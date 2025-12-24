@@ -52,7 +52,20 @@ def parser_add_main_args(parser):
     parser.add_argument('--model_dir', type=str, default='./model_ckpt/')
     parser.add_argument('--switch_freq', type=int, default=8)
     parser.add_argument('--dummy_bias', action='store_true', default=False)
-    parser.add_argument('--reorder', action='store_true', default=False)
+    parser.add_argument('--subgraph_sampler', type=str, default='identity',
+                        choices=['identity', 'edge_drop'],
+                        help='子图采样器类型')
+    parser.add_argument('--edge_drop_ratio', type=float, default=0.0,
+                        help='edge_drop 采样时的丢弃比例')
+    parser.add_argument('--head_subgraph_provider', type=str, default='shared',
+                        choices=['shared', 'grouped', 'hop'],
+                        help='为不同 head 提供不同子图的方式')
+    parser.add_argument('--head_groups', type=int, default=4,
+                        help='将所有 head 平分到的子图组数')
+    parser.add_argument('--head_rw_length', type=int, default=6,
+                        help='随机游走近似的 walk length')
+    parser.add_argument('--head_rw_walks', type=int, default=2,
+                        help='每个节点的随机游走次数')
     
     # distributed args
     parser.add_argument('--rank', type=int, default=None,

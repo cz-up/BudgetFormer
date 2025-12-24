@@ -247,6 +247,7 @@ class DistributedAttentionNodeLevel(torch.nn.Module):
         # in shape : [b, s/p, n_head, hn]
         # global token embedding (index = 0) is same for each rank
         # print(f'rank: {get_sequence_parallel_rank()}, q: {query[:, 0, :, :].view(4, 1, -1)}')
+
         if self.training:
             query_layer = _SeqAllToAll.apply(self.spg, query, self.scatter_idx, self.gather_idx)
             key_layer = _SeqAllToAll.apply(self.spg, key, self.scatter_idx, self.gather_idx)

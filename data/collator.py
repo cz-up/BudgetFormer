@@ -15,7 +15,6 @@ from gt_sp.initialize import (
     get_last_batch_flag,
 )
 import time
-from gt_sp.utils import partition_graph_and_remap
 
 
 def pad_1d_unsqueeze(x, padlen):
@@ -261,7 +260,7 @@ def collator(items, max_node=512, multi_hop_max_dist=20, spatial_pos_max=20, mya
     # edge_indexes, xs, edge_inputs, attn_biases, spatial_poses, in_degrees, out_degrees  = [], [], [], [], [], [], []
     # k = 2
     # for i in range(len(edge_indexes_raw)):
-    #     edge_index_i, sorted_indices = partition_graph_and_remap(edge_indexes_raw[i], k)
+    #     edge_index_i, sorted_indices = reformat_graph(edge_indexes_raw[i], k)
     #     edge_indexes.append(edge_index_i)
     #     xs.append(torch.index_select(xs_raw[i], 0, sorted_indices))
     #     edge_input = torch.index_select(edge_inputs_raw[i], 0, sorted_indices)

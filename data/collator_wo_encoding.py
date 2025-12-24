@@ -18,7 +18,7 @@ import time
 import torch.nn.functional as F
 import warnings
 warnings.filterwarnings('ignore', '.*Sparse CSR tensor support is in beta state.*')
-from gt_sp.utils import partition_graph_and_remap
+from gt_sp.utils import reformat_graph
 import torch.distributed as dist
 
 
@@ -279,7 +279,7 @@ def collator(items, max_node=512, multi_hop_max_dist=20, spatial_pos_max=20, mya
                 k, block_size = 4, 32
             else:
                 k, block_size = 4, 4
-            edge_index_i, sorted_indices = partition_graph_and_remap(edge_indexes_raw[i], k, block_size)
+            edge_index_i, sorted_indices = reformat_graph(edge_indexes_raw[i], k, block_size)
             
             if myargs.model == "graphormer":
                 # 重排x,y, attn_bias张量的第0维度

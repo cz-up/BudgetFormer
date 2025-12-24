@@ -39,11 +39,12 @@ class FeedForwardNetwork(nn.Module):
         return x
     
     
+import os
 class CoreAttention(nn.Module):
     """
     Core attention
     """
-    def __init__(self, hidden_size, attention_dropout_rate, num_heads, attn_bias_dim):
+    def __init__(self, hidden_size, attention_dropout_rate, num_heads, attn_bias_dim, chunk_size: int | None = None):
         super(CoreAttention, self).__init__()
 
         # SP group: Per attention head and per partition values.
@@ -61,11 +62,46 @@ class CoreAttention(nn.Module):
         self.att_dropout = nn.Dropout(attention_dropout_rate)
         self.attention_dropout_rate = attention_dropout_rate
 
+        env_chunk = os.getenv("TORCH_FULL_ATTN_CHUNK", "").strip()
+        self.full_chunk_size = chunk_size if chunk_size else (int(env_chunk) if env_chunk.isdigit() else 0)
+
+        # hop-1 统计参数
+        self.track_hop1_stats = False
+        self.hop1_sum = 0.0
+        self.hop1_count = 0
+
+        # entropy 统计参数
+        self.track_entropy_stats = False
+        self.entropy_sum = 0.0
+        self.entropy_count = 0
+
+        # self._shuffle = True
+        self._shuffle = False
+        if self._shuffle:
+            print('Shuffling destination nodes in edge_index for sparse attention')
+
 
     def reset_parameters(self):
         torch.nn.init.constant_(self.b, 0.1)
 
+    def enable_hop1_tracking(self, head_idx: int = 0) -> None:
+        self.track_hop1_stats = True
+        self.hop1_head = max(int(head_idx), 0)
+        self.reset_hop1_stats()
 
+    def disable_hop1_tracking(self) -> None:
+        self.track_hop1_stats = False
+
+    def reset_hop1_stats(self) -> None:
+        self.hop1_sum = 0.0
+        self.hop1_count = 0
+
+    def get_hop1_stats(self):
+        if not self.track_hop1_stats or self.hop1_count == 0:
+            return None
+        return self.hop1_sum, self.hop1_count
+
+    
     def sparse_attention_bias(self, k, q, v, edge_index, attn_bias):
         # kqv: [b, s+p, np, hn], edge_index: [2, n_edges], attn_bias: [b, s+p, s+p, np]
         batch_size, node_num = k.size(0), k.size(1)
@@ -83,51 +119,142 @@ class CoreAttention(nn.Module):
         # q = q.half()
         # k = k.half()
         # v = v.half()
-
-        # -> [n_edges, np, hn]
-        src = k[edge_index[0].to(torch.long)] 
-        dest = q[edge_index[1].to(torch.long)] 
-        score = torch.mul(src, dest)  # element-wise multiplication
-            
-        # Scale scores by sqrt(d)
-        score = score / self.scale
-
-        # Use available edge features to modify the scores for edges
-        # -> [total_edges, np, 1] 
-        score = score.sum(-1, keepdim=True).clamp(-5, 5)
-
-        # [b, s+p, s+p, np] -> [b, s+p, s+p, np] -> [b, s+p, b, s+p, np]
         if attn_bias is not None:
-            # attn_bias = attn_bias.repeat(1, 1, 1, num_heads)
-            attn_bias = attn_bias.unsqueeze(2).repeat(1, 1, batch_size, 1, 1)  
-            attn_bias = attn_bias.view(batch_size*node_num, batch_size*node_num, -1)
-    
-            score = score + \
-                    attn_bias[edge_index[0].to(torch.long), edge_index[1].to(torch.long), :] 
+            attn_bias = attn_bias.unsqueeze(2).repeat(1, 1, batch_size, 1, 1)
+            attn_bias = attn_bias.view(batch_size * node_num, batch_size * node_num, -1)
 
-        # softmax -> [total_edges, np, 1]
-        score = torch.exp(score) 
+        if isinstance(edge_index, list):
+            wV = torch.zeros_like(v)
+            Z = v.new_zeros(v.size(0), num_heads, 1)
+            groups = max(1, len(edge_index))
+            heads_per_group = (num_heads + groups - 1) // groups
+            for g, edge_index_g in enumerate(edge_index):
+                if edge_index_g is None or edge_index_g.numel() == 0:
+                    continue
+                h_start = g * heads_per_group
+                h_end = min((g + 1) * heads_per_group, num_heads)
+                if h_start >= h_end:
+                    continue
+                edge_index_g = edge_index_g.to(k.device)
+                if self._shuffle:
+                    destinations = edge_index_g[1, :].clone()
+                    shuffled_indices = torch.randperm(destinations.size(0), device=destinations.device)
+                    shuffled_destinations = destinations[shuffled_indices]
+                    edge_index_g = torch.stack([edge_index_g[0, :], shuffled_destinations])
+                src = k[edge_index_g[0].to(torch.long), h_start:h_end, :]
+                dest = q[edge_index_g[1].to(torch.long), h_start:h_end, :]
+                score = torch.mul(src, dest)
+                score = score / self.scale
+                score = score.sum(-1, keepdim=True).clamp(-5, 5)
+                if attn_bias is not None:
+                    score = score + attn_bias[
+                        edge_index_g[0].to(torch.long),
+                        edge_index_g[1].to(torch.long),
+                        h_start:h_end,
+                    ]
+                score = torch.exp(score)
+                msg = v[edge_index_g[0].to(torch.long), h_start:h_end, :] * score
+                scatter(msg, edge_index_g[1], dim=0, out=wV[:, h_start:h_end, :], reduce='add')
+                scatter(score, edge_index_g[1], dim=0, out=Z[:, h_start:h_end, :], reduce='add')
+            x = wV / (Z + 1e-6)
+        else:
+            if self._shuffle: # Only apply shuffling during training
+                destinations = edge_index[1, :].clone() # 克隆一份原始目标节点用于比较
+                shuffled_indices = torch.randperm(destinations.size(0), device=destinations.device)
+                shuffled_destinations = destinations[shuffled_indices]
+            
+                # --- 开始统计未改变的边 ---
+                unchanged_edges = (destinations == shuffled_destinations).sum().item()
+                total_edges = destinations.size(0)
+                unchanged_percentage = (unchanged_edges / total_edges) * 100 if total_edges > 0 else 0
+                print(f"Unchanged edges after shuffling: {unchanged_edges}/{total_edges} ({unchanged_percentage:.2f}%)")
+                # --- 统计结束 ---
+            
+                edge_index = torch.stack([edge_index[0, :], shuffled_destinations])
 
-        # Apply attention score to each source node to create edge messages
-        # -> [total_edges, np, hn]
-        msg = v[edge_index[0].to(torch.long)] * score
-        
-        # Add-up real msgs in destination nodes as given by edge_index[1]
-        # -> [total_s, np, hn]
-        wV = torch.zeros_like(v)  
-        scatter(msg, edge_index[1], dim=0, out=wV, reduce='add')
+            # -> [n_edges, np, hn]
+            src = k[edge_index[0].to(torch.long)] 
+            dest = q[edge_index[1].to(torch.long)] 
+            score = torch.mul(src, dest)  # element-wise multiplication
+                
+            # Scale scores by sqrt(d)
+            score = score / self.scale
 
-        # Compute attention normalization coefficient
-        # -> [total_s, np, 1]
-        Z = score.new_zeros(v.size(0), num_heads, 1)    
-        scatter(score, edge_index[1], dim=0, out=Z, reduce='add')
+            # Use available edge features to modify the scores for edges
+            # -> [total_edges, np, 1] 
+            score = score.sum(-1, keepdim=True).clamp(-5, 5)
 
-        x = wV / (Z + 1e-6)
+            if attn_bias is not None:
+                score = score + \
+                        attn_bias[edge_index[0].to(torch.long), edge_index[1].to(torch.long), :] 
+
+            # softmax -> [total_edges, np, 1]
+            score = torch.exp(score) 
+
+            # Apply attention score to each source node to create edge messages
+            # -> [total_edges, np, hn]
+            msg = v[edge_index[0].to(torch.long)] * score
+            
+            # Add-up real msgs in destination nodes as given by edge_index[1]
+            # -> [total_s, np, hn]
+            wV = torch.zeros_like(v)  
+            scatter(msg, edge_index[1], dim=0, out=wV, reduce='add')
+
+            # Compute attention normalization coefficient
+            # -> [total_s, np, 1]
+            Z = score.new_zeros(v.size(0), num_heads, 1)    
+            scatter(score, edge_index[1], dim=0, out=Z, reduce='add')
+
+            x = wV / (Z + 1e-6)
         
         return x
 
+    def set_full_attention_chunk_size(self, chunk_size: int | None) -> None:
+        self.full_chunk_size = int(chunk_size) if chunk_size else 0
 
-    def full_attention(self, k, q, v, attn_bias):
+    def _full_attention_chunked(self, k, q, v, attn_bias, edge_index=None):
+        batch_size, seq_q, num_heads_local, head_dim = q.size()
+        seq_k = k.size(1)
+        chunk = max(int(self.full_chunk_size), 1)
+
+        q_flat = q.permute(0, 2, 1, 3).contiguous().view(-1, seq_q, head_dim)
+        k_flat = k.permute(0, 2, 1, 3).contiguous().view(-1, seq_k, head_dim)
+        v_flat = v.permute(0, 2, 1, 3).contiguous().view(-1, seq_k, head_dim)
+        k_t = k_flat.transpose(1, 2)
+
+        if attn_bias is not None:
+            bias = attn_bias.view(batch_size, num_heads_local, seq_q, seq_k)
+            bias = bias.permute(0, 1, 2, 3).contiguous().view(-1, seq_q, seq_k)
+        else:
+            bias = None
+
+        attn_probs_full = None
+
+        context = q_flat.new_empty((q_flat.size(0), seq_q, head_dim))
+        for start in range(0, seq_q, chunk):
+            end = min(start + chunk, seq_q)
+            q_chunk = q_flat[:, start:end, :] * self.scale
+            scores = torch.bmm(q_chunk, k_t)
+            if bias is not None:
+                scores = scores + bias[:, start:end, :]
+            probs = torch.softmax(scores, dim=-1)
+            probs = self.att_dropout(probs)
+            context[:, start:end, :] = torch.bmm(probs, v_flat)
+            if attn_probs_full is not None:
+                attn_probs_full[:, start:end, :] = probs
+
+        context = context.view(batch_size, num_heads_local, seq_q, head_dim).permute(0, 2, 1, 3).contiguous()
+        context = context.view(batch_size, seq_q, -1)
+
+        # if attn_probs_full is not None:
+            # attn_probs_view = attn_probs_full.view(batch_size, num_heads_local, seq_q, seq_k)
+            # self._accumulate_hop1_attention(attn_probs_view, edge_index)
+
+        return context
+
+
+
+    def full_attention(self, k, q, v, attn_bias, edge_index=None):
         # [b, np, sq+1, sk+1]
         output_size = (q.size(0),
                        q.size(2),
@@ -159,8 +286,10 @@ class CoreAttention(nn.Module):
             # attn_bias = attn_bias.repeat(1, 1, 1, num_heads) 
             attn_bias = attn_bias.view(*output_size) # [b, s+1, s+1, np] -> [b, np, s+1, s+1]
             x = x + attn_bias
-        x = torch.softmax(x, dim=3)
-        x = self.att_dropout(x)
+        attn_probs = torch.softmax(x, dim=3)
+        if self.track_hop1_stats:
+            self._accumulate_hop1_attention(attn_probs, edge_index)
+        x = self.att_dropout(attn_probs)
 
         # =========================
         # Context layer. [s, b, hp]
@@ -195,6 +324,48 @@ class CoreAttention(nn.Module):
 
         return x
 
+    def _accumulate_hop1_attention(self, attn_probs: torch.Tensor, edge_index: torch.Tensor) -> None:
+        if edge_index is None or edge_index.numel() == 0:
+            return
+
+        bsz, n_head_local, q_len, k_len = attn_probs.shape
+        if n_head_local == 0 or q_len == 0 or k_len == 0:
+            return
+
+        head_idx = min(self.hop1_head, n_head_local - 1)
+        probs = attn_probs[:, head_idx, :, :]  # [bsz, q_len, k_len]
+
+        src = edge_index[0].long().to(probs.device)
+        dst = edge_index[1].long().to(probs.device)
+
+        mask = (src >= 0) & (dst >= 0) & (src < k_len) & (dst < q_len)
+        if not mask.any():
+            return
+        src = src[mask]
+        dst = dst[mask]
+
+        hop_vals = probs[:, dst, src]  # [bsz, n_edges]
+
+        hop_sum_per_query = torch.zeros((bsz, q_len), device=probs.device, dtype=probs.dtype)
+        hop_sum_per_query.scatter_add_(1, dst.unsqueeze(0).expand(bsz, -1), hop_vals)
+
+        total_per_query = probs.sum(dim=-1)  # [bsz, q_len]
+        valid_query_mask = total_per_query > 0
+
+        if q_len > 1:
+            hop_sum_per_query = hop_sum_per_query[:, 1:]
+            total_per_query = total_per_query[:, 1:]
+            valid_query_mask = valid_query_mask[:, 1:]
+
+        ratios = torch.where(
+            valid_query_mask,
+            hop_sum_per_query / (total_per_query + 1e-9),
+            torch.zeros_like(hop_sum_per_query),
+        )
+
+        self.hop1_sum += float(ratios.sum().detach().cpu())
+        self.hop1_count += int(valid_query_mask.sum().item())
+
 
     def forward(self, q, k, v, attn_bias=None, edge_index=None, attn_type=None):
         # ===================================
@@ -204,7 +375,7 @@ class CoreAttention(nn.Module):
         batch_size, s_len = q.size(0), q.size(1)
         
         if attn_type == "full":
-            x = self.full_attention(k, q, v, attn_bias)
+            x = self.full_attention(k, q, v, attn_bias, edge_index=edge_index)
         elif attn_type == "sparse":
             x = self.sparse_attention_bias(k, q, v, edge_index, attn_bias)
             # x = x.float()
@@ -350,6 +521,57 @@ class Graphormer(nn.Module):
         self.graph_token = nn.Embedding(self.num_global_node, hidden_dim)
         self.graph_token_virtual_distance = nn.Embedding(self.num_global_node, attn_bias_dim)
         self.apply(lambda module: init_params(module, n_layers=n_layers))
+
+    def enable_hop1_tracking(self, head_idx: int = 0) -> None:
+        for layer in self.layers:
+            core_attn = layer.self_attention.dist_attn.local_attn
+            if hasattr(core_attn, "enable_hop1_tracking"):
+                core_attn.enable_hop1_tracking(head_idx)
+
+    def disable_hop1_tracking(self) -> None:
+        for layer in self.layers:
+            core_attn = layer.self_attention.dist_attn.local_attn
+            if hasattr(core_attn, "disable_hop1_tracking"):
+                core_attn.disable_hop1_tracking()
+
+    def reset_hop1_stats(self) -> None:
+        for layer in self.layers:
+            core_attn = layer.self_attention.dist_attn.local_attn
+            if hasattr(core_attn, "reset_hop1_stats"):
+                core_attn.reset_hop1_stats()
+
+    def get_hop1_stats_per_layer(self):
+        stats = []
+        for layer in self.layers:
+            core_attn = layer.self_attention.dist_attn.local_attn
+            if hasattr(core_attn, "get_hop1_stats"):
+                stats.append(core_attn.get_hop1_stats())
+            else:
+                stats.append(None)
+        return stats
+
+    def get_hop1_means_per_layer(self):
+        means = []
+        for stat in self.get_hop1_stats_per_layer():
+            if stat is None or stat[1] == 0:
+                means.append(None)
+            else:
+                hop_sum, hop_count = stat
+                means.append(hop_sum / hop_count)
+        return means
+
+    def get_hop1_global_mean(self):
+        total_sum = 0.0
+        total_count = 0
+        for stat in self.get_hop1_stats_per_layer():
+            if stat is None:
+                continue
+            hop_sum, hop_count = stat
+            total_sum += hop_sum
+            total_count += hop_count
+        if total_count == 0:
+            return None
+        return total_sum / total_count
 
 
     def forward(self, x, attn_bias, edge_index, perturb=None, attn_type=None):

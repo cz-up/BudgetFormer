@@ -100,9 +100,9 @@ def initialize_sequence_parallel(
                         (i + 1) * sequence_parallel_size)
         group = torch.distributed.new_group(ranks)
         if rank in ranks:
-            _SEQUENCE_PARALLEL_GROUP = group
-            _SEQUENCE_PARALLEL_RANK = ranks.index(rank)
-            _SEQUENCE_PARALLEL_WORLD_SIZE = len(ranks)
+            _SEQUENCE_PARALLEL_GROUP = group # the group the caller rank belongs to
+            _SEQUENCE_PARALLEL_RANK = ranks.index(rank) # local rank in the group 0 ~ size-1
+            _SEQUENCE_PARALLEL_WORLD_SIZE = len(ranks) # 每个sequence parallel group的size
             _SEQUENCE_LENGTH_PER_RANK = seq_length // _SEQUENCE_PARALLEL_WORLD_SIZE # for node-level tasks
     
     if torch.distributed.get_rank() == 0:

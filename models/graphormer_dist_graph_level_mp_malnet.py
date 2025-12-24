@@ -4,7 +4,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 from torch_geometric.utils import degree
 from torch_sparse import SparseTensor, matmul
-from gt_sp.layer import DistributedAttentionLocalBias, DistributedAttentionAll2all, DistributedAttentionAll2allNoMerge
+from gt_sp.layer import  DistributedAttentionNoMerge
 from gt_sp.initialize import (
     initialize_distributed,
     sequence_parallel_is_initialized,
@@ -329,7 +329,7 @@ class MultiHeadAttention(nn.Module):
 
         local_attn = CoreAttention(
             hidden_size, attention_dropout_rate, num_heads)
-        self.dist_attn = DistributedAttentionAll2allNoMerge(local_attn, get_sequence_parallel_group())
+        self.dist_attn = DistributedAttentionNoMerge(local_attn, get_sequence_parallel_group())
 
         self.output_layer = nn.Linear(num_heads * att_size, hidden_size)
 

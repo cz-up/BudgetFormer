@@ -1,21 +1,16 @@
 import torch
-import torch.nn.functional as F
 import torch.distributed as dist
 import numpy as np
 import random
-from typing import Any, Tuple, List
-from functools import partial
-from torch import Tensor
-import time
-import sys
-import os
-import dgl
-import copy
 import contextlib
-import networkx as nx
-import itertools
-from torch.utils.data import DataLoader, SubsetRandomSampler
-from torch_geometric.utils import to_undirected, remove_self_loops, add_self_loops, subgraph
+import os
+import sys
+import time
+import dgl
+from typing import List, Optional
+from torch import Tensor
+from torch_sparse import SparseTensor
+from torch_geometric.utils import remove_self_loops, subgraph
 from gt_sp.initialize import (
     sequence_parallel_is_initialized,
     get_sequence_parallel_group,
@@ -44,7 +39,7 @@ def fix_edge_index(x, num_node):
         virt_edge_index = torch.cat([(x.new_zeros([num_node])+idx).view(1, -1), 
                                     (torch.arange(num_node)+(1+idx)).view(1, -1)], dim=0)
         virt_edges.append(virt_edge_index)
-    
+
     extra_virt_edges = torch.cat(virt_edges, dim=1)
     x = torch.cat([(x + 1), extra_virt_edges], dim=1) # virtual node index = 0, other nodes start from 1
     return x
@@ -56,6 +51,22 @@ def adjust_edge_index_nomerge(edge_index, sub_seq_len):
     new_index[mask] = edge_index[mask] + ((edge_index[mask].float() - 1) // sub_seq_len).to(torch.int64)
 
     return new_index
+
+
+def slice_edge_index(edge_index, start, end):
+    if edge_index is None:
+        return None
+    if edge_index.numel() == 0:
+        return edge_index
+    mask = (
+        (edge_index[0] >= start)
+        & (edge_index[0] < end)
+        & (edge_index[1] >= start)
+        & (edge_index[1] < end)
+    )
+    if mask.sum().item() == 0:
+        return edge_index.new_empty((2, 0), dtype=edge_index.dtype)
+    return edge_index[:, mask] - start
 
 
 def pad_y(x, padlen):
@@ -209,153 +220,55 @@ def gen_sub_edge_index(edge_index, idx_batch, N):
         N (Int): number of nodes in the whole graph
     """
     adj, _ = remove_self_loops(edge_index)
-    adj, _ = add_self_loops(adj, num_nodes=N)
+    # adj, _ = add_self_loops(adj, num_nodes=N)
     edge_index_i, _ = subgraph(idx_batch, adj, num_nodes=N, relabel_nodes=True)
 
     return edge_index_i
 
 
-def create_pairs(N, M, off_N, off_M):
-    """Create a list of pairs (a, b) where a ranges from 1 to N and b ranges from 1 to M."""
-    return [(a, b) for a in range(off_N, off_N + N) for b in range(off_M, off_M + M)]
-
-
-def generate_new_edges_optimized(edge_index, k, partition_ids, p, blocksize, new_id_mapping):
-    # edge_counts = np.zeros((k, k), dtype=np.int64)
-    new_edges = []
-    src, dst = edge_index
-    edge_partiton = (partition_ids.numpy()[src.numpy()], partition_ids.numpy()[dst.numpy()])
-    edge_index_np = (src.numpy(), dst.numpy())
-    # Combining the first and second rows of a for sorting
-    combined_a = list(zip(edge_partiton[0], edge_partiton[1]))
-    # Sorting combined_a and also sorting b based on the sorting of combined_a
-    sorted_combined_a, sorted_b = zip(*sorted(zip(combined_a, zip(*edge_index_np))))
-    # Unzipping the sorted lists
-    sorted_a1, sorted_a2 = zip(*sorted_combined_a)
-    sorted_b1, sorted_b2 = zip(*sorted_b)
-
-    edge_count_list = np.zeros(k*k, dtype=np.int64)
-    change_count = 0
-    for i in range(len(sorted_a1)-1):
-        if (sorted_a1[i] == sorted_a1[i+1]) and (sorted_a2[i] == sorted_a2[i+1]):
-            edge_count_list[change_count] += 1
-        else:
-            edge_count_list[change_count] += 1
-            change_count += 1
-    edge_count_list[change_count] += 1
-    cumulative_sum = [sum(edge_count_list[:i]) for i in range(len(edge_count_list) + 1)]
-
-    # # Converting the sorted tuples back to lists
-    # sorted_a_new = (list(sorted_a1), list(sorted_a2))
-    # sorted_b_new = (list(sorted_b1), list(sorted_b2))
-    
-    # for src, dst in zip(*edge_index):
-    #     src_part = partition_ids[src]
-    #     dst_part = partition_ids[dst]
-    #     edge_counts[src_part, dst_part] += 1
-
-    node_counts = np.zeros(k, dtype=int)
-    total_node_offset = np.zeros(k, dtype=int)
-    for pid in partition_ids:
-        node_counts[pid] += 1
-
-    for i in range(k-1):
-        total_node_offset[i+1] = total_node_offset[i] + node_counts[i]
-    # print(total_node_offset)
-    # node_counts = np.array([np.sum(partition_ids == i) for i in range(k)])
-    # print(node_counts)
-    keep_cnt = 0
-    for i in range(k):
-        for j in range(k):
-            sparsity = edge_count_list[i*k+j] / (node_counts[i] * node_counts[j])
-            # if i == j:
-            # print(f"chunk sparsity: {sparsity:.8f}, {sparsity/8.7988461e-05}")
-
-            if sparsity > p:
-                raw_edge_src = sorted_b1[cumulative_sum[i*k+j]:cumulative_sum[i*k+j+1]]
-                raw_edge_dst = sorted_b2[cumulative_sum[i*k+j]:cumulative_sum[i*k+j+1]]
-                # print(len(raw_edge_src))
-                for jj in range(len(raw_edge_src)):
-                    new_edges.append((new_id_mapping[raw_edge_src[jj]], new_id_mapping[raw_edge_dst[jj]]))
-                # for src, dst in zip(*edge_index):
-                #     if partition_ids[src] == i and partition_ids[dst] == j:
-                #         new_edges.append((new_id_mapping[src], new_id_mapping[dst]))
-                #         # new_edges.append((src, dst))
-            else:
-                # mask = torch.zeros(node_counts[i], node_counts[j])
-                num_elements_per_block = blocksize * blocksize
-
-                total_elements = node_counts[i] * node_counts[j]
-                num_nonzero_blocks = int(sparsity * total_elements / num_elements_per_block) + 1
-                np.random.seed(keep_cnt)
-                if (node_counts[i] >= blocksize) and (node_counts[j] >= blocksize):
-                    for ii in range(num_nonzero_blocks):
-                        block_row = (np.random.randint(0, node_counts[i] // blocksize)) #% (node_counts[i] // blocksize)
-                        # print(ii, block_row)
-                        block_col = (np.random.randint(0, node_counts[j] // blocksize)) #% (node_counts[j] // blocksize)
-                        # print(ii, keep_cnt, block_row, block_col)
-                        keep_cnt += 1
-                        random_edge = create_pairs(blocksize, blocksize, (block_row * blocksize + total_node_offset[i]), (block_col * blocksize + total_node_offset[j]))
-                        new_edges.extend(random_edge)
-
-
-    # print(keep_cnt)
-    # print("Edge raw {} new {}".format(len(edge_index[0]), len(new_edges)))
-    # print(new_edges)
-    return torch.tensor(new_edges).t()
-
-
 @contextlib.contextmanager
 def suppress_stdout():
-    with open(os.devnull, 'w') as devnull:
+    with open(os.devnull, "w") as devnull:
         old_stdout = sys.stdout
         sys.stdout = devnull
-        try:  
+        try:
             yield
         finally:
             sys.stdout = old_stdout
 
 
-def reformat_graph(edge_index, k, block_size, beta_coeffi='1'):
-
+def reformat_graph(edge_index, k):
     src, dst = edge_index
     g = dgl.graph((src, dst))
-    # logging.getLogger('dgl').setLevel(logging.WARNING)
     t0 = time.time()
     with suppress_stdout():
         partition_ids = dgl.metis_partition_assignment(g, k)
-    # exit(0)
     t1 = time.time()
     new_id_mapping = np.empty(g.num_nodes(), dtype=np.int64)
-    # print(x.shape)
     current_id = 0
     for part_id in range(k):
         nodes_in_part = np.where(partition_ids == part_id)[0]
         new_id_mapping[nodes_in_part] = np.arange(current_id, current_id + len(nodes_in_part))
         current_id += len(nodes_in_part)
-        
+
     t2 = time.time()
 
-    p_ori = len(edge_index[0]) / (g.num_nodes() * g.num_nodes()) # 1-sparsity
-    if beta_coeffi == '1':
-        p = 1
-    else:
-        p = beta_coeffi * p_ori
-    p = 1
-    
-    new_edge_index = generate_new_edges_optimized(edge_index, k, partition_ids, p, blocksize=block_size, new_id_mapping=new_id_mapping)
-    # new_edge_index = (new_id_mapping[src.numpy()], new_id_mapping[dst.numpy()])
-    # new_edge_index = (new_id_mapping[block_src.numpy()], new_id_mapping[block_dst.numpy()])
+    src, dst = edge_index
+    new_edge_index = torch.stack(
+        [
+            torch.from_numpy(new_id_mapping[src.numpy()]),
+            torch.from_numpy(new_id_mapping[dst.numpy()]),
+        ],
+        dim=0,
+    )
     t3 = time.time()
     new_id_mapping_tensor = torch.from_numpy(new_id_mapping)
 
     sorted_indices = torch.argsort(new_id_mapping_tensor)
-
     sorted_indices_edge = torch.argsort(new_edge_index[0])
-
     sorted_edge_index = new_edge_index[:, sorted_indices_edge]
     t4 = time.time()
-    # print("Time in reorder {} {} {}".format(t1-t0, t2-t1, t3-t2))
+    # print(f"Time in reorder {t1 - t0} {t2 - t1} {t3 - t2} {t4 - t3}")
     return sorted_edge_index, sorted_indices
 
 
@@ -406,77 +319,396 @@ def get_batch(args, x, y, idx_batch, adjs, rest_split_sizes, device):
         return x_i, y_i, attn_bias
     
 
-def get_batch_reorder_blockize(args, x, y, idx_batch, rest_split_sizes, device, edge_index, N, k, block_size, beta_coeffi='1'):
+def _apply_to_edge_index(edge_index, fn):
+    if isinstance(edge_index, list):
+        return [fn(e) if e is not None else None for e in edge_index]
+    if edge_index is None:
+        return None
+    return fn(edge_index)
+
+
+def compute_hops_random_walk(
+    edge_index: Tensor,
+    num_nodes: int,
+    device: str = "cpu",
+    walk_length: int = 6,
+    walks_per_node: int = 2,
+    num_groups: int = 4,
+) -> List[Tensor]:
     """
-    Dummy bias for faster processing time each iteration
-    Generate a local subsequence in sequence parallel
-    Get sub edge_index according to sequence length
+    使用随机游走为不同 head 组生成不同的子图。
+    每个组内的边来自该组的随机游走序列 (seed_node -> d-step node)。
+    后处理会尽量避免回退与重复节点。
     """
-     # For sequence parallel
+    walk_length = max(1, int(walk_length))
+    num_groups = max(1, int(num_groups))
+    if edge_index.numel() == 0:
+        return [edge_index for _ in range(num_groups)]
+
+    inferred_nodes = int(edge_index.max().item()) + 1
+    num_nodes = max(num_nodes, inferred_nodes)
+    edge_index = edge_index.to(device)
+
+    adj = SparseTensor(row=edge_index[0], col=edge_index[1], sparse_sizes=(num_nodes, num_nodes)).coalesce()
+    rowptr, col, _ = adj.csr()
+
+    starts = torch.arange(num_nodes, device=device, dtype=torch.long)
+    starts = starts.repeat_interleave(walks_per_node * num_groups)
+
+    walks = _run_random_walk(edge_index, rowptr, col, starts, walk_length)
+    walks = walks.view(num_groups, -1, walk_length + 1)
+
+    group_edges: List[List[Tensor]] = [[] for _ in range(num_groups)]
+    seen = torch.zeros(num_nodes, device=device, dtype=torch.bool)
+    for d in range(1, walk_length + 1):
+        g = (d - 1) % num_groups
+        walks_g = walks[g]
+        src = walks_g[:, 0]
+        dst = walks_g[:, d]
+        valid = dst >= 0
+        if d > 1:
+            prev = walks_g[:, d - 1]
+            valid = valid & (dst != prev)
+        if not valid.any():
+            continue
+        dst_valid = dst[valid]
+        src_valid = src[valid]
+        unseen = ~seen[dst_valid]
+        if not unseen.any():
+            continue
+        dst_keep = dst_valid[unseen]
+        src_keep = src_valid[unseen]
+        seen[dst_keep] = True
+        group_edges[g].append(torch.stack([src_keep, dst_keep], dim=0))
+
+    buckets: List[Tensor] = []
+    for edges in group_edges:
+        if not edges:
+            buckets.append(edge_index.new_zeros((2, 0), dtype=edge_index.dtype))
+        else:
+            buckets.append(torch.cat(edges, dim=1))
+    return buckets
+
+
+def compute_hop_buckets_random_walk(
+    edge_index: Tensor,
+    num_nodes: int,
+    num_buckets: int,
+    device: str = "cpu",
+    walk_length: int = 4,
+    walks_per_node: int = 2,
+) -> List[Tensor]:
+    """
+    使用随机游走生成 hop buckets，bucket i 对应 hop i+1，
+    最后一个 bucket 合并 >= num_buckets 的 hop.
+    """
+    num_buckets = max(1, int(num_buckets))
+    walk_length = max(1, int(walk_length))
+    walks_per_node = max(1, int(walks_per_node))
+    if edge_index.numel() == 0:
+        return [edge_index.new_zeros((2, 0), dtype=edge_index.dtype) for _ in range(num_buckets)]
+
+    inferred_nodes = int(edge_index.max().item()) + 1
+    num_nodes = max(num_nodes, inferred_nodes)
+    edge_index = edge_index.to(device)
+
+    adj = SparseTensor(row=edge_index[0], col=edge_index[1], sparse_sizes=(num_nodes, num_nodes)).coalesce()
+    rowptr, col, _ = adj.csr()
+
+    starts = torch.arange(num_nodes, device=device, dtype=torch.long)
+    starts = starts.repeat_interleave(walks_per_node)
+    walks = _run_random_walk(edge_index, rowptr, col, starts, walk_length)
+
+    buckets = [edge_index.new_zeros((2, 0), dtype=edge_index.dtype) for _ in range(num_buckets)]
+    src = walks[:, 0]
+    for d in range(1, walk_length + 1):
+        dst = walks[:, d]
+        valid = dst >= 0
+        if d > 1:
+            prev = walks[:, d - 1]
+            valid = valid & (dst != prev)
+        if not valid.any():
+            continue
+        src_valid = src[valid]
+        dst_valid = dst[valid]
+        edges = torch.stack([src_valid, dst_valid], dim=0)
+        bucket_idx = min(d - 1, num_buckets - 1)
+        buckets[bucket_idx] = torch.cat([buckets[bucket_idx], edges], dim=1)
+    return buckets
+
+
+def build_head_hop_edges(
+    edge_index: Tensor,
+    num_nodes: int,
+    num_heads: int,
+    num_groups: int,
+    device: str = "cpu",
+    walk_length: int = 4,
+    walks_per_node: int = 2,
+):
+    """
+    根据 hop buckets 构建 per-head edge_index 列表。
+    """
+    buckets = compute_hop_buckets_random_walk(
+        edge_index=edge_index,
+        num_nodes=num_nodes,
+        num_buckets=num_groups,
+        device=device,
+        walk_length=walk_length,
+        walks_per_node=walks_per_node,
+    )
+    provider = HopMappedHeadSubgraphProvider(list(range(max(1, num_groups))), num_groups)
+    return provider.build(buckets, num_heads)
+
+
+def _run_random_walk(edge_index: Tensor, rowptr: Tensor, col: Tensor, starts: Tensor, walk_length: int) -> Tensor:
+    try:
+        from torch_cluster import random_walk
+    except Exception as exc:
+        raise RuntimeError("torch_cluster.random_walk not available") from exc
+    try:
+        return random_walk(rowptr, col, starts, walk_length)
+    except RuntimeError as exc:
+        msg = str(exc)
+        if "must match" in msg or "size" in msg:
+            return random_walk(edge_index[0], edge_index[1], starts, walk_length)
+        raise
+
+
+def compute_group_nodes_random_walk(
+    edge_index: Tensor,
+    num_nodes: int,
+    device: str = "cpu",
+    walk_length: int = 6,
+    walks_per_node: int = 2,
+    num_groups: int = 4,
+    max_nodes_per_group: int = 2048,
+) -> List[Tensor]:
+    """
+    使用随机游走生成每个组的节点序列，组内去重，组间可重叠。
+    """
+    walk_length = max(1, int(walk_length))
+    num_groups = max(1, int(num_groups))
+    max_nodes_per_group = max(1, int(max_nodes_per_group))
+    if edge_index.numel() == 0:
+        return [edge_index.new_zeros((0,), dtype=torch.long) for _ in range(num_groups)]
+
+    inferred_nodes = int(edge_index.max().item()) + 1
+    num_nodes = max(int(num_nodes), inferred_nodes)
+    edge_index = edge_index.to(device)
+    adj = SparseTensor(
+        row=edge_index[0],
+        col=edge_index[1],
+        sparse_sizes=(num_nodes, num_nodes),
+    ).coalesce()
+    rowptr, col, _ = adj.csr()
+
+    group_nodes: List[Tensor] = []
+    all_nodes = torch.arange(num_nodes, device=device, dtype=torch.long)
+    for g in range(num_groups):
+        seeds = all_nodes[g::num_groups]
+        if seeds.numel() > max_nodes_per_group:
+            seeds = seeds[:max_nodes_per_group]
+        if seeds.numel() == 0:
+            group_nodes.append(seeds)
+            continue
+        starts = seeds.repeat_interleave(walks_per_node)
+        walks = _run_random_walk(edge_index, rowptr, col, starts, walk_length)
+        seen = torch.zeros(num_nodes, device=device, dtype=torch.bool)
+        seen[seeds] = True
+        nodes_g = [seeds]
+        total = int(seeds.numel())
+        for d in range(1, walk_length + 1):
+            if total >= max_nodes_per_group:
+                break
+            dst = walks[:, d]
+            valid = dst >= 0
+            if d > 1:
+                prev = walks[:, d - 1]
+                valid = valid & (dst != prev)
+            if not valid.any():
+                continue
+            dst_valid = dst[valid]
+            unseen = ~seen[dst_valid]
+            if not unseen.any():
+                continue
+            dst_keep = dst_valid[unseen]
+            remaining = max_nodes_per_group - total
+            if dst_keep.numel() > remaining:
+                dst_keep = dst_keep[:remaining]
+            seen[dst_keep] = True
+            nodes_g.append(dst_keep)
+            total += int(dst_keep.numel())
+        group_nodes.append(torch.cat(nodes_g) if len(nodes_g) > 1 else seeds)
+    return group_nodes
+
+
+class SubgraphSampler:
+    """Base sampler that returns a subgraph given the current batch nodes."""
+
+    def sample(self, edge_index: Tensor, seed_nodes: Tensor, num_nodes: int) -> Tensor:
+        raise NotImplementedError
+
+
+class IdentitySubgraphSampler(SubgraphSampler):
+    """Return the incoming edge_index unchanged."""
+
+    def sample(self, edge_index: Tensor, seed_nodes: Tensor, num_nodes: int) -> Tensor:
+        return edge_index
+
+
+class EdgeDropSubgraphSampler(SubgraphSampler):
+    """Randomly drop edges with a fixed ratio."""
+
+    def __init__(self, drop_ratio: float) -> None:
+        self.drop_ratio = max(0.0, min(1.0, float(drop_ratio)))
+
+    def sample(self, edge_index: Tensor, seed_nodes: Tensor, num_nodes: int) -> Tensor:
+        if edge_index.numel() == 0 or self.drop_ratio <= 0:
+            return edge_index
+        keep_mask = torch.rand(edge_index.size(1), device=edge_index.device) > self.drop_ratio
+        # Avoid empty graphs
+        if not keep_mask.any():
+            return edge_index
+        return edge_index[:, keep_mask]
+
+
+class HeadSubgraphProvider:
+    """Produce per-head edge_index views."""
+
+    def build(self, edge_index: Tensor, num_heads: int):
+        raise NotImplementedError
+
+
+class SharedHeadSubgraphProvider(HeadSubgraphProvider):
+    """All heads share the same edge_index."""
+
+    def build(self, edge_index, num_heads: int):
+        if isinstance(edge_index, list) and len(edge_index) > 0:
+            edge_index = edge_index[0]
+        return [edge_index for _ in range(num_heads)]
+
+
+class GroupedHeadSubgraphProvider(HeadSubgraphProvider):
+    """
+    Split edges into N groups (configurable), then assign each head to a group.
+    Heads in the same group share the same subgraph.
+    """
+
+    def __init__(self, num_groups: int) -> None:
+        self.num_groups = max(1, int(num_groups))
+
+    def build(self, edge_index, num_heads: int):
+        if isinstance(edge_index, list) and len(edge_index) > 0:
+            edge_index = edge_index[0]
+        if edge_index.numel() == 0:
+            return [edge_index for _ in range(num_heads)]
+
+        groups = min(self.num_groups, num_heads)
+        heads_per_group = (num_heads + groups - 1) // groups
+
+        group_edges = [edge_index.new_zeros((2, 0), dtype=edge_index.dtype) for _ in range(groups)]
+        src = edge_index[0].to(torch.long)
+        buckets = [[] for _ in range(groups)]
+        for idx in range(edge_index.size(1)):
+            g = int(src[idx].item() % groups)
+            buckets[g].append(idx)
+        for g in range(groups):
+            if buckets[g]:
+                group_edges[g] = edge_index[:, buckets[g]]
+
+        head_edges: List[Tensor] = []
+        for h in range(num_heads):
+            g = min(h // heads_per_group, groups - 1)
+            head_edges.append(group_edges[g])
+        return head_edges
+
+
+class HopMappedHeadSubgraphProvider(HeadSubgraphProvider):
+    """
+    Map head groups to pre-defined hop buckets. Buckets由外部传入的列表确定。
+    """
+
+    def __init__(self, hop_sequence: List[int], num_groups: int) -> None:
+        self.hop_sequence = hop_sequence
+        self.num_groups = max(1, int(num_groups))
+
+    def build(self, edge_buckets: List[Tensor], num_heads: int):
+        if not isinstance(edge_buckets, list) or len(edge_buckets) == 0:
+            return [edge_buckets for _ in range(num_heads)]
+
+        groups = min(self.num_groups, num_heads)
+        heads_per_group = (num_heads + groups - 1) // groups
+
+        # 准备组子图
+        group_edges: List[Tensor] = []
+        for g in range(groups):
+            hop_idx = self.hop_sequence[g % len(self.hop_sequence)]
+            if hop_idx < len(edge_buckets):
+                bucket = edge_buckets[hop_idx]
+            else:
+                bucket = edge_buckets[0]
+            if bucket is None:
+                bucket = edge_buckets[0] if edge_buckets else None
+            group_edges.append(bucket)
+
+        head_edges: List[Tensor] = []
+        for h in range(num_heads):
+            g = min(h // heads_per_group, groups - 1)
+            head_edges.append(group_edges[g])
+        return head_edges
+
+
+def build_subgraph_sampler(args) -> SubgraphSampler:
+    if getattr(args, "subgraph_sampler", "identity") == "edge_drop":
+        return EdgeDropSubgraphSampler(getattr(args, "edge_drop_ratio", 0.0))
+    return IdentitySubgraphSampler()
+
+
+def build_head_subgraph_provider(args) -> HeadSubgraphProvider:
+    provider = getattr(args, "head_subgraph_provider", "hop")
+    num_groups = getattr(args, "head_groups", 4)
+    if provider == "hop":
+        hop_sequence = list(range(max(1, int(num_groups))))
+        return HopMappedHeadSubgraphProvider(hop_sequence, num_groups)
+    return SharedHeadSubgraphProvider()
+
+
+def get_batch_blockize(args, x, y, idx_batch, rest_split_sizes, device, edge_index, N, sampler: Optional[SubgraphSampler] = None, head_provider: Optional[HeadSubgraphProvider] = None):
+    """
+    Generate a local subsequence in sequence parallel and slice the corresponding edge_index.
+    """
     seq_parallel_world_size = get_sequence_parallel_world_size() if sequence_parallel_is_initialized() else 1
     seq_parallel_world_rank = get_sequence_parallel_rank() if sequence_parallel_is_initialized() else 0
-    if seq_parallel_world_size > 1:
-        src_rank = get_sequence_parallel_src_rank()
-        group = get_sequence_parallel_group()
     seq_length = args.seq_len
 
-    x_i = x[idx_batch] # [s, x_d]
-    y_i = y[idx_batch] # [s]
+    x_i = x[idx_batch]  # [s, x_d]
+    y_i = y[idx_batch]  # [s]
 
-    # Get sub edge_index according to current sequence nodes
-    edge_index_i_raw = gen_sub_edge_index(edge_index, idx_batch, N) 
-    
+    edge_index_i = gen_sub_edge_index(edge_index, idx_batch, N)
+
     if args.model == "graphormer":
-        # Fix edge index: add new edges of virtual nodes
-        edge_index_i_raw = fix_edge_index(edge_index_i_raw, idx_batch.shape[0])
-    
-    # Broadcast the reordered edges & sorted indices to all ranks
-    if args.reorder:
-        if args.rank == 0:
-            edge_index_i, sorted_indices = reformat_graph(edge_index_i_raw, k, block_size, beta_coeffi)
-            
-            sizes_broad = torch.LongTensor([edge_index_i.shape[1], sorted_indices.shape[0]]).to(device)
-        else:
-            sizes_broad = torch.empty(2, dtype=torch.int64, device=device)
-        dist.barrier()
-        dist.broadcast(sizes_broad, src_rank, group=group)
-        
-        if args.rank == 0:
-            edge_index_i_broad = edge_index_i.to(device)
-            sorted_indices_broad = sorted_indices.to(device)
-        else:
-            shape = sizes_broad.tolist()
-            edge_index_i_broad = torch.empty((2, shape[0]),
-                                    device=device,
-                                    dtype=torch.int64)
-            sorted_indices_broad = torch.empty((shape[1]),
-                                    device=device,
-                                    dtype=torch.int64)
-        dist.broadcast(edge_index_i_broad, src_rank, group=group)
-        dist.broadcast(sorted_indices_broad, src_rank, group=group)
-        edge_index_i = edge_index_i_broad.to("cpu")
-        sorted_indices = sorted_indices_broad.to("cpu")
-        # dist.barrier()
-        
-        # Remap x, y, attn_bias tensors according to the sorted indices
-        if args.model == "graphormer":
-            sorted_indices = sorted_indices[sorted_indices != 0]
-            sorted_indices = sorted_indices - 1
-            attn_bias = None
-            # attn_bias = torch.zeros(idx_batch.shape[0], idx_batch.shape[0], args.attn_bias_dim, dtype=torch.float32) # For quicker experiments, use dummy attn bias
-            # attn_bias = torch.index_select(attn_bias, 0, sorted_indices)
-            # attn_bias = torch.index_select(attn_bias, 1, sorted_indices)
-        else:
-            attn_bias = None
-        x_i = torch.index_select(x_i, 0, sorted_indices)
-        y_i = torch.index_select(y_i, 0, sorted_indices)
-    else:
-        edge_index_i = edge_index_i_raw
-    
+        edge_index_i = fix_edge_index(edge_index_i, idx_batch.shape[0])
+
+    sampler = sampler or IdentitySubgraphSampler()
+    edge_index_i = sampler.sample(edge_index_i, idx_batch, N)
+
+    attn_bias = None
+    edge_index_i_heads = edge_index_i
+    if getattr(args, "head_hop_edges", False):
+        edge_index_i_heads = build_head_hop_edges(
+            edge_index=edge_index_i,
+            num_nodes=x_i.size(0),
+            num_heads=args.num_heads,
+            num_groups=getattr(args, "head_groups", args.num_heads),
+            device=edge_index_i.device,
+            walk_length=getattr(args, "head_hop_walk_length", 4),
+            walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
+        )
 
     if idx_batch.shape[0] < seq_length:
         assert rest_split_sizes is not None, 'Rest split_sizes should not be None'
-        seq_length = max(rest_split_sizes) * seq_parallel_world_size # 14 * 4 = 56 
+        seq_length = max(rest_split_sizes) * seq_parallel_world_size
         x_i = pad_2d(x_i, seq_length)
         y_i = pad_y(y_i, seq_length)
 
@@ -485,39 +717,164 @@ def get_batch_reorder_blockize(args, x, y, idx_batch, rest_split_sizes, device, 
         y_i_list = [t for t in torch.split(y_i, afterpad_split_sizes, dim=0)]
 
         if args.model == "graphormer":
-            # Adjust edge index values w/o merging global token after all2all 
-            edge_index_i = adjust_edge_index_nomerge(edge_index_i, max(rest_split_sizes))   
+            edge_index_i_heads = _apply_to_edge_index(
+                edge_index_i_heads,
+                lambda e: adjust_edge_index_nomerge(e, max(rest_split_sizes)),
+            )
 
         x_i = x_i_list[seq_parallel_world_rank]
         y_i = y_i_list[seq_parallel_world_rank]
-        edge_index_i = edge_index_i
-        
-        if attn_bias is not None:
-            attn_bias = pad_attn_bias(attn_bias, seq_length)
-            attn_bias_list = [t for t in torch.split(attn_bias, afterpad_split_sizes, dim=0)]
-            attn_bias = attn_bias_list[seq_parallel_world_rank] # [s/p, s, d]
-        
+        sub_seq_start = seq_parallel_world_rank * max(rest_split_sizes)
+        sub_seq_end = sub_seq_start + x_i.size(0)
+        edge_index_i_heads = _apply_to_edge_index(
+            edge_index_i_heads,
+            lambda e: slice_edge_index(e, sub_seq_start, sub_seq_end),
+        )
+
         last_batch_flag(True)
-        
     else:
         assert seq_length % seq_parallel_world_size == 0
         sub_seq_length = seq_length // seq_parallel_world_size
         sub_seq_start = seq_parallel_world_rank * sub_seq_length
         sub_seq_end = (seq_parallel_world_rank + 1) * sub_seq_length
-        
+
         x_i = x_i[sub_seq_start:sub_seq_end, :]
         y_i = y_i[sub_seq_start:sub_seq_end]
-        
-        if attn_bias is not None:
-            attn_bias = attn_bias[sub_seq_start:sub_seq_end, :, :] 
+        edge_index_i_heads = _apply_to_edge_index(
+            edge_index_i_heads,
+            lambda e: slice_edge_index(e, sub_seq_start, sub_seq_end),
+        )
 
         if args.model == "graphormer":
-            # Adjust edge index values w/o merging global token after all2all
-            edge_index_i = adjust_edge_index_nomerge(edge_index_i, sub_seq_length)
-            
+            edge_index_i_heads = _apply_to_edge_index(
+                edge_index_i_heads,
+                lambda e: adjust_edge_index_nomerge(e, sub_seq_length),
+            )
+
         last_batch_flag(False)
 
-    return (x_i, y_i, edge_index_i, attn_bias)
+    return (x_i, y_i, edge_index_i_heads, attn_bias)
+
+
+def get_batch_reorder_blockize(args, x, y, idx_batch, rest_split_sizes, device, edge_index, N, k, coverage_tracker=None):
+    """
+    Generate a local subsequence in sequence parallel with optional edge reordering.
+    """
+    seq_parallel_world_size = get_sequence_parallel_world_size() if sequence_parallel_is_initialized() else 1
+    seq_parallel_world_rank = get_sequence_parallel_rank() if sequence_parallel_is_initialized() else 0
+    if seq_parallel_world_size > 1:
+        src_rank = get_sequence_parallel_src_rank()
+        group = get_sequence_parallel_group()
+    seq_length = args.seq_len
+
+    x_i = x[idx_batch]
+    y_i = y[idx_batch]
+
+    edge_index_i_raw = gen_sub_edge_index(edge_index, idx_batch, N)
+    if coverage_tracker is not None:
+        coverage_tracker.update(idx_batch, edge_index_i_raw)
+
+    if args.model == "graphormer":
+        edge_index_i_raw = fix_edge_index(edge_index_i_raw, idx_batch.shape[0])
+
+    if args.rank == 0:
+        edge_index_i, sorted_indices = reformat_graph(edge_index_i_raw, k)
+        sizes_broad = torch.LongTensor([edge_index_i.shape[1], sorted_indices.shape[0]]).to(device)
+    else:
+        sizes_broad = torch.empty(2, dtype=torch.int64, device=device)
+    if seq_parallel_world_size > 1:
+        dist.barrier()
+        dist.broadcast(sizes_broad, src_rank, group=group)
+
+    if args.rank == 0:
+        edge_index_i_broad = edge_index_i.to(device)
+        sorted_indices_broad = sorted_indices.to(device)
+    else:
+        shape = sizes_broad.tolist()
+        edge_index_i_broad = torch.empty((2, shape[0]), device=device, dtype=torch.int64)
+        sorted_indices_broad = torch.empty((shape[1]), device=device, dtype=torch.int64)
+    if seq_parallel_world_size > 1:
+        dist.broadcast(edge_index_i_broad, src_rank, group=group)
+        dist.broadcast(sorted_indices_broad, src_rank, group=group)
+    edge_index_i = edge_index_i_broad.to("cpu")
+    sorted_indices = sorted_indices_broad.to("cpu")
+
+    if args.model == "graphormer":
+        sorted_indices = sorted_indices[sorted_indices != 0]
+        sorted_indices = sorted_indices - 1
+        attn_bias = None
+    else:
+        attn_bias = None
+    x_i = torch.index_select(x_i, 0, sorted_indices)
+    y_i = torch.index_select(y_i, 0, sorted_indices)
+    edge_index_i_heads = edge_index_i
+    if getattr(args, "head_hop_edges", False):
+        edge_index_i_heads = build_head_hop_edges(
+            edge_index=edge_index_i,
+            num_nodes=x_i.size(0),
+            num_heads=args.num_heads,
+            num_groups=getattr(args, "head_groups", args.num_heads),
+            device=edge_index_i.device,
+            walk_length=getattr(args, "head_hop_walk_length", 4),
+            walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
+        )
+
+    if idx_batch.shape[0] < seq_length:
+        assert rest_split_sizes is not None, "Rest split_sizes should not be None"
+        seq_length = max(rest_split_sizes) * seq_parallel_world_size
+        x_i = pad_2d(x_i, seq_length)
+        y_i = pad_y(y_i, seq_length)
+
+        afterpad_split_sizes = [max(rest_split_sizes)] * seq_parallel_world_size
+        x_i_list = [t for t in torch.split(x_i, afterpad_split_sizes, dim=0)]
+        y_i_list = [t for t in torch.split(y_i, afterpad_split_sizes, dim=0)]
+
+        if args.model == "graphormer":
+            edge_index_i_heads = _apply_to_edge_index(
+                edge_index_i_heads,
+                lambda e: adjust_edge_index_nomerge(e, max(rest_split_sizes)),
+            )
+
+        x_i = x_i_list[seq_parallel_world_rank]
+        y_i = y_i_list[seq_parallel_world_rank]
+        sub_seq_start = seq_parallel_world_rank * max(rest_split_sizes)
+        sub_seq_end = sub_seq_start + x_i.size(0)
+        edge_index_i_heads = _apply_to_edge_index(
+            edge_index_i_heads,
+            lambda e: slice_edge_index(e, sub_seq_start, sub_seq_end),
+        )
+
+        if attn_bias is not None:
+            attn_bias = pad_attn_bias(attn_bias, seq_length)
+            attn_bias_list = [t for t in torch.split(attn_bias, afterpad_split_sizes, dim=0)]
+            attn_bias = attn_bias_list[seq_parallel_world_rank]
+
+        last_batch_flag(True)
+    else:
+        assert seq_length % seq_parallel_world_size == 0
+        sub_seq_length = seq_length // seq_parallel_world_size
+        sub_seq_start = seq_parallel_world_rank * sub_seq_length
+        sub_seq_end = (seq_parallel_world_rank + 1) * sub_seq_length
+
+        x_i = x_i[sub_seq_start:sub_seq_end, :]
+        y_i = y_i[sub_seq_start:sub_seq_end]
+        edge_index_i_heads = _apply_to_edge_index(
+            edge_index_i_heads,
+            lambda e: slice_edge_index(e, sub_seq_start, sub_seq_end),
+        )
+
+        if attn_bias is not None:
+            attn_bias = attn_bias[sub_seq_start:sub_seq_end, :, :]
+
+        if args.model == "graphormer":
+            edge_index_i_heads = _apply_to_edge_index(
+                edge_index_i_heads,
+                lambda e: adjust_edge_index_nomerge(e, sub_seq_length),
+            )
+
+        last_batch_flag(False)
+
+    return (x_i, y_i, edge_index_i_heads, attn_bias)
 
 
 def get_batch_papers100m(args, x, y, idx_batch, attn_bias, rest_split_sizes, device, edge_index, N):
@@ -539,17 +896,6 @@ def get_batch_papers100m(args, x, y, idx_batch, attn_bias, rest_split_sizes, dev
     if args.model == "graphormer":
         # Fix edge index: add new edges of virtual nodes
         edge_index_i = fix_edge_index(edge_index_i, idx_batch.shape[0])
-
-    if args.reorder:
-        k, block_size = 8, 16 # number of partitions
-        edge_index_i, sorted_indices = reformat_graph(edge_index_i, k, block_size)
-        
-        if args.model == "graphormer":
-            sorted_indices = sorted_indices[sorted_indices != 0]
-            sorted_indices = sorted_indices - 1
-
-        x_i = torch.index_select(x_i, 0, sorted_indices)
-        y_i = torch.index_select(y_i, 0, sorted_indices)
 
     if idx_batch.shape[0] < seq_length:
         # 对于剩余的node，feature用0 pad, label用-100 pad, attn_bias用0填充，

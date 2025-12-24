@@ -1,7 +1,5 @@
 import numpy as np
 import torch
-import os.path as osp
-import pickle
 from torch_geometric.data import InMemoryDataset, download_url, Data
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
@@ -19,7 +17,14 @@ import random
 import math
 import pickle as pkl
 from ogb.nodeproppred import NodePropPredDataset
+import argparse
 
+def shuffle_edges(edge_index, dim=1) -> None:
+    idx = torch.randperm(edge_index.size(1))
+    if dim == 0:
+        return torch.stack([edge_index[0, idx], edge_index[1, :]], dim=0)
+    elif dim == 1:
+        return torch.stack([edge_index[0, :], edge_index[1, idx]], dim=0)
 
 def adj_normalize(mx):
     "A' = (D + I)^-1/2 * ( A + I ) * (D + I)^-1/2"
@@ -53,20 +58,9 @@ def get_dataset(dataset_name):
     print(f'Get dataset {dataset_name}...')
 
     dataset_dir = './dataset/'
-    dataset_path = dataset_dir + dataset_name + '/edge_index.pt'
-    split_seed = 0
     if not os.path.exists(f'{dataset_dir}/{dataset_name}'): 
         os.makedirs(f'{dataset_dir}/{dataset_name}')
 
-    # if os.path.exists(dataset_path):
-    #     print(f'Already downloaded. Loading {dataset_name}...')
-    #     data_x = torch.load(dataset_dir + dataset_name + '/x.pt')
-    #     data_y = torch.load(dataset_dir + dataset_name + '/y.pt')
-    #     adj = sp.load_npz(dataset_dir + dataset_name + '/adj.npz')
-        
-    #     normalized_adj = sp.load_npz(dataset_dir + dataset_name + '/normalized_adj.npz')
-    #     column_normalized_adj = sp.load_npz(dataset_dir + dataset_name + '/column_normalized_adj.npz')
-    # else: 
     if True:
         if dataset_name in ['cora', 'citeseer', 'pubmed']: 
             dataset = Planetoid(root=dataset_dir, name=dataset_name)       
@@ -171,7 +165,7 @@ def get_dataset(dataset_name):
             edge_index = coalesce(edge_index, num_nodes=data_x.size(0))
             
         elif dataset_name in ['amazon']:
-            dataset_dir = "/home/mzhang/data/"
+            # dataset_dir = '/home/zhaochu/torchgt/utils/dataset/'
             adj = sp.load_npz(os.path.join(dataset_dir, dataset_name, 'adj_full.npz'))
             data_x = np.load(os.path.join(dataset_dir, dataset_name, 'feats.npy'))
             data_y = np.load(os.path.join(dataset_dir, dataset_name, 'labels.npy'))
@@ -188,7 +182,7 @@ def get_dataset(dataset_name):
             edge_index = coalesce(edge_index, num_nodes=data_x.size(0))
             
         elif dataset_name in ['pokec']:
-            fulldata = scipy.io.loadmat(f'/home/mzhang/work/GTNodeLevel/dataset/pokec.mat')
+            fulldata = scipy.io.loadmat(f'/path/to/dataset/pokec.mat')
             edge_index = torch.tensor(fulldata['edge_index'], dtype=torch.long)
             
             data_x = torch.tensor(fulldata['node_feat']).float()
@@ -204,17 +198,28 @@ def get_dataset(dataset_name):
             column_normalized_adj = column_normalize(adj)
 
         elif dataset_name in {"ogbn-papers100M"}:
-            file_dir = '/home/mzhang/data/'
+            file_dir = '/home/zhaochu/torchgt/utils/dataset/'
             ogb_dataset = NodePropPredDataset(name=dataset_name, root=file_dir)
             split_idx = ogb_dataset.get_idx_split()
             idx_train, idx_val, idx_test = split_idx["train"], split_idx["valid"], split_idx["test"]
-            
+
             data_y = torch.as_tensor(ogb_dataset.labels).squeeze(1)
-            # data_x = torch.as_tensor(ogb_dataset.graph['node_feat'])
+            data_x = torch.as_tensor(ogb_dataset.graph['node_feat'])
             edge_index = torch.as_tensor(ogb_dataset.graph['edge_index'])
-            # num_nodes=ogb_dataset.graph['num_nodes']
-            # adj = sp.coo_matrix((np.ones(edge_index.shape[1]), (edge_index[0], edge_index[1])),
-            #                         shape=(num_nodes, num_nodes), dtype=np.float32)
+            num_nodes = ogb_dataset.graph['num_nodes']
+            adj = sp.coo_matrix(
+                (np.ones(edge_index.shape[1]), (edge_index[0], edge_index[1])),
+                shape=(num_nodes, num_nodes),
+                dtype=np.float32,
+            )
+            if torch.is_floating_point(data_y):
+                data_y = torch.nan_to_num(data_y, nan=-1.0)
+            else:
+                nan_mask = torch.isnan(data_y)
+                if nan_mask.any():
+                    data_y = data_y.masked_fill(nan_mask, -1)
+            data_y = data_y.to(torch.long)
+
             # normalized_adj = adj_normalize(adj)
             # column_normalized_adj = column_normalize(adj)
         
@@ -226,6 +231,11 @@ def get_dataset(dataset_name):
             data_y = torch.as_tensor(ogb_dataset.labels).squeeze(1)
             data_x = torch.as_tensor(ogb_dataset.graph['node_feat'])
             edge_index = torch.as_tensor(ogb_dataset.graph['edge_index'])
+
+            dim = 1
+            edge_index_copy = edge_index.clone()
+            edge_index = shuffle_edges(edge_index, dim=dim)
+           
             num_nodes=ogb_dataset.graph['num_nodes']
             adj = sp.coo_matrix((np.ones(edge_index.shape[1]), (edge_index[0], edge_index[1])),
                                     shape=(num_nodes, num_nodes), dtype=np.float32)
@@ -369,4 +379,7 @@ def rand_nodes_seq(dataset_name, k1, p=None):
 
 
 if __name__ == '__main__':
-    get_dataset('ogbn-arxiv')
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--dataset', required=True)
+    args = parser.parse_args()
+    get_dataset(args.dataset)
