@@ -85,7 +85,7 @@ class _SeqGather(torch.autograd.Function):
         corresponding slice."""
         # Bypass the function if we are using only 1 GPU.
         if ctx.seq_world_size == 1:
-            return grad_output
+            return (grad_output, None)
 
         # Split along second dimension.
         input_list = split_tensor_along_second_dim(grad_output, ctx.seq_world_size)

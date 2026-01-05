@@ -243,6 +243,31 @@ class CoreAttention(nn.Module):
         k = k.view(-1, self.num_attention_heads_per_partition, self.hidden_size_per_attention_head)
         v = v.view(-1, self.num_attention_heads_per_partition, self.hidden_size_per_attention_head)
 
+        if isinstance(edge_index, list):
+            edge_list = edge_index
+            if len(edge_list) > self.num_attention_heads_per_partition and sequence_parallel_is_initialized():
+                head_start = get_sequence_parallel_rank() * self.num_attention_heads_per_partition
+                edge_list = edge_list[head_start: head_start + self.num_attention_heads_per_partition]
+            if len(edge_list) != self.num_attention_heads_per_partition:
+                edge_list = [edge_list[i % len(edge_list)] for i in range(self.num_attention_heads_per_partition)]
+
+            wV = torch.zeros_like(v)
+            Z = v.new_zeros(v.size(0), self.num_attention_heads_per_partition, 1)
+            for h in range(self.num_attention_heads_per_partition):
+                e = edge_list[h]
+                if e is None or e.numel() == 0:
+                    continue
+                src_idx = e[0].to(torch.long)
+                dst_idx = e[1].to(torch.long)
+                src = k[:, h, :][src_idx]
+                dest = q[:, h, :][dst_idx]
+                score = torch.mul(src, dest).sum(-1, keepdim=True).clamp(-5, 5)
+                score = torch.exp(score / self.scale)
+                msg = v[:, h, :][src_idx] * score
+                scatter(msg, dst_idx, dim=0, out=wV[:, h, :], reduce='add')
+                scatter(score, dst_idx, dim=0, out=Z[:, h, :], reduce='add')
+            return wV / (Z + 1e-6)
+
         # -> [total_edges, np, hn]
         src = k[edge_index[0].to(torch.long)] 
         dest = q[edge_index[1].to(torch.long)] 

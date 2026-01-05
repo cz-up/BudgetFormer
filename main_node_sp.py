@@ -25,11 +25,45 @@ from gt_sp.initialize import (
 from gt_sp.reducer import sync_params_and_buffers
 from gt_sp.evaluate import sparse_eval_gpu
 from gt_sp.utils import (
+    get_batch_blockize,
     random_split_idx,
     get_batch_reorder_blockize,
 )
 from utils.parser_node_level import parser_add_main_args
 import math
+
+
+def resolve_attn_type(args, iter_idx, switch_points):
+    if args.attn_type == "hybrid":
+        return "full" if iter_idx in switch_points else "sparse"
+    if args.attn_type == "full":
+        return "full"
+    if args.attn_type == "flash":
+        return "flash"
+    return "sparse"
+
+
+def run_step(args, model, device, feature, y, idx_batch_cpu, sub_split_seq_lens, edge_index_global, N, attn_type):
+    x_i, y_i, edge_index_i, attn_bias = get_batch_blockize(
+        args,
+        feature,
+        y,
+        idx_batch_cpu,
+        sub_split_seq_lens,
+        edge_index_global,
+        N,
+    )
+
+    x_i = x_i.to(device)
+    y_i = y_i.to(device)
+    if isinstance(edge_index_i, list):
+        edge_index_i = [e.to(device) for e in edge_index_i]
+    else:
+        edge_index_i = edge_index_i.to(device)
+
+    out_i = model(x_i, attn_bias, edge_index_i, attn_type=attn_type)
+    loss = F.nll_loss(out_i, y_i.long())
+    return loss, out_i, y_i
 
 
 def main():
@@ -192,31 +226,31 @@ def main():
 
         num_batch = idx_train_shuffle.size(0) // args.seq_len + 1
         batch_indices = torch.split(idx_train_shuffle, args.seq_len)
+        if args.attn_type == "hybrid":
+            percent_list = [(i + 1) / args.switch_freq for i in range(args.switch_freq)]
+            switch_points = {int(len(batch_indices) * percentage) for percentage in percent_list}
+        else:
+            switch_points = set()
 
         iter_t_list = []
         t_epoch_start = time.time()
+        iter_idx = 1
         for idx_batch_cpu in batch_indices:
             t_iter_start = time.time()
             optimizer.zero_grad(set_to_none=True)
-            x_i, y_i, edge_index_i, attn_bias = get_batch_reorder_blockize(
+            attn_type = resolve_attn_type(args, iter_idx, switch_points)
+            loss, out_i, y_i = run_step(
                 args,
+                model,
+                device,
                 feature,
                 y,
                 idx_batch_cpu,
                 sub_split_seq_lens,
-                device,
                 edge_index_global,
                 N,
-                k=8,
+                attn_type,
             )
-
-            x_i = x_i.to(device)
-            y_i = y_i.to(device)
-            edge_index_i = edge_index_i.to(device)
-            attn_type = args.attn_type
-
-            out_i = model(x_i, attn_bias, edge_index_i, attn_type=attn_type)
-            loss = F.nll_loss(out_i, y_i.long())
             loss.backward()
 
             for _, param in model.named_parameters():
@@ -227,6 +261,7 @@ def main():
             optimizer.step()
             torch.cuda.synchronize()
             iter_t_list.append(time.time() - t_iter_start)
+            iter_idx += 1
 
         loss_list.append(loss.item())
         lr_scheduler.step()

@@ -315,7 +315,7 @@ class MyMalNetTiny(torch_geometric.datasets.MalNetTiny):
             item = self.get(self.indices()[idx])
             item.idx = idx
             t0 = time.time()
-            item = preprocess_item_malnet_dummy_encd(item)
+            item = preprocess_item_malnet(item)
             # print(f"N: {item.num_nodes} wrapper t: {time.time()-t0}s")
             
             # print()

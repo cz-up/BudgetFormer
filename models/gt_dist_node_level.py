@@ -95,50 +95,70 @@ class CoreAttention(nn.Module):
         k = k.view(-1, num_heads, self.hidden_size_per_attention_head)
         v = v.view(-1, num_heads, self.hidden_size_per_attention_head)
 
+        if isinstance(edge_index, list):
+            edge_list = edge_index
+            if len(edge_list) > num_heads and sequence_parallel_is_initialized():
+                head_start = get_sequence_parallel_rank() * self.num_attention_heads_per_partition
+                edge_list = edge_list[head_start: head_start + num_heads]
+            if len(edge_list) != num_heads:
+                edge_list = [edge_list[i % len(edge_list)] for i in range(num_heads)]
+
+            wV = torch.zeros_like(v)
+            Z = v.new_zeros(v.size(0), num_heads, 1)
+            for h in range(num_heads):
+                e = edge_list[h]
+                if e is None or e.numel() == 0:
+                    continue
+                src_idx = e[0].to(torch.long)
+                dst_idx = e[1].to(torch.long)
+                src = k[:, h, :][src_idx]
+                dest = q[:, h, :][dst_idx]
+                score = torch.mul(src, dest).sum(-1, keepdim=True).clamp(-5, 5)
+                score = torch.exp(score / self.scale)
+                msg = v[:, h, :][src_idx] * score
+                scatter(msg, dst_idx, dim=0, out=wV[:, h, :], reduce='add')
+                scatter(score, dst_idx, dim=0, out=Z[:, h, :], reduce='add')
+            return wV / (Z + 1e-6)
+
         # -> [total_edges, np, hn]
-        src = k[edge_index[0].to(torch.long)] 
-        dest = q[edge_index[1].to(torch.long)] 
+        src = k[edge_index[0].to(torch.long)]
+        dest = q[edge_index[1].to(torch.long)]
         score = torch.mul(src, dest)  # element-wise multiplication
-            
+
         # Scale scores by sqrt(d)
         score = score / self.scale
 
         # Use available edge features to modify the scores for edges
-        # -> [total_edges, np, 1] 
+        # -> [total_edges, np, 1]
         score = score.sum(-1, keepdim=True).clamp(-5, 5)
 
         # [b, np, s+1, s+1] -> [b, s+1, s+1, np] -> [b, s+1, b, s+1, np]
         if attn_bias is not None:
-            attn_bias = attn_bias.permute(0, 2, 3, 1).contiguous().unsqueeze(2).repeat(1, 1, batch_size, 1, 1)  
-            attn_bias = attn_bias.view(batch_size*node_num, batch_size*node_num, num_heads)
+            attn_bias = attn_bias.permute(0, 2, 3, 1).contiguous().unsqueeze(2).repeat(1, 1, batch_size, 1, 1)
+            attn_bias = attn_bias.view(batch_size * node_num, batch_size * node_num, num_heads)
             attn_bias = attn_bias.repeat(1, 1, 1, num_heads)
 
             score = score + \
-                    attn_bias[edge_index[0].to(torch.long), edge_index[1].to(torch.long), :].unsqueeze(2) 
+                    attn_bias[edge_index[0].to(torch.long), edge_index[1].to(torch.long), :].unsqueeze(2)
 
         # softmax -> [total_edges, np, 1]
-        # print(score[80:150, :2, 0])
-        score = torch.exp(score) 
-        # print(score[80:150, :2, 0])
+        score = torch.exp(score)
 
         # Apply attention score to each source node to create edge messages
         # -> [total_edges, np, hn]
         msg = v[edge_index[0].to(torch.long)] * score
-        # print(msg[110:150, :2, 0])
-        # exit(0)
-        
+
         # Add-up real msgs in destination nodes as given by edge_index[1]
         # -> [total_s, np, hn]
-        wV = torch.zeros_like(v)  
+        wV = torch.zeros_like(v)
         scatter(msg, edge_index[1], dim=0, out=wV, reduce='add')
 
         # Compute attention normalization coefficient
         # -> [total_s, np, 1]
-        Z = score.new_zeros(v.size(0), num_heads, 1)    
+        Z = score.new_zeros(v.size(0), num_heads, 1)
         scatter(score, edge_index[1], dim=0, out=Z, reduce='add')
 
         x = wV / (Z + 1e-6)
-        
         return x
 
 

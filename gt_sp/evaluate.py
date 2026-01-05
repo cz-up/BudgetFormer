@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 import numpy as np
-from gt_sp.utils import get_batch, gen_sub_edge_index
+from gt_sp.utils import get_batch, gen_sub_edge_index, build_head_hop_edges
 from gt_sp.initialize import (
     get_sequence_parallel_world_size,
     set_last_batch_global_token_indices
@@ -244,6 +244,16 @@ def sparse_eval_gpu_subset_batch(args, model, x, y, sub_idx, adjs, edge_index, d
         attn_bias = torch.cat([torch.tensor(i[idx_i, :][:, idx_i].toarray(), dtype=torch.float32).unsqueeze(0) for i in adjs])
         attn_bias = attn_bias.permute(1, 2, 0)
         edge_index_i = gen_sub_edge_index(edge_index, idx_i, N) # [2, num_edges] index plused global token
+        if getattr(args, "head_hop_edges", False):
+            edge_index_i = build_head_hop_edges(
+                edge_index=edge_index_i,
+                num_nodes=x_i.size(0),
+                num_heads=args.num_heads,
+                num_groups=getattr(args, "head_groups", args.num_heads),
+                device=edge_index_i.device,
+                walk_length=getattr(args, "head_hop_walk_length", 4),
+                walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
+            )
         
         x_i, y_i, edge_index_i, attn_bias = x_i.to(device), y_i.to(device), edge_index_i.to(device), attn_bias.to(device)
         
@@ -302,6 +312,10 @@ def sparse_eval_cpu_subset_batch_dummy_bias(args, model, x, y, sub_idx, dummy_at
 
         edge_index_i = gen_sub_edge_index(edge_index, idx_i, N) # [2, num_edges] index plused global token
         
+        if isinstance(edge_index_i, list):
+            edge_index_i = [e.to(device) for e in edge_index_i]
+        else:
+            edge_index_i = edge_index_i.to(device)
         pred = model(x_i, dummy_attn_bias, edge_index_i, attn_type=attn_type)
         loss = F.nll_loss(pred, y_i)
         loss_list.append(loss.item())
@@ -350,8 +364,22 @@ def sparse_eval_gpu(args, model, x, y, sub_idx, attn_bias, edge_index, device):
         # if idx_i.shape[0] < args.seq_len:
         #     dummy_attn_bias = torch.zeros(idx_i.shape[0], idx_i.shape[0], args.attn_bias_dim, dtype=torch.float32)
         edge_index_i = gen_sub_edge_index(edge_index, idx_i, N) # [2, num_edges] index plused global token
+        if getattr(args, "head_hop_edges", False):
+            edge_index_i = build_head_hop_edges(
+                edge_index=edge_index_i,
+                num_nodes=x_i.size(0),
+                num_heads=args.num_heads,
+                num_groups=getattr(args, "head_groups", args.num_heads),
+                device=edge_index_i.device,
+                walk_length=getattr(args, "head_hop_walk_length", 4),
+                walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
+            )
         
-        x_i, y_i, edge_index_i = x_i.to(device), y_i.to(device), edge_index_i.to(device)
+        x_i, y_i = x_i.to(device), y_i.to(device)
+        if isinstance(edge_index_i, list):
+            edge_index_i = [e.to(device) for e in edge_index_i]
+        else:
+            edge_index_i = edge_index_i.to(device)
 
         pred = model(x_i, attn_bias, edge_index_i, attn_type=attn_type)
         loss = F.nll_loss(pred, y_i)

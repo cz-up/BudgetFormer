@@ -6,7 +6,7 @@ def parser_add_main_args(parser):
     # main args
     parser.add_argument('--device', type=int, default=0, help='device id')
     parser.add_argument('--dataset_dir', type=str, default='./dataset/')
-    parser.add_argument('--dataset', type=str, default='pubmed')
+    parser.add_argument('--dataset', type=str, default='ogbn-arxiv')
 
     # model args
     parser.add_argument('--model', type=str, default="graphormer")
@@ -49,6 +49,12 @@ def parser_add_main_args(parser):
                         help='为不同 head 提供不同子图的方式')
     parser.add_argument('--head_groups', type=int, default=4,
                         help='将所有 head 平分到的子图组数')
+    parser.add_argument('--head_hop_edges', action='store_true', default=False,
+                        help='为不同 head 生成不同 hop 的子图')
+    parser.add_argument('--head_hop_walk_length', type=int, default=4,
+                        help='head hop 随机游走长度')
+    parser.add_argument('--head_hop_walks_per_node', type=int, default=2,
+                        help='head hop 随机游走次数/节点')
     parser.add_argument('--head_rw_walks_factor', type=float, default=1.0,
                         help='每节点随机游走次数=平均度*系数')
     parser.add_argument('--head_rw_length_factor', type=float, default=1.0,

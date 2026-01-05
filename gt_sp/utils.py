@@ -449,6 +449,7 @@ def build_head_hop_edges(
     """
     根据 hop buckets 构建 per-head edge_index 列表。
     """
+    num_groups = max(1, min(int(num_groups), int(walk_length)))
     buckets = compute_hop_buckets_random_walk(
         edge_index=edge_index,
         num_nodes=num_nodes,
@@ -674,7 +675,7 @@ def build_head_subgraph_provider(args) -> HeadSubgraphProvider:
     return SharedHeadSubgraphProvider()
 
 
-def get_batch_blockize(args, x, y, idx_batch, rest_split_sizes, device, edge_index, N, sampler: Optional[SubgraphSampler] = None, head_provider: Optional[HeadSubgraphProvider] = None):
+def get_batch_blockize(args, x, y, idx_batch, rest_split_sizes, edge_index, N):
     """
     Generate a local subsequence in sequence parallel and slice the corresponding edge_index.
     """
@@ -688,10 +689,8 @@ def get_batch_blockize(args, x, y, idx_batch, rest_split_sizes, device, edge_ind
     edge_index_i = gen_sub_edge_index(edge_index, idx_batch, N)
 
     if args.model == "graphormer":
-        edge_index_i = fix_edge_index(edge_index_i, idx_batch.shape[0])
+        edge_index_i = fix_edge_index(edge_index, idx_batch.shape[0])
 
-    sampler = sampler or IdentitySubgraphSampler()
-    edge_index_i = sampler.sample(edge_index_i, idx_batch, N)
 
     attn_bias = None
     edge_index_i_heads = edge_index_i
@@ -756,7 +755,7 @@ def get_batch_blockize(args, x, y, idx_batch, rest_split_sizes, device, edge_ind
     return (x_i, y_i, edge_index_i_heads, attn_bias)
 
 
-def get_batch_reorder_blockize(args, x, y, idx_batch, rest_split_sizes, device, edge_index, N, k, coverage_tracker=None):
+def get_batch_reorder_blockize(args, x, y, idx_batch, rest_split_sizes, device, edge_index, N, k):
     """
     Generate a local subsequence in sequence parallel with optional edge reordering.
     """
@@ -771,8 +770,6 @@ def get_batch_reorder_blockize(args, x, y, idx_batch, rest_split_sizes, device, 
     y_i = y[idx_batch]
 
     edge_index_i_raw = gen_sub_edge_index(edge_index, idx_batch, N)
-    if coverage_tracker is not None:
-        coverage_tracker.update(idx_batch, edge_index_i_raw)
 
     if args.model == "graphormer":
         edge_index_i_raw = fix_edge_index(edge_index_i_raw, idx_batch.shape[0])
