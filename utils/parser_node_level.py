@@ -55,6 +55,8 @@ def parser_add_main_args(parser):
                         help='head hop 随机游走长度')
     parser.add_argument('--head_hop_walks_per_node', type=int, default=2,
                         help='head hop 随机游走次数/节点')
+    parser.add_argument('--head_hop_dynamic', action='store_true', default=False,
+                        help='是否启用基于head贡献度的动态随机游走调整')
     parser.add_argument('--head_rw_walks_factor', type=float, default=1.0,
                         help='每节点随机游走次数=平均度*系数')
     parser.add_argument('--head_rw_length_factor', type=float, default=1.0,

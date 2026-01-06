@@ -101,12 +101,18 @@ def run_step(args, model, device, batch, criterion, attn_type):
         )
         edge_index = [e.to(device) for e in edge_index]
     pred = model(x_i, in_degree_i, out_degree_i, edge_index, attn_type=attn_type)
-    if args.dataset in ["ZINC"]:
+    if args.dataset in ["ZINC", "PCQM4M-LSC"]:
         pred_loss = pred.view(-1)
         y_true = y_i.view(-1)
+    elif args.dataset in ["ogbg-molhiv", "ogbg-molpcba"]:
+        pred_loss = pred.view(-1)
+        y_true = y_i.view(-1).float()
+        mask = ~torch.isnan(y_true)
+        pred_loss = pred_loss[mask]
+        y_true = y_true[mask]
     else:
         pred_loss = pred
-        y_true = y_i.view(-1)
+        y_true = y_i
     loss = criterion(pred_loss, y_true)
     return loss, pred, y_i
 
@@ -178,6 +184,10 @@ def eval_gpu(args, model, device, packed_data, criterion, evaluator, metric, spl
 
     y_true = torch.cat(y_true_list)
     y_pred = torch.cat(y_pred_list)
+    if torch.isnan(y_pred).any() or torch.isinf(y_pred).any():
+        if args.rank == 0:
+            print(f"{split_name} warning: y_pred has NaN/Inf; applying nan_to_num before eval.")
+        y_pred = torch.nan_to_num(y_pred, nan=0.0, posinf=0.0, neginf=0.0)
     eval_metric = None
     if metric is not None:
         metric_lower = str(metric).lower()
@@ -196,7 +206,6 @@ def eval_gpu(args, model, device, packed_data, criterion, evaluator, metric, spl
                 y_true_eval = y_true.view(-1, 1)
             else:
                 y_true_eval = y_true
-            y_pred_eval = torch.sigmoid(y_pred_eval)
             eval_metric = evaluator.eval(
                 {"y_true": y_true_eval.numpy(), "y_pred": y_pred_eval.numpy()}
             )[metric_lower]
@@ -308,10 +317,49 @@ def main():
     else:
         best_val = float("-inf")
     best_test = None
+    prev_loss = None
+    prev_walk_length = getattr(args, "head_hop_walk_length", 4)
+    prev_walks_per_node = getattr(args, "head_hop_walks_per_node", 2)
+    max_walk_length = max(1, prev_walk_length * 2)
+    max_walks_per_node = max(1, prev_walks_per_node * 4)
     for epoch in range(1, args.epochs + 1):
+        if hasattr(model, "reset_head_mass_stats"):
+            model.reset_head_mass_stats()
         train_loss = train(args, model, device, train_loader, optimizer, criterion, epoch, lr_scheduler)
         if args.rank == 0:
             print(f"Epoch {epoch} train loss {train_loss:.4f}")
+        if getattr(args, "head_hop_edges", False) and getattr(args, "head_hop_dynamic", False) and hasattr(model, "get_head_mass_stats"):
+            stats = model.get_head_mass_stats()
+            if stats is not None and args.head_groups >= 2:
+                num_heads = stats.numel()
+                groups = min(args.head_groups, num_heads)
+                heads_per_group = (num_heads + groups - 1) // groups
+                group_vals = [[] for _ in range(groups)]
+                for h in range(num_heads):
+                    g = min(h // heads_per_group, groups - 1)
+                    group_vals[g].append(float(stats[h]))
+                near = np.mean(group_vals[0]) if group_vals[0] else 0.0
+                far = np.mean(group_vals[-1]) if group_vals[-1] else 0.0
+                if prev_loss is not None and train_loss > prev_loss:
+                    args.head_hop_walk_length = prev_walk_length
+                    args.head_hop_walks_per_node = prev_walks_per_node
+                else:
+                    prev_walk_length = args.head_hop_walk_length
+                    prev_walks_per_node = args.head_hop_walks_per_node
+                    if far > near:
+                        args.head_hop_walk_length = min(max_walk_length, args.head_hop_walk_length + 1)
+                    else:
+                        args.head_hop_walk_length = max(1, args.head_hop_walk_length - 1)
+                        args.head_hop_walks_per_node = min(
+                            max_walks_per_node, args.head_hop_walks_per_node + 1
+                        )
+                if args.rank == 0:
+                    print(
+                        f"Head-hop adjust: near={near:.4f} far={far:.4f} "
+                        f"walk_length={args.head_hop_walk_length} "
+                        f"walks_per_node={args.head_hop_walks_per_node}"
+                    )
+        prev_loss = train_loss
 
         val_metric = eval_gpu(
             args, model, device, val_loader, criterion, dataset.dataset.get("evaluator"), dataset.dataset.get("metric"), "valid"

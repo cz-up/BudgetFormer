@@ -50,6 +50,7 @@ def run_step(args, model, device, feature, y, idx_batch_cpu, sub_split_seq_lens,
         y,
         idx_batch_cpu,
         sub_split_seq_lens,
+        device,
         edge_index_global,
         N,
     )
@@ -219,9 +220,16 @@ def main():
     test_acc_list = []
     best_val = 0
     best_test = 0
+    prev_loss = None
+    prev_walk_length = getattr(args, "head_hop_walk_length", 4)
+    prev_walks_per_node = getattr(args, "head_hop_walks_per_node", 2)
+    max_walk_length = max(1, prev_walk_length * 2)
+    max_walks_per_node = max(1, prev_walks_per_node * 2)
 
     for epoch in range(1, args.epochs + 1):
         model.train()
+        if hasattr(model, "reset_head_mass_stats"):
+            model.reset_head_mass_stats()
         idx_train_shuffle = flatten_train_idx[torch.randperm(flatten_train_idx.size(0))].to("cpu")
 
         num_batch = idx_train_shuffle.size(0) // args.seq_len + 1
@@ -270,6 +278,39 @@ def main():
             print(
                 f"Epoch: {epoch:03d}, Loss: {np.mean(loss_list):.4f}, Epoch Time: {np.mean(epoch_t_list):.3f}s"
             )
+        train_loss = np.mean(loss_list)
+        if getattr(args, "head_hop_edges", False) and getattr(args, "head_hop_dynamic", False) and hasattr(model, "get_head_mass_stats"):
+            stats = model.get_head_mass_stats()
+            if stats is not None and args.head_groups >= 2:
+                num_heads = stats.numel()
+                groups = min(args.head_groups, num_heads)
+                heads_per_group = (num_heads + groups - 1) // groups
+                group_vals = [[] for _ in range(groups)]
+                for h in range(num_heads):
+                    g = min(h // heads_per_group, groups - 1)
+                    group_vals[g].append(float(stats[h]))
+                near = np.mean(group_vals[0]) if group_vals[0] else 0.0
+                far = np.mean(group_vals[-1]) if group_vals[-1] else 0.0
+                if prev_loss is not None and train_loss > prev_loss:
+                    args.head_hop_walk_length = prev_walk_length
+                    args.head_hop_walks_per_node = prev_walks_per_node
+                else:
+                    prev_walk_length = args.head_hop_walk_length
+                    prev_walks_per_node = args.head_hop_walks_per_node
+                    if far > near:
+                        args.head_hop_walk_length = min(max_walk_length, args.head_hop_walk_length + 1)
+                    else:
+                        args.head_hop_walk_length = max(1, args.head_hop_walk_length - 1)
+                        args.head_hop_walks_per_node = min(
+                            max_walks_per_node, args.head_hop_walks_per_node + 1
+                        )
+                if args.rank == 0:
+                    print(
+                        f"Head-hop adjust: near={near:.4f} far={far:.4f} "
+                        f"walk_length={args.head_hop_walk_length} "
+                        f"walks_per_node={args.head_hop_walks_per_node}"
+                    )
+        prev_loss = train_loss
 
         if args.rank == 0 and epoch % 5 ==0:
             t4 = time.time()

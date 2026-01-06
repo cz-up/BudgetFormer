@@ -40,7 +40,7 @@ def parser_add_main_args(parser):
                         help='warmup steps for optimizer learning rate scheduling')
     parser.add_argument('--tot_updates',  type=int, default=1000000,
                         help='used for optimizer learning rate scheduling')
-    parser.add_argument('--epochs', type=int, default=1000)
+    parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--patience', type=int, default=50, 
                         help='Patience for early stopping')
     parser.add_argument('--peak_lr', type=float, default=2e-4) # TODO larger dataset larger lr?
@@ -68,6 +68,8 @@ def parser_add_main_args(parser):
                         help='head hop 随机游走长度')
     parser.add_argument('--head_hop_walks_per_node', type=int, default=2,
                         help='head hop 随机游走次数/节点')
+    parser.add_argument('--head_hop_dynamic', action='store_true', default=False,
+                        help='是否启用基于head贡献度的动态随机游走调整')
     parser.add_argument('--head_rw_length', type=int, default=6,
                         help='随机游走近似的 walk length')
     parser.add_argument('--head_rw_walks', type=int, default=2,

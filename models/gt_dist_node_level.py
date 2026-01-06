@@ -48,6 +48,22 @@ class CoreAttention(nn.Module):
         self.num_heads = num_heads
         self.att_dropout = nn.Dropout(attention_dropout_rate)
         self.attention_dropout_rate = attention_dropout_rate
+        self._head_mass_sum = None
+        self._head_mass_count = None
+
+    def reset_head_mass_stats(self):
+        self._head_mass_sum = torch.zeros(
+            self.num_attention_heads_per_partition, dtype=torch.float32
+        )
+        self._head_mass_count = torch.zeros(
+            self.num_attention_heads_per_partition, dtype=torch.float32
+        )
+
+    def get_head_mass_stats(self):
+        if self._head_mass_sum is None:
+            return None
+        denom = torch.clamp(self._head_mass_count, min=1.0)
+        return self._head_mass_sum / denom
 
     # def full_flash_attention(self, q, k, v, attn_bias=None, mask=None):
     #     return flash_attn_func(q, k, v, self.attention_dropout_rate)
@@ -118,6 +134,9 @@ class CoreAttention(nn.Module):
                 msg = v[:, h, :][src_idx] * score
                 scatter(msg, dst_idx, dim=0, out=wV[:, h, :], reduce='add')
                 scatter(score, dst_idx, dim=0, out=Z[:, h, :], reduce='add')
+                if self._head_mass_sum is not None:
+                    self._head_mass_sum[h] += float(score.sum().detach().cpu())
+                    self._head_mass_count[h] += float(score.numel())
             return wV / (Z + 1e-6)
 
         # -> [total_edges, np, hn]
@@ -233,6 +252,19 @@ class MultiHeadAttention(nn.Module):
 
         assert x.size() == orig_q_size
         return x
+
+    def reset_head_mass_stats(self):
+        if hasattr(self.dist_attn, "local_attn"):
+            reset_fn = getattr(self.dist_attn.local_attn, "reset_head_mass_stats", None)
+            if reset_fn is not None:
+                reset_fn()
+
+    def get_head_mass_stats(self):
+        if hasattr(self.dist_attn, "local_attn"):
+            get_fn = getattr(self.dist_attn.local_attn, "get_head_mass_stats", None)
+            if get_fn is not None:
+                return get_fn()
+        return None
 
 
 class EncoderLayer(nn.Module):
@@ -360,3 +392,19 @@ class GT(nn.Module):
         output = self.MLP_layer(output[0, :, :]) 
         
         return F.log_softmax(output, dim=1)
+
+    def reset_head_mass_stats(self):
+        for layer in self.layers:
+            if hasattr(layer, "self_attention"):
+                layer.self_attention.reset_head_mass_stats()
+
+    def get_head_mass_stats(self):
+        stats = []
+        for layer in self.layers:
+            if hasattr(layer, "self_attention"):
+                layer_stats = layer.self_attention.get_head_mass_stats()
+                if layer_stats is not None:
+                    stats.append(layer_stats)
+        if not stats:
+            return None
+        return sum(stats) / len(stats)
