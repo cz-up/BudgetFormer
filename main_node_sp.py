@@ -33,16 +33,6 @@ from utils.parser_node_level import parser_add_main_args
 import math
 
 
-def resolve_attn_type(args, iter_idx, switch_points):
-    if args.attn_type == "hybrid":
-        return "full" if iter_idx in switch_points else "sparse"
-    if args.attn_type == "full":
-        return "full"
-    if args.attn_type == "flash":
-        return "flash"
-    return "sparse"
-
-
 def run_step(args, model, device, feature, y, idx_batch_cpu, sub_split_seq_lens, edge_index_global, N, attn_type):
     x_i, y_i, edge_index_i, attn_bias = get_batch_blockize(
         args,
@@ -246,7 +236,7 @@ def main():
         for idx_batch_cpu in batch_indices:
             t_iter_start = time.time()
             optimizer.zero_grad(set_to_none=True)
-            attn_type = resolve_attn_type(args, iter_idx, switch_points)
+            attn_type = args.attn_type
             loss, out_i, y_i = run_step(
                 args,
                 model,
@@ -342,6 +332,24 @@ def main():
 
     if args.rank == 0:
         print(f"Best epoch: {best_epoch}, validation accuracy: {best_val:.2%}, test accuracy: {best_test:.2%}")
+    if torch.cuda.is_available():
+        peak_alloc = torch.cuda.max_memory_allocated()
+        peak_reserved = torch.cuda.max_memory_reserved()
+        peak_tensor = torch.tensor([peak_alloc, peak_reserved], device=device, dtype=torch.long)
+        if dist.is_initialized():
+            world_size = dist.get_world_size()
+            gathered = [torch.zeros_like(peak_tensor) for _ in range(world_size)]
+            dist.all_gather(gathered, peak_tensor)
+            if args.rank == 0:
+                print("Peak GPU memory per rank (MiB):")
+                for r, t in enumerate(gathered):
+                    alloc_mib = t[0].item() / (1024 ** 2)
+                    reserved_mib = t[1].item() / (1024 ** 2)
+                    print(f"  rank {r}: allocated={alloc_mib:.2f}, reserved={reserved_mib:.2f}")
+        else:
+            alloc_mib = peak_alloc / (1024 ** 2)
+            reserved_mib = peak_reserved / (1024 ** 2)
+            print(f"Peak GPU memory (MiB): allocated={alloc_mib:.2f}, reserved={reserved_mib:.2f}")
 
 
 if __name__ == "__main__":

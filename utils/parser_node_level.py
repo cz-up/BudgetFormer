@@ -12,7 +12,7 @@ def parser_add_main_args(parser):
     parser.add_argument('--model', type=str, default="graphormer")
     parser.add_argument('--n_layers', type=int, default=2)
     parser.add_argument('--num_heads', type=int, default=8)
-    parser.add_argument('--hidden_dim', type=int, default=64) #128
+    parser.add_argument('--hidden_dim', type=int, default=128) #128
     parser.add_argument('--ffn_dim', type=int, default=128)
     parser.add_argument('--attn_bias_dim', type=int, default=1) # must match M power adj in preprocess_data
     parser.add_argument('--dropout_rate', type=float, default=0.3)
