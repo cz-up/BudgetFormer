@@ -50,7 +50,6 @@ def run_step(args, model, device, feature, y, idx_batch_cpu, sub_split_seq_lens,
         y,
         idx_batch_cpu,
         sub_split_seq_lens,
-        device,
         edge_index_global,
         N,
     )
@@ -218,6 +217,7 @@ def main():
     epoch_t_list = []
     val_acc_list = []
     test_acc_list = []
+    best_epoch = -1
     best_val = 0
     best_test = 0
     prev_loss = None
@@ -326,6 +326,7 @@ def main():
 
             if val_acc > best_val:
                 best_val = val_acc
+                best_epoch = epoch
                 if args.save_model:
                     torch.save(model.state_dict(), args.model_dir + f"{args.dataset}.pkl")
 
@@ -340,7 +341,7 @@ def main():
         
 
     if args.rank == 0:
-        print(f"Best validation accuracy: {best_val:.2%}, test accuracy: {best_test:.2%}")
+        print(f"Best epoch: {best_epoch}, validation accuracy: {best_val:.2%}, test accuracy: {best_test:.2%}")
 
 
 if __name__ == "__main__":
