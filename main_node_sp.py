@@ -34,15 +34,29 @@ import math
 
 
 def run_step(args, model, device, feature, y, idx_batch_cpu, sub_split_seq_lens, edge_index_global, N, attn_type):
-    x_i, y_i, edge_index_i, attn_bias = get_batch_blockize(
-        args,
-        feature,
-        y,
-        idx_batch_cpu,
-        sub_split_seq_lens,
-        edge_index_global,
-        N,
-    )
+    if getattr(args, "head_hop_edges", False):
+        x_i, y_i, edge_index_i, attn_bias = get_batch_blockize(
+            args,
+            feature,
+            y,
+            idx_batch_cpu,
+            sub_split_seq_lens,
+            edge_index_global,
+            N,
+        )
+    else:
+        metis_k = getattr(args, "metis_k", 1)
+        x_i, y_i, edge_index_i, attn_bias = get_batch_reorder_blockize(
+            args,
+            feature,
+            y,
+            idx_batch_cpu,
+            sub_split_seq_lens,
+            device,
+            edge_index_global,
+            N,
+            metis_k,
+        )
 
     x_i = x_i.to(device)
     y_i = y_i.to(device)
@@ -224,11 +238,6 @@ def main():
 
         num_batch = idx_train_shuffle.size(0) // args.seq_len + 1
         batch_indices = torch.split(idx_train_shuffle, args.seq_len)
-        if args.attn_type == "hybrid":
-            percent_list = [(i + 1) / args.switch_freq for i in range(args.switch_freq)]
-            switch_points = {int(len(batch_indices) * percentage) for percentage in percent_list}
-        else:
-            switch_points = set()
 
         iter_t_list = []
         t_epoch_start = time.time()

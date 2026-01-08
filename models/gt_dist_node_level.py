@@ -134,7 +134,7 @@ class CoreAttention(nn.Module):
                 msg = v[:, h, :][src_idx] * score
                 scatter(msg, dst_idx, dim=0, out=wV[:, h, :], reduce='add')
                 scatter(score, dst_idx, dim=0, out=Z[:, h, :], reduce='add')
-                if self._head_mass_sum is not None:
+                if self._head_mass_sum is not None and h < self._head_mass_sum.numel():
                     self._head_mass_sum[h] += float(score.sum().detach().cpu())
                     self._head_mass_count[h] += float(score.numel())
             return wV / (Z + 1e-6)

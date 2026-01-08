@@ -10,7 +10,7 @@ import dgl
 from typing import List, Optional
 from torch import Tensor
 from torch_sparse import SparseTensor
-from torch_geometric.utils import remove_self_loops, subgraph
+from torch_geometric.utils import remove_self_loops, subgraph, add_self_loops
 from gt_sp.initialize import (
     sequence_parallel_is_initialized,
     get_sequence_parallel_group,
@@ -219,8 +219,9 @@ def gen_sub_edge_index(edge_index, idx_batch, N):
         idx_batch (Tensor): training node indexes of a batch
         N (Int): number of nodes in the whole graph
     """
-    adj, _ = remove_self_loops(edge_index)
+    # adj, _ = remove_self_loops(edge_index)
     # adj, _ = add_self_loops(adj, num_nodes=N)
+    adj = edge_index
     edge_index_i, _ = subgraph(idx_batch, adj, num_nodes=N, relabel_nodes=True)
 
     return edge_index_i
@@ -755,7 +756,7 @@ def get_batch_blockize(args, x, y, idx_batch, rest_split_sizes, edge_index, N):
     return (x_i, y_i, edge_index_i_heads, attn_bias)
 
 
-def get_batch_reorder_blockize(args, x, y, idx_batch, rest_split_sizes, device, edge_index, N, k):
+def get_batch_reorder_blockize(args, x, y, idx_batch, rest_split_sizes, device, edge_index, N, k=0):
     """
     Generate a local subsequence in sequence parallel with optional edge reordering.
     """
@@ -774,27 +775,31 @@ def get_batch_reorder_blockize(args, x, y, idx_batch, rest_split_sizes, device, 
     if args.model == "graphormer":
         edge_index_i_raw = fix_edge_index(edge_index_i_raw, idx_batch.shape[0])
 
-    if args.rank == 0:
-        edge_index_i, sorted_indices = reformat_graph(edge_index_i_raw, k)
-        sizes_broad = torch.LongTensor([edge_index_i.shape[1], sorted_indices.shape[0]]).to(device)
-    else:
-        sizes_broad = torch.empty(2, dtype=torch.int64, device=device)
-    if seq_parallel_world_size > 1:
-        dist.barrier()
-        dist.broadcast(sizes_broad, src_rank, group=group)
+    if k > 1:
+        if args.rank == 0:
+            edge_index_i, sorted_indices = reformat_graph(edge_index_i_raw, k)
+            sizes_broad = torch.LongTensor([edge_index_i.shape[1], sorted_indices.shape[0]]).to(device)
+        else:
+            sizes_broad = torch.empty(2, dtype=torch.int64, device=device)
+        if seq_parallel_world_size > 1:
+            dist.barrier()
+            dist.broadcast(sizes_broad, src_rank, group=group)
 
-    if args.rank == 0:
-        edge_index_i_broad = edge_index_i.to(device)
-        sorted_indices_broad = sorted_indices.to(device)
+        if args.rank == 0:
+            edge_index_i_broad = edge_index_i.to(device)
+            sorted_indices_broad = sorted_indices.to(device)
+        else:
+            shape = sizes_broad.tolist()
+            edge_index_i_broad = torch.empty((2, shape[0]), device=device, dtype=torch.int64)
+            sorted_indices_broad = torch.empty((shape[1]), device=device, dtype=torch.int64)
+        if seq_parallel_world_size > 1:
+            dist.broadcast(edge_index_i_broad, src_rank, group=group)
+            dist.broadcast(sorted_indices_broad, src_rank, group=group)
+        edge_index_i = edge_index_i_broad.to("cpu")
+        sorted_indices = sorted_indices_broad.to("cpu")
     else:
-        shape = sizes_broad.tolist()
-        edge_index_i_broad = torch.empty((2, shape[0]), device=device, dtype=torch.int64)
-        sorted_indices_broad = torch.empty((shape[1]), device=device, dtype=torch.int64)
-    if seq_parallel_world_size > 1:
-        dist.broadcast(edge_index_i_broad, src_rank, group=group)
-        dist.broadcast(sorted_indices_broad, src_rank, group=group)
-    edge_index_i = edge_index_i_broad.to("cpu")
-    sorted_indices = sorted_indices_broad.to("cpu")
+        edge_index_i = edge_index_i_raw
+        sorted_indices = torch.arange(x_i.size(0), device=x_i.device, dtype=torch.long)
 
     if args.model == "graphormer":
         sorted_indices = sorted_indices[sorted_indices != 0]
@@ -805,16 +810,6 @@ def get_batch_reorder_blockize(args, x, y, idx_batch, rest_split_sizes, device, 
     x_i = torch.index_select(x_i, 0, sorted_indices)
     y_i = torch.index_select(y_i, 0, sorted_indices)
     edge_index_i_heads = edge_index_i
-    if getattr(args, "head_hop_edges", False):
-        edge_index_i_heads = build_head_hop_edges(
-            edge_index=edge_index_i,
-            num_nodes=x_i.size(0),
-            num_heads=args.num_heads,
-            num_groups=getattr(args, "head_groups", args.num_heads),
-            device=edge_index_i.device,
-            walk_length=getattr(args, "head_hop_walk_length", 4),
-            walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
-        )
 
     if idx_batch.shape[0] < seq_length:
         assert rest_split_sizes is not None, "Rest split_sizes should not be None"
