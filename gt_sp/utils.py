@@ -31,18 +31,43 @@ def fix_edge_index(x, num_node):
     virt_edges = []
 
     num_virtual_tokens = 1
+    arange_nodes = torch.arange(num_node, device=x.device, dtype=x.dtype)
     for idx in range(num_virtual_tokens):
-        virt_edge_index = torch.cat([(torch.arange(num_node)+(1+idx)).view(1, -1), # virtual node index = 0
-                                        (x.new_zeros([num_node])+idx).view(1, -1)], dim=0)
+        virt_edge_index = torch.cat([(arange_nodes + (1 + idx)).view(1, -1), # virtual node index = 0
+                                        (x.new_zeros([num_node]) + idx).view(1, -1)], dim=0)
         virt_edges.append(virt_edge_index)
 
-        virt_edge_index = torch.cat([(x.new_zeros([num_node])+idx).view(1, -1), 
-                                    (torch.arange(num_node)+(1+idx)).view(1, -1)], dim=0)
+        virt_edge_index = torch.cat([(x.new_zeros([num_node]) + idx).view(1, -1), 
+                                    (arange_nodes + (1 + idx)).view(1, -1)], dim=0)
         virt_edges.append(virt_edge_index)
 
     extra_virt_edges = torch.cat(virt_edges, dim=1)
     x = torch.cat([(x + 1), extra_virt_edges], dim=1) # virtual node index = 0, other nodes start from 1
     return x
+
+
+@contextlib.contextmanager
+def fixed_random_seed(seed: int):
+    """Temporarily set RNG seeds and restore states afterward."""
+    py_state = random.getstate()
+    np_state = np.random.get_state()
+    torch_state = torch.random.get_rng_state()
+    cuda_states = None
+    if torch.cuda.is_available():
+        cuda_states = torch.cuda.get_rng_state_all()
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    try:
+        yield
+    finally:
+        random.setstate(py_state)
+        np.random.set_state(np_state)
+        torch.random.set_rng_state(torch_state)
+        if cuda_states is not None:
+            torch.cuda.set_rng_state_all(cuda_states)
 
 
 def adjust_edge_index_nomerge(edge_index, sub_seq_len):
@@ -67,6 +92,62 @@ def slice_edge_index(edge_index, start, end):
     if mask.sum().item() == 0:
         return edge_index.new_empty((2, 0), dtype=edge_index.dtype)
     return edge_index[:, mask] - start
+
+
+def _edge_index_to_ids(edge_index, num_nodes: Optional[int] = None) -> Tensor:
+    """Encode edge_index into unique edge ids on CPU for set ops."""
+    if edge_index is None:
+        return torch.empty((0,), dtype=torch.long)
+    if isinstance(edge_index, list):
+        tensors = [e for e in edge_index if e is not None and e.numel() > 0]
+        if not tensors:
+            return torch.empty((0,), dtype=torch.long)
+        if num_nodes is None:
+            max_node = max(int(e.max().item()) for e in tensors)
+            num_nodes = max_node + 1
+        edge_index = torch.cat(tensors, dim=1)
+    else:
+        if edge_index.numel() == 0:
+            return torch.empty((0,), dtype=torch.long)
+        if num_nodes is None:
+            num_nodes = int(edge_index.max().item()) + 1
+
+    edge_index = edge_index.to(torch.long).cpu()
+    src = edge_index[0]
+    dst = edge_index[1]
+    ids = src * num_nodes + dst
+    return torch.unique(ids)
+
+
+def edge_index_new_edge_ratio(edge_index_prev, edge_index_next, num_nodes: Optional[int] = None) -> float:
+    """
+    Ratio of newly added edges from prev -> next.
+    Returns 1.0 when prev is empty and next is non-empty, 0.0 when both empty.
+    """
+    ids_prev = _edge_index_to_ids(edge_index_prev, num_nodes=num_nodes)
+    ids_next = _edge_index_to_ids(edge_index_next, num_nodes=num_nodes)
+    if ids_prev.numel() == 0:
+        return 1.0 if ids_next.numel() > 0 else 0.0
+    if ids_next.numel() == 0:
+        return 0.0
+    new_mask = ~torch.isin(ids_next, ids_prev)
+    new_count = int(new_mask.sum().item())
+    return float(new_count) / float(ids_prev.numel())
+
+
+def edge_index_jaccard(edge_index_a, edge_index_b, num_nodes: Optional[int] = None) -> float:
+    """Jaccard similarity between two edge sets."""
+    ids_a = _edge_index_to_ids(edge_index_a, num_nodes=num_nodes)
+    ids_b = _edge_index_to_ids(edge_index_b, num_nodes=num_nodes)
+    if ids_a.numel() == 0 and ids_b.numel() == 0:
+        return 1.0
+    if ids_a.numel() == 0 or ids_b.numel() == 0:
+        return 0.0
+    inter = torch.isin(ids_a, ids_b).sum().item()
+    union = ids_a.numel() + ids_b.numel() - inter
+    if union == 0:
+        return 1.0
+    return float(inter) / float(union)
 
 
 def pad_y(x, padlen):
@@ -676,7 +757,7 @@ def build_head_subgraph_provider(args) -> HeadSubgraphProvider:
     return SharedHeadSubgraphProvider()
 
 
-def get_batch_blockize(args, x, y, idx_batch, rest_split_sizes, edge_index, N):
+def get_batch_blockize(args, x, y, idx_batch, rest_split_sizes, edge_index, N, device=None):
     """
     Generate a local subsequence in sequence parallel and slice the corresponding edge_index.
     """
@@ -692,19 +773,35 @@ def get_batch_blockize(args, x, y, idx_batch, rest_split_sizes, edge_index, N):
     if args.model == "graphormer":
         edge_index_i = fix_edge_index(edge_index, idx_batch.shape[0])
 
+    if device is not None:
+        dev = torch.device(device) if not isinstance(device, torch.device) else device
+        if dev.type == "cuda":
+            edge_index_i = edge_index_i.to(dev)
 
     attn_bias = None
     edge_index_i_heads = edge_index_i
     if getattr(args, "head_hop_edges", False):
-        edge_index_i_heads = build_head_hop_edges(
-            edge_index=edge_index_i,
-            num_nodes=x_i.size(0),
-            num_heads=args.num_heads,
-            num_groups=getattr(args, "head_groups", args.num_heads),
-            device=edge_index_i.device,
-            walk_length=getattr(args, "head_hop_walk_length", 4),
-            walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
-        )
+        try:
+            edge_index_i_heads = build_head_hop_edges(
+                edge_index=edge_index_i,
+                num_nodes=x_i.size(0),
+                num_heads=args.num_heads,
+                num_groups=getattr(args, "head_groups", args.num_heads),
+                device=edge_index_i.device,
+                walk_length=getattr(args, "head_hop_walk_length", 4),
+                walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
+            )
+        except RuntimeError:
+            edge_index_i = edge_index_i.to("cpu")
+            edge_index_i_heads = build_head_hop_edges(
+                edge_index=edge_index_i,
+                num_nodes=x_i.size(0),
+                num_heads=args.num_heads,
+                num_groups=getattr(args, "head_groups", args.num_heads),
+                device=edge_index_i.device,
+                walk_length=getattr(args, "head_hop_walk_length", 4),
+                walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
+            )
 
     if idx_batch.shape[0] < seq_length:
         assert rest_split_sizes is not None, 'Rest split_sizes should not be None'

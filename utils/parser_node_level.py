@@ -34,11 +34,11 @@ def parser_add_main_args(parser):
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--save_model', action='store_true', default=False, help='whether to save model')
     parser.add_argument('--model_dir', type=str, default='./model_ckpt/')
-    parser.add_argument('--head_groups', type=int, default=4,
+    parser.add_argument('--head_groups', type=int, default=1,
                         help='将所有 head 平分到的子图组数')
     parser.add_argument('--head_hop_edges', action='store_true', default=False,
                         help='为不同 head 生成不同 hop 的子图')
-    parser.add_argument('--head_hop_walk_length', type=int, default=4,
+    parser.add_argument('--head_hop_walk_length', type=int, default=8,
                         help='head hop 随机游走长度')
     parser.add_argument('--head_hop_walks_per_node', type=int, default=2,
                         help='head hop 随机游走次数/节点')

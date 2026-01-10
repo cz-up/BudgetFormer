@@ -245,15 +245,28 @@ def sparse_eval_gpu_subset_batch(args, model, x, y, sub_idx, adjs, edge_index, d
         attn_bias = attn_bias.permute(1, 2, 0)
         edge_index_i = gen_sub_edge_index(edge_index, idx_i, N) # [2, num_edges] index plused global token
         if getattr(args, "head_hop_edges", False):
-            edge_index_i = build_head_hop_edges(
-                edge_index=edge_index_i,
-                num_nodes=x_i.size(0),
-                num_heads=args.num_heads,
-                num_groups=getattr(args, "head_groups", args.num_heads),
-                device=edge_index_i.device,
-                walk_length=getattr(args, "head_hop_walk_length", 4),
-                walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
-            )
+            edge_index_i = edge_index_i.to(device)
+            try:
+                edge_index_i = build_head_hop_edges(
+                    edge_index=edge_index_i,
+                    num_nodes=x_i.size(0),
+                    num_heads=args.num_heads,
+                    num_groups=getattr(args, "head_groups", args.num_heads),
+                    device=edge_index_i.device,
+                    walk_length=getattr(args, "head_hop_walk_length", 4),
+                    walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
+                )
+            except RuntimeError:
+                edge_index_i = edge_index_i.to("cpu")
+                edge_index_i = build_head_hop_edges(
+                    edge_index=edge_index_i,
+                    num_nodes=x_i.size(0),
+                    num_heads=args.num_heads,
+                    num_groups=getattr(args, "head_groups", args.num_heads),
+                    device=edge_index_i.device,
+                    walk_length=getattr(args, "head_hop_walk_length", 4),
+                    walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
+                )
         
         x_i, y_i, edge_index_i, attn_bias = x_i.to(device), y_i.to(device), edge_index_i.to(device), attn_bias.to(device)
         
@@ -347,14 +360,7 @@ def sparse_eval_gpu(args, model, x, y, sub_idx, attn_bias, edge_index, device):
     # seq_len = 128
     num_batch = sub_idx.size(0) // args.seq_len + 1
     
-    if args.attn_type == "full":
-        attn_type = "full"
-    elif args.attn_type == "flash":
-        attn_type = "flash"
-    else:
-        attn_type = "sparse"
     
-
     # for i in tqdm(range(num_batch), desc="Iteration"):
     for i in range(num_batch):
         idx_i = sub_idx[i*args.seq_len:(i+1)*args.seq_len]
@@ -381,7 +387,7 @@ def sparse_eval_gpu(args, model, x, y, sub_idx, attn_bias, edge_index, device):
         else:
             edge_index_i = edge_index_i.to(device)
 
-        pred = model(x_i, attn_bias, edge_index_i, attn_type=attn_type)
+        pred = model(x_i, attn_bias, edge_index_i, attn_type=args.attn_type)
         loss = F.nll_loss(pred, y_i)
         loss_list.append(loss.item())
         
