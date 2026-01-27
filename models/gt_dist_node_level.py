@@ -16,6 +16,7 @@ from gt_sp.initialize import (
 )
 from torch_scatter import scatter
 from flash_attn import flash_attn_qkvpacked_func, flash_attn_func
+from collections import deque
 
 
 def init_params(module, n_layers):
@@ -65,11 +66,47 @@ class CoreAttention(nn.Module):
         denom = torch.clamp(self._head_mass_count, min=1.0)
         return self._head_mass_sum / denom
 
+    def enable_hop_mass_tracking(
+        self,
+        mass: float = 0.95,
+        max_queries: int = 64,
+        max_batches: int = 1,
+        max_hop: int = 15,
+    ) -> None:
+        self.track_hop_mass = True
+        self.hop_mass_target = float(mass)
+        self.hop_mass_max_queries = int(max_queries)
+        self.hop_mass_max_batches = int(max_batches)
+        self.hop_mass_max_hop = int(max_hop)
+        self.reset_hop_mass_stats()
+
+    def disable_hop_mass_tracking(self) -> None:
+        self.track_hop_mass = False
+
+    def reset_hop_mass_stats(self) -> None:
+        self.hop_mass_sum = []
+        self.hop_mass_count = 0
+        self.hop_mass_max_sum = 0.0
+        self.hop_mass_max_count = 0
+        self.hop_mass_max = 0
+        self.hop_mass_batch_count = 0
+
+    def get_hop_mass_stats(self):
+        if not getattr(self, "track_hop_mass", False) or self.hop_mass_count == 0:
+            return None
+        return (
+            list(self.hop_mass_sum),
+            self.hop_mass_count,
+            self.hop_mass_max_sum,
+            self.hop_mass_max_count,
+            self.hop_mass_max,
+        )
+
     # def full_flash_attention(self, q, k, v, attn_bias=None, mask=None):
     #     return flash_attn_func(q, k, v, self.attention_dropout_rate)
     
 
-    def full_attention(self, k, q, v, attn_bias, mask=None):
+    def full_attention(self, k, q, v, attn_bias, mask=None, edge_index=None):
         # ===================================
         # Raw attention scores. [b, np, s+1, s+1]
         # ===================================
@@ -89,6 +126,8 @@ class CoreAttention(nn.Module):
             x = x.masked_fill(mask, 0)
 
         x = torch.softmax(x, dim=3)
+        if getattr(self, "track_hop_mass", False):
+            self._accumulate_hop_mass(x, edge_index)
         x = self.att_dropout(x)
         x = x.matmul(v)  # [b, h, q_len, attn]
 
@@ -103,6 +142,10 @@ class CoreAttention(nn.Module):
             num_heads = self.num_attention_heads_per_partition
         else:
             num_heads = self.num_heads
+        edge_hops = None
+        if isinstance(edge_index, torch.Tensor) and edge_index.dim() == 2 and edge_index.size(0) == 3:
+            edge_hops = edge_index[2]
+            edge_index = edge_index[:2]
         
         # Reshaping into [total_s, np, hn] to
         # get projections for multi-head attention
@@ -177,8 +220,170 @@ class CoreAttention(nn.Module):
         Z = score.new_zeros(v.size(0), num_heads, 1)
         scatter(score, edge_index[1], dim=0, out=Z, reduce='add')
 
+        if getattr(self, "track_hop_mass", False) and edge_hops is not None:
+            self._accumulate_sparse_hop_mass(edge_index, edge_hops, score, Z)
+
         x = wV / (Z + 1e-6)
         return x
+
+    def _accumulate_sparse_hop_mass(
+        self,
+        edge_index: torch.Tensor,
+        edge_hops: torch.Tensor,
+        score: torch.Tensor,
+        Z: torch.Tensor,
+    ) -> None:
+        if edge_index is None or edge_hops is None:
+            return
+        if not getattr(self, "track_hop_mass", False):
+            return
+        if self.hop_mass_max_batches > 0 and self.hop_mass_batch_count >= self.hop_mass_max_batches:
+            return
+        if score.numel() == 0:
+            return
+        self.hop_mass_batch_count += 1
+
+        edge_hops = edge_hops.to(score.device).long()
+        dst = edge_index[1].to(torch.long)
+        denom = Z[dst] + 1e-6
+        weights = (score / denom).squeeze(-1)
+        if weights.numel() == 0:
+            return
+        weights = weights.mean(dim=1)
+
+        max_hop_limit = int(self.hop_mass_max_hop)
+        if max_hop_limit > 0:
+            mask = (edge_hops >= 1) & (edge_hops <= max_hop_limit)
+        else:
+            mask = edge_hops >= 1
+        if not mask.any():
+            return
+        edge_hops = edge_hops[mask] - 1
+        dst = dst[mask]
+        weights = weights[mask]
+
+        max_hop = int(edge_hops.max().item()) + 1
+        if max_hop <= 0:
+            return
+        num_nodes = int(dst.max().item()) + 1
+        combined = dst * max_hop + edge_hops
+        node_hop = weights.new_zeros(num_nodes * max_hop)
+        node_hop.scatter_add_(0, combined, weights)
+        hop_mass = node_hop.view(num_nodes, max_hop).sum(dim=0)
+        total = float(hop_mass.sum().item())
+        if total <= 0:
+            return
+        hop_mass = hop_mass / total
+        if len(self.hop_mass_sum) < max_hop:
+            self.hop_mass_sum.extend([0.0] * (max_hop - len(self.hop_mass_sum)))
+        for i in range(max_hop):
+            self.hop_mass_sum[i] += float(hop_mass[i].item())
+        self.hop_mass_count += 1
+
+        mass_target = max(0.0, min(self.hop_mass_target, 1.0))
+        if mass_target > 0.0:
+            cum = hop_mass.cumsum(dim=0)
+            hit = torch.nonzero(cum >= mass_target, as_tuple=False)
+            if hit.numel() > 0:
+                needed = int(hit[0].item()) + 1
+                self.hop_mass_max_sum += float(needed)
+                self.hop_mass_max_count += 1
+                if needed > self.hop_mass_max:
+                    self.hop_mass_max = needed
+
+    def _accumulate_hop_mass(self, attn_probs: torch.Tensor, edge_index) -> None:
+        if edge_index is None:
+            return
+        if not getattr(self, "track_hop_mass", False):
+            return
+        if self.hop_mass_max_batches > 0 and self.hop_mass_batch_count >= self.hop_mass_max_batches:
+            return
+        if isinstance(edge_index, list):
+            edge_index = [e for e in edge_index if e is not None and e.numel() > 0]
+            if not edge_index:
+                return
+            edge_index = torch.cat(edge_index, dim=1)
+        if edge_index.numel() == 0:
+            return
+
+        self.hop_mass_batch_count += 1
+        bsz, n_head, q_len, k_len = attn_probs.shape
+        if bsz == 0 or q_len == 0 or k_len == 0:
+            return
+
+        edge_cpu = edge_index.detach().cpu()
+        src = edge_cpu[0].long()
+        dst = edge_cpu[1].long()
+        valid = (src >= 0) & (dst >= 0) & (src < k_len) & (dst < k_len)
+        if not valid.any():
+            return
+        src = src[valid]
+        dst = dst[valid]
+
+        adj = [[] for _ in range(k_len)]
+        for s, d in zip(src.tolist(), dst.tolist()):
+            adj[s].append(d)
+            adj[d].append(s)
+
+        probs = attn_probs.mean(dim=1).detach().cpu()
+        start_q = 1 if q_len > 1 else 0
+        max_q = min(q_len, start_q + max(1, self.hop_mass_max_queries))
+        max_hop = int(self.hop_mass_max_hop)
+        mass_target = max(0.0, min(self.hop_mass_target, 1.0))
+
+        for b in range(bsz):
+            for q in range(start_q, max_q):
+                p = probs[b, q, :].float()
+                if k_len > 1:
+                    p[0] = 0.0
+                total_mass = float(p.sum().item())
+                if total_mass <= 0:
+                    continue
+                target_mass = mass_target * total_mass
+                dist = [-1] * k_len
+                dist[q] = 0
+                q_deque = deque([q])
+                while q_deque:
+                    cur = q_deque.popleft()
+                    d = dist[cur]
+                    if max_hop > 0 and d >= max_hop:
+                        continue
+                    for nxt in adj[cur]:
+                        if dist[nxt] != -1:
+                            continue
+                        dist[nxt] = d + 1
+                        q_deque.append(nxt)
+
+                hop_mass = []
+                for idx, d in enumerate(dist):
+                    if d <= 0:
+                        continue
+                    if max_hop > 0 and d > max_hop:
+                        continue
+                    while len(hop_mass) < d:
+                        hop_mass.append(0.0)
+                    hop_mass[d - 1] += float(p[idx].item())
+                if not hop_mass:
+                    continue
+                cum = 0.0
+                trimmed = []
+                for m in hop_mass:
+                    cum += m
+                    trimmed.append(m)
+                    if cum >= target_mass:
+                        break
+                if cum <= 0:
+                    continue
+                needed = len(trimmed)
+                if len(self.hop_mass_sum) < needed:
+                    self.hop_mass_sum.extend([0.0] * (needed - len(self.hop_mass_sum)))
+                for i, m in enumerate(trimmed):
+                    self.hop_mass_sum[i] += m / cum
+                self.hop_mass_count += 1
+                self.hop_mass_max_sum += float(needed)
+                self.hop_mass_max_count += 1
+                if needed > self.hop_mass_max:
+                    self.hop_mass_max = needed
 
 
     def forward(self, q, k, v, attn_bias=None, edge_index=None, attn_type=None):
@@ -189,7 +394,7 @@ class CoreAttention(nn.Module):
         batch_size, s_len = q.size(0), q.size(1)
          
         if attn_type == "full":
-            x = self.full_attention(k, q, v, attn_bias)
+            x = self.full_attention(k, q, v, attn_bias, edge_index=edge_index)
         elif attn_type == "sparse":
             x = self.sparse_attention_bias(q, k, v, edge_index, attn_bias)
         elif attn_type == "flash":
@@ -262,6 +467,31 @@ class MultiHeadAttention(nn.Module):
     def get_head_mass_stats(self):
         if hasattr(self.dist_attn, "local_attn"):
             get_fn = getattr(self.dist_attn.local_attn, "get_head_mass_stats", None)
+            if get_fn is not None:
+                return get_fn()
+        return None
+
+    def enable_hop_mass_tracking(self, mass=0.95, max_queries=64, max_batches=1, max_hop=15):
+        if hasattr(self.dist_attn, "local_attn"):
+            enable_fn = getattr(self.dist_attn.local_attn, "enable_hop_mass_tracking", None)
+            if enable_fn is not None:
+                enable_fn(mass, max_queries, max_batches, max_hop)
+
+    def disable_hop_mass_tracking(self):
+        if hasattr(self.dist_attn, "local_attn"):
+            disable_fn = getattr(self.dist_attn.local_attn, "disable_hop_mass_tracking", None)
+            if disable_fn is not None:
+                disable_fn()
+
+    def reset_hop_mass_stats(self):
+        if hasattr(self.dist_attn, "local_attn"):
+            reset_fn = getattr(self.dist_attn.local_attn, "reset_hop_mass_stats", None)
+            if reset_fn is not None:
+                reset_fn()
+
+    def get_hop_mass_stats(self):
+        if hasattr(self.dist_attn, "local_attn"):
+            get_fn = getattr(self.dist_attn.local_attn, "get_hop_mass_stats", None)
             if get_fn is not None:
                 return get_fn()
         return None
@@ -408,3 +638,27 @@ class GT(nn.Module):
         if not stats:
             return None
         return sum(stats) / len(stats)
+
+    def enable_hop_mass_tracking(self, mass=0.95, max_queries=64, max_batches=1, max_hop=15):
+        for layer in self.layers:
+            if hasattr(layer, "self_attention"):
+                layer.self_attention.enable_hop_mass_tracking(mass, max_queries, max_batches, max_hop)
+
+    def disable_hop_mass_tracking(self):
+        for layer in self.layers:
+            if hasattr(layer, "self_attention"):
+                layer.self_attention.disable_hop_mass_tracking()
+
+    def reset_hop_mass_stats(self):
+        for layer in self.layers:
+            if hasattr(layer, "self_attention"):
+                layer.self_attention.reset_hop_mass_stats()
+
+    def get_hop_mass_stats_per_layer(self):
+        stats = []
+        for layer in self.layers:
+            if hasattr(layer, "self_attention"):
+                stats.append(layer.self_attention.get_hop_mass_stats())
+            else:
+                stats.append(None)
+        return stats

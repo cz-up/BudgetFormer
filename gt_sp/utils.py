@@ -300,8 +300,6 @@ def gen_sub_edge_index(edge_index, idx_batch, N):
         idx_batch (Tensor): training node indexes of a batch
         N (Int): number of nodes in the whole graph
     """
-    # adj, _ = remove_self_loops(edge_index)
-    # adj, _ = add_self_loops(adj, num_nodes=N)
     adj = edge_index
     edge_index_i, _ = subgraph(idx_batch, adj, num_nodes=N, relabel_nodes=True)
 
@@ -407,6 +405,23 @@ def _apply_to_edge_index(edge_index, fn):
     if edge_index is None:
         return None
     return fn(edge_index)
+
+
+def _merge_edge_index_list(edge_list: List[Tensor]) -> Tensor:
+    """Merge a list of edge_index tensors into one unique edge_index."""
+    tensors = [e for e in edge_list if e is not None and e.numel() > 0]
+    if not tensors:
+        return edge_list[0] if edge_list else None
+    device = tensors[0].device
+    edge_index = torch.cat(tensors, dim=1).to(torch.long)
+    src = edge_index[0]
+    dst = edge_index[1]
+    num_nodes = int(max(src.max().item(), dst.max().item())) + 1
+    ids = src * num_nodes + dst
+    ids_unique = torch.unique(ids)
+    src_u = ids_unique // num_nodes
+    dst_u = ids_unique % num_nodes
+    return torch.stack([src_u, dst_u], dim=0).to(device)
 
 
 def compute_hops_random_walk(
@@ -771,37 +786,79 @@ def get_batch_blockize(args, x, y, idx_batch, rest_split_sizes, edge_index, N, d
     edge_index_i = gen_sub_edge_index(edge_index, idx_batch, N)
 
     if args.model == "graphormer":
-        edge_index_i = fix_edge_index(edge_index, idx_batch.shape[0])
+        edge_index_i = fix_edge_index(edge_index_i, idx_batch.shape[0])
 
+    dev = None
     if device is not None:
         dev = torch.device(device) if not isinstance(device, torch.device) else device
         if dev.type == "cuda":
             edge_index_i = edge_index_i.to(dev)
 
     attn_bias = None
-    edge_index_i_heads = edge_index_i
-    if getattr(args, "head_hop_edges", False):
-        try:
-            edge_index_i_heads = build_head_hop_edges(
-                edge_index=edge_index_i,
-                num_nodes=x_i.size(0),
-                num_heads=args.num_heads,
-                num_groups=getattr(args, "head_groups", args.num_heads),
-                device=edge_index_i.device,
-                walk_length=getattr(args, "head_hop_walk_length", 4),
-                walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
-            )
-        except RuntimeError:
-            edge_index_i = edge_index_i.to("cpu")
-            edge_index_i_heads = build_head_hop_edges(
-                edge_index=edge_index_i,
-                num_nodes=x_i.size(0),
-                num_heads=args.num_heads,
-                num_groups=getattr(args, "head_groups", args.num_heads),
-                device=edge_index_i.device,
-                walk_length=getattr(args, "head_hop_walk_length", 4),
-                walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
-            )
+    num_groups = getattr(args, "head_groups", 1)
+    try:
+        edge_index_i_heads = build_head_hop_edges(
+            edge_index=edge_index_i,
+            num_nodes=x_i.size(0),
+            num_heads=args.num_heads,
+            num_groups=num_groups,
+            device=edge_index_i.device,
+            walk_length=getattr(args, "head_hop_walk_length", 4),
+            walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
+        )
+    except RuntimeError:
+        edge_index_i = edge_index_i.to("cpu")
+        edge_index_i_heads = build_head_hop_edges(
+            edge_index=edge_index_i,
+            num_nodes=x_i.size(0),
+            num_heads=args.num_heads,
+            num_groups=num_groups,
+            device=edge_index_i.device,
+            walk_length=getattr(args, "head_hop_walk_length", 4),
+            walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
+        )
+    if dev is not None and dev.type == "cuda":
+        if isinstance(edge_index_i_heads, list):
+            edge_index_i_heads = [e.to(dev) for e in edge_index_i_heads]
+        else:
+            edge_index_i_heads = edge_index_i_heads.to(dev)
+    if seq_parallel_world_size > 1:
+        src_rank = get_sequence_parallel_src_rank()
+        group = get_sequence_parallel_group()
+        if isinstance(edge_index_i_heads, list):
+            device_ref = edge_index_i_heads[0].device if edge_index_i_heads else edge_index_i.device
+            dtype_ref = edge_index_i_heads[0].dtype if edge_index_i_heads else edge_index_i.dtype
+            if dist.get_rank() == src_rank:
+                head_count = torch.tensor([len(edge_index_i_heads)], device=device_ref, dtype=torch.long)
+            else:
+                head_count = torch.empty(1, device=device_ref, dtype=torch.long)
+            dist.broadcast(head_count, src_rank, group=group)
+            head_count_val = int(head_count.item())
+            if dist.get_rank() == src_rank:
+                size_broad = torch.tensor(
+                    [e.size(1) for e in edge_index_i_heads],
+                    device=device_ref,
+                    dtype=torch.long,
+                )
+            else:
+                size_broad = torch.empty(head_count_val, device=device_ref, dtype=torch.long)
+            dist.broadcast(size_broad, src_rank, group=group)
+            if dist.get_rank() != src_rank:
+                edge_index_i_heads = [
+                    torch.empty((2, int(size_broad[i].item())), device=device_ref, dtype=dtype_ref)
+                    for i in range(head_count_val)
+                ]
+            for i in range(head_count_val):
+                dist.broadcast(edge_index_i_heads[i], src_rank, group=group)
+        else:
+            if dist.get_rank() == src_rank:
+                size_broad = torch.tensor([edge_index_i_heads.size(1)], device=edge_index_i_heads.device, dtype=torch.long)
+            else:
+                size_broad = torch.empty(1, device=edge_index_i_heads.device, dtype=torch.long)
+            dist.broadcast(size_broad, src_rank, group=group)
+            if dist.get_rank() != src_rank:
+                edge_index_i_heads = torch.empty((2, int(size_broad.item())), device=edge_index_i_heads.device, dtype=edge_index_i_heads.dtype)
+            dist.broadcast(edge_index_i_heads, src_rank, group=group)
 
     if idx_batch.shape[0] < seq_length:
         assert rest_split_sizes is not None, 'Rest split_sizes should not be None'
@@ -823,11 +880,6 @@ def get_batch_blockize(args, x, y, idx_batch, rest_split_sizes, edge_index, N, d
         y_i = y_i_list[seq_parallel_world_rank]
         sub_seq_start = seq_parallel_world_rank * max(rest_split_sizes)
         sub_seq_end = sub_seq_start + x_i.size(0)
-        edge_index_i_heads = _apply_to_edge_index(
-            edge_index_i_heads,
-            lambda e: slice_edge_index(e, sub_seq_start, sub_seq_end),
-        )
-
         last_batch_flag(True)
     else:
         assert seq_length % seq_parallel_world_size == 0
@@ -837,11 +889,6 @@ def get_batch_blockize(args, x, y, idx_batch, rest_split_sizes, edge_index, N, d
 
         x_i = x_i[sub_seq_start:sub_seq_end, :]
         y_i = y_i[sub_seq_start:sub_seq_end]
-        edge_index_i_heads = _apply_to_edge_index(
-            edge_index_i_heads,
-            lambda e: slice_edge_index(e, sub_seq_start, sub_seq_end),
-        )
-
         if args.model == "graphormer":
             edge_index_i_heads = _apply_to_edge_index(
                 edge_index_i_heads,

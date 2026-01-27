@@ -12,8 +12,8 @@ def parser_add_main_args(parser):
     parser.add_argument('--model', type=str, default="graphormer")
     parser.add_argument('--n_layers', type=int, default=2)
     parser.add_argument('--num_heads', type=int, default=8)
-    parser.add_argument('--hidden_dim', type=int, default=128) #128
-    parser.add_argument('--ffn_dim', type=int, default=128)
+    parser.add_argument('--hidden_dim', type=int, default=64) #128
+    parser.add_argument('--ffn_dim', type=int, default=256)
     parser.add_argument('--attn_bias_dim', type=int, default=1) # must match M power adj in preprocess_data
     parser.add_argument('--dropout_rate', type=float, default=0.3)
     parser.add_argument('--input_dropout_rate', type=float, default=0.1)
@@ -36,18 +36,36 @@ def parser_add_main_args(parser):
     parser.add_argument('--model_dir', type=str, default='./model_ckpt/')
     parser.add_argument('--head_groups', type=int, default=1,
                         help='将所有 head 平分到的子图组数')
-    parser.add_argument('--head_hop_edges', action='store_true', default=False,
-                        help='为不同 head 生成不同 hop 的子图')
-    parser.add_argument('--head_hop_walk_length', type=int, default=8,
+    parser.add_argument('--head_hop_walk_length', type=int, default=4,
                         help='head hop 随机游走长度')
-    parser.add_argument('--head_hop_walks_per_node', type=int, default=2,
+    parser.add_argument('--head_hop_walks_per_node', type=int, default=4,
                         help='head hop 随机游走次数/节点')
-    parser.add_argument('--head_hop_dynamic', action='store_true', default=False,
-                        help='是否启用基于head贡献度的动态随机游走调整')
-    parser.add_argument('--head_rw_walks_factor', type=float, default=1.0,
-                        help='每节点随机游走次数=平均度*系数')
-    parser.add_argument('--head_rw_length_factor', type=float, default=1.0,
-                        help='随机游走长度=平均直径估计值*系数')
+    parser.add_argument('--use_ogbn_split', type=int, default=0,
+                        help='是否使用OGBN原始划分 (1启用, 0关闭)')
+    parser.add_argument('--adaptive_walk', action='store_true', default=False,
+                        help='enable adaptive tuning of walk length/num walks')
+    parser.add_argument('--adaptive_patience', type=int, default=5,
+                        help='epochs without improvement before fixing L/R')
+    parser.add_argument('--adaptive_eval_repeats', type=int, default=3,
+                        help='repeat evaluation and average to reduce randomness')
+    parser.add_argument('--adaptive_embed_batches', type=int, default=5,
+                        help='number of train batches to compare L vs L+1')
+    parser.add_argument('--adaptive_embed_delta', type=float, default=0.05,
+                        help='min relative output diff to keep increasing L')
+    parser.add_argument('--full_attn_hop_stats', action='store_true', default=False,
+                        help='enable full attention hop-mass stats in val')
+    parser.add_argument('--full_attn_hop_mass', type=float, default=0.95,
+                        help='target mass for hop-mass coverage stats')
+    parser.add_argument('--full_attn_hop_max_queries', type=int, default=64,
+                        help='max queries per batch for hop-mass stats')
+    parser.add_argument('--full_attn_hop_max_batches', type=int, default=1,
+                        help='max batches per layer to collect hop-mass stats')
+    parser.add_argument('--full_attn_hop_max_hop', type=int, default=64,
+                        help='max hop to explore when collecting hop-mass stats (<=0 for no limit)')
+    parser.add_argument('--adaptive_val_delta', type=float, default=0.0,
+                        help='min val acc improvement to reset patience')
+    parser.add_argument('--adaptive_cov_delta', type=float, default=0.0,
+                        help='min coverage improvement to reset patience')
     
     # distributed args
     parser.add_argument('--rank', type=int, default=None,

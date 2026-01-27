@@ -19,13 +19,6 @@ import pickle as pkl
 from ogb.nodeproppred import NodePropPredDataset
 import argparse
 
-def shuffle_edges(edge_index, dim=1) -> None:
-    idx = torch.randperm(edge_index.size(1))
-    if dim == 0:
-        return torch.stack([edge_index[0, idx], edge_index[1, :]], dim=0)
-    elif dim == 1:
-        return torch.stack([edge_index[0, :], edge_index[1, idx]], dim=0)
-
 def adj_normalize(mx):
     "A' = (D + I)^-1/2 * ( A + I ) * (D + I)^-1/2"
     mx = mx + sp.eye(mx.shape[0])
@@ -231,10 +224,6 @@ def get_dataset(dataset_name):
             data_y = torch.as_tensor(ogb_dataset.labels).squeeze(1)
             data_x = torch.as_tensor(ogb_dataset.graph['node_feat'])
             edge_index = torch.as_tensor(ogb_dataset.graph['edge_index'])
-
-            dim = 1
-            edge_index_copy = edge_index.clone()
-            edge_index = shuffle_edges(edge_index, dim=dim)
            
             num_nodes=ogb_dataset.graph['num_nodes']
             adj = sp.coo_matrix((np.ones(edge_index.shape[1]), (edge_index[0], edge_index[1])),
