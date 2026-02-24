@@ -544,19 +544,20 @@ def build_head_hop_edges(
     walks_per_node: int = 2,
 ):
     """
-    根据 hop buckets 构建 per-head edge_index 列表。
+    构建 per-head edge_index 列表。
+    当前实现不再按 head 分桶：所有 head 共享同一份随机游走子图。
     """
-    num_groups = max(1, min(int(num_groups), int(walk_length)))
+    _ = num_groups  # kept for backward-compatible call signature
     buckets = compute_hop_buckets_random_walk(
         edge_index=edge_index,
         num_nodes=num_nodes,
-        num_buckets=num_groups,
+        num_buckets=1,
         device=device,
         walk_length=walk_length,
         walks_per_node=walks_per_node,
     )
-    provider = HopMappedHeadSubgraphProvider(list(range(max(1, num_groups))), num_groups)
-    return provider.build(buckets, num_heads)
+    shared_edge_index = buckets[0] if buckets else edge_index.new_zeros((2, 0), dtype=edge_index.dtype)
+    return [shared_edge_index for _ in range(max(1, int(num_heads)))]
 
 
 def _run_random_walk(edge_index: Tensor, rowptr: Tensor, col: Tensor, starts: Tensor, walk_length: int) -> Tensor:
@@ -795,13 +796,12 @@ def get_batch_blockize(args, x, y, idx_batch, rest_split_sizes, edge_index, N, d
             edge_index_i = edge_index_i.to(dev)
 
     attn_bias = None
-    num_groups = getattr(args, "head_groups", 1)
     try:
         edge_index_i_heads = build_head_hop_edges(
             edge_index=edge_index_i,
             num_nodes=x_i.size(0),
             num_heads=args.num_heads,
-            num_groups=num_groups,
+            num_groups=1,
             device=edge_index_i.device,
             walk_length=getattr(args, "head_hop_walk_length", 4),
             walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
@@ -812,7 +812,7 @@ def get_batch_blockize(args, x, y, idx_batch, rest_split_sizes, edge_index, N, d
             edge_index=edge_index_i,
             num_nodes=x_i.size(0),
             num_heads=args.num_heads,
-            num_groups=num_groups,
+            num_groups=1,
             device=edge_index_i.device,
             walk_length=getattr(args, "head_hop_walk_length", 4),
             walks_per_node=getattr(args, "head_hop_walks_per_node", 2),

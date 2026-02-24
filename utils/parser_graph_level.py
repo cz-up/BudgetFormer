@@ -50,8 +50,6 @@ def parser_add_main_args(parser):
     parser.add_argument('--switch_freq', type=int, default=8)
     parser.add_argument('--dummy_bias', action='store_true', default=False)
 
-    parser.add_argument('--head_groups', type=int, default=4,
-                        help='将所有 head 平分到的子图组数')
     parser.add_argument('--head_hop_edges', action='store_true', default=False,
                         help='为不同 head 生成不同 hop 的子图')
     parser.add_argument('--head_hop_walk_length', type=int, default=4,

@@ -34,11 +34,9 @@ def parser_add_main_args(parser):
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--save_model', action='store_true', default=False, help='whether to save model')
     parser.add_argument('--model_dir', type=str, default='./model_ckpt/')
-    parser.add_argument('--head_groups', type=int, default=1,
-                        help='将所有 head 平分到的子图组数')
     parser.add_argument('--head_hop_walk_length', type=int, default=4,
                         help='head hop 随机游走长度')
-    parser.add_argument('--head_hop_walks_per_node', type=int, default=4,
+    parser.add_argument('--head_hop_walks_per_node', type=int, default=2,
                         help='head hop 随机游走次数/节点')
     parser.add_argument('--use_ogbn_split', type=int, default=0,
                         help='是否使用OGBN原始划分 (1启用, 0关闭)')

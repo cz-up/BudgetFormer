@@ -23,7 +23,14 @@ def _edge_index_coverage(edge_index, num_nodes):
         return 0.0
     if edge_index.numel() == 0:
         return 0.0
-    nodes = torch.unique(edge_index.view(-1))
+    # Coverage is defined on destination nodes only: C_dst = |unique(dst)| / N.
+    if edge_index.dim() != 2 or edge_index.size(0) < 2:
+        return 0.0
+    dst = edge_index[1].view(-1)
+    valid = (dst >= 0) & (dst < int(num_nodes))
+    if not valid.any():
+        return 0.0
+    nodes = torch.unique(dst[valid])
     return float(nodes.numel()) / float(num_nodes)
 
 
