@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 import numpy as np
-from gt_sp.utils import get_batch, gen_sub_edge_index, build_head_hop_edges, _merge_edge_index_list
+from gt_sp.utils import get_batch, gen_sub_edge_index
 from gt_sp.initialize import (
     get_sequence_parallel_world_size,
     set_last_batch_global_token_indices
@@ -16,22 +16,6 @@ def calc_acc(y_true, y_pred):
     acc_list.append(float(np.sum(correct)) / len(correct))
 
     return sum(acc_list) / len(acc_list)
-
-
-def _edge_index_coverage(edge_index, num_nodes):
-    if edge_index is None or num_nodes <= 0:
-        return 0.0
-    if edge_index.numel() == 0:
-        return 0.0
-    # Coverage is defined on destination nodes only: C_dst = |unique(dst)| / N.
-    if edge_index.dim() != 2 or edge_index.size(0) < 2:
-        return 0.0
-    dst = edge_index[1].view(-1)
-    valid = (dst >= 0) & (dst < int(num_nodes))
-    if not valid.any():
-        return 0.0
-    nodes = torch.unique(dst[valid])
-    return float(nodes.numel()) / float(num_nodes)
 
 
 @torch.no_grad()
@@ -69,7 +53,6 @@ def eval(args, model, device, x, y, sub_idx, adjs):
         loss_list.append(loss.item())
         y_true.append(y_i.view(-1))
         y_pred.append(pred.argmax(1))
-        torch.cuda.empty_cache()
 
     y_pred = torch.cat(y_pred)
     y_true = torch.cat(y_true)
@@ -177,7 +160,6 @@ def eval_gpu_subset_batch(args, model, x, y, sub_idx, adjs, device):
     acc = calc_acc(y_true, y_pred)
     
     del x_i, y_i, attn_bias
-    torch.cuda.empty_cache()
     
     return acc  
 
@@ -260,31 +242,6 @@ def sparse_eval_gpu_subset_batch(args, model, x, y, sub_idx, adjs, edge_index, d
         attn_bias = torch.cat([torch.tensor(i[idx_i, :][:, idx_i].toarray(), dtype=torch.float32).unsqueeze(0) for i in adjs])
         attn_bias = attn_bias.permute(1, 2, 0)
         edge_index_i = gen_sub_edge_index(edge_index, idx_i, N) # [2, num_edges] index plused global token
-        if attn_type == "sparse":
-            edge_index_i = edge_index_i.to(device)
-            try:
-                edge_index_i = build_head_hop_edges(
-                    edge_index=edge_index_i,
-                    num_nodes=x_i.size(0),
-                    num_heads=args.num_heads,
-                    num_groups=1,
-                    device=edge_index_i.device,
-                    walk_length=getattr(args, "head_hop_walk_length", 4),
-                    walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
-                )
-            except RuntimeError:
-                edge_index_i = edge_index_i.to("cpu")
-                edge_index_i = build_head_hop_edges(
-                    edge_index=edge_index_i,
-                    num_nodes=x_i.size(0),
-                    num_heads=args.num_heads,
-                    num_groups=1,
-                    device=edge_index_i.device,
-                    walk_length=getattr(args, "head_hop_walk_length", 4),
-                    walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
-                )
-            if isinstance(edge_index_i, list):
-                edge_index_i = _merge_edge_index_list(edge_index_i)
         
         x_i, y_i, edge_index_i, attn_bias = x_i.to(device), y_i.to(device), edge_index_i.to(device), attn_bias.to(device)
         
@@ -300,7 +257,6 @@ def sparse_eval_gpu_subset_batch(args, model, x, y, sub_idx, adjs, edge_index, d
     acc = calc_acc(y_true.to(torch.device("cpu")), y_pred.to(torch.device("cpu")))
     
     del x_i, y_i, edge_index_i, attn_bias
-    torch.cuda.empty_cache()
     
     return acc  
 
@@ -362,18 +318,15 @@ def sparse_eval_cpu_subset_batch_dummy_bias(args, model, x, y, sub_idx, dummy_at
 
 
 @torch.no_grad()
-def sparse_eval_gpu(args, model, x, y, sub_idx, attn_bias, edge_index, device, return_coverage=False):
+def sparse_eval_gpu(args, model, x, y, sub_idx, attn_bias, edge_index, device):
     """
     Evaluate the model on train/valid/test subset of nodes in a batched way on GPU.
     lager seq_len will be slower 
     """
     model.eval()
 
-    y_true = []
-    y_pred = []
-    loss_list = []
-    covered_nodes = 0.0
-    total_nodes = 0
+    total = 0
+    correct = 0
     N = x.shape[0]
     
     # num_batch = sub_idx.size(0) // args.seq_len + 1
@@ -390,49 +343,21 @@ def sparse_eval_gpu(args, model, x, y, sub_idx, attn_bias, edge_index, device, r
         # if idx_i.shape[0] < args.seq_len:
         #     dummy_attn_bias = torch.zeros(idx_i.shape[0], idx_i.shape[0], args.attn_bias_dim, dtype=torch.float32)
         edge_index_i = gen_sub_edge_index(edge_index, idx_i, N) # [2, num_edges] index plused global token
-        if args.attn_type == "sparse":
-            edge_index_i = build_head_hop_edges(
-                edge_index=edge_index_i,
-                num_nodes=x_i.size(0),
-                num_heads=args.num_heads,
-                num_groups=1,
-                device=edge_index_i.device,
-                walk_length=getattr(args, "head_hop_walk_length", 4),
-                walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
-            )
-            if isinstance(edge_index_i, list):
-                edge_index_i = _merge_edge_index_list(edge_index_i)
-            if return_coverage:
-                coverage_i = _edge_index_coverage(edge_index_i, x_i.size(0))
-                covered_nodes += coverage_i * x_i.size(0)
-                total_nodes += int(x_i.size(0))
-        elif return_coverage:
-            covered_nodes += float(x_i.size(0))
-            total_nodes += int(x_i.size(0))
         
         x_i, y_i = x_i.to(device), y_i.to(device)
-        if isinstance(edge_index_i, list):
-            edge_index_i = [e.to(device) for e in edge_index_i]
-        else:
-            edge_index_i = edge_index_i.to(device)
+        edge_index_i = edge_index_i.to(device)
 
         pred = model(x_i, attn_bias, edge_index_i, attn_type=args.attn_type)
-        loss = F.nll_loss(pred, y_i)
-        loss_list.append(loss.item())
-        
-        y_true.append(y_i.view(-1))
-        y_pred.append(pred.argmax(1))
-    y_pred = torch.cat(y_pred)
-    y_true = torch.cat(y_true)
-        
-    acc = calc_acc(y_true, y_pred)
+        pred_label = pred.argmax(1)
+        y_i_flat = y_i.view(-1)
+        is_labeled = y_i_flat == y_i_flat
+        if is_labeled.any():
+            correct += int((pred_label[is_labeled] == y_i_flat[is_labeled]).sum().item())
+            total += int(is_labeled.sum().item())
+    acc = float(correct) / max(1, total)
     
     del x_i, y_i, edge_index_i
-    torch.cuda.empty_cache()
     
-    if return_coverage:
-        coverage = covered_nodes / max(1, total_nodes)
-        return acc, coverage
     return acc  
 
 

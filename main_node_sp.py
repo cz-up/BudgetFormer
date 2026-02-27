@@ -28,6 +28,8 @@ from gt_sp.reducer import sync_params_and_buffers
 from gt_sp.evaluate import sparse_eval_gpu
 from gt_sp.utils import (
     get_batch_blockize,
+    build_head_hop_edges,
+    _merge_edge_index_list,
     gen_sub_edge_index,
     random_split_idx,
     fixed_random_seed,
@@ -94,7 +96,6 @@ def _eval_with_params(
     device,
     walk_length=None,
     walks_per_node=None,
-    return_coverage=False,
     repeats=1,
 ):
     orig_len = args.head_hop_walk_length
@@ -104,43 +105,23 @@ def _eval_with_params(
     if walks_per_node is not None:
         args.head_hop_walks_per_node = int(walks_per_node)
     acc_sum = 0.0
-    cov_sum = 0.0
     try:
         for r in range(max(1, int(repeats))):
             with fixed_random_seed(args.seed + r):
-                if return_coverage:
-                    acc, cov = sparse_eval_gpu(
-                        args,
-                        model,
-                        feature,
-                        y,
-                        split_idx,
-                        None,
-                        edge_index_global,
-                        device,
-                        return_coverage=True,
-                    )
-                    acc_sum += acc
-                    cov_sum += cov
-                else:
-                    acc_sum += sparse_eval_gpu(
-                        args,
-                        model,
-                        feature,
-                        y,
-                        split_idx,
-                        None,
-                        edge_index_global,
-                        device,
-                    )
+                acc_sum += sparse_eval_gpu(
+                    args,
+                    model,
+                    feature,
+                    y,
+                    split_idx,
+                    None,
+                    edge_index_global,
+                    device,
+                )
     finally:
         args.head_hop_walk_length = orig_len
         args.head_hop_walks_per_node = orig_walks
-    acc_avg = acc_sum / max(1, int(repeats))
-    if return_coverage:
-        cov_avg = cov_sum / max(1, int(repeats))
-        return acc_avg, cov_avg
-    return acc_avg
+    return acc_sum / max(1, int(repeats))
 
 
 def _forward_outputs(
@@ -273,34 +254,28 @@ def _coverage_for_R(
     try:
         with fixed_random_seed(seed):
             args.head_hop_walks_per_node = int(walks_per_node)
-            x_i, _, edge_index_i, _ = get_batch_blockize(
-                args,
-                feature,
-                y,
-                idx_batch_cpu,
-                sub_split_seq_lens,
-                edge_index_global,
-                N,
-                device=device,
+            edge_index_i = gen_sub_edge_index(edge_index_global, idx_batch_cpu, N)
+            if edge_index_i is None or edge_index_i.numel() == 0:
+                return 0.0
+            edge_index_i = build_head_hop_edges(
+                edge_index=edge_index_i.to("cpu"),
+                num_nodes=int(idx_batch_cpu.numel()),
+                num_heads=args.num_heads,
+                num_groups=1,
+                device="cpu",
+                walk_length=getattr(args, "head_hop_walk_length", 4),
+                walks_per_node=int(walks_per_node),
             )
+            if isinstance(edge_index_i, list):
+                edge_index_i = _merge_edge_index_list(edge_index_i)
     finally:
         args.head_hop_walks_per_node = base_R
-    num_nodes = int(x_i.size(0))
+    num_nodes = int(idx_batch_cpu.numel())
     if num_nodes <= 0 or edge_index_i is None:
         return 0.0
-    if isinstance(edge_index_i, list):
-        nodes_list = []
-        for e in edge_index_i:
-            if e is None or e.numel() == 0:
-                continue
-            nodes_list.append(torch.unique(e.detach().cpu()[1].view(-1)))
-        if not nodes_list:
-            return 0.0
-        nodes = torch.unique(torch.cat(nodes_list, dim=0))
-    else:
-        if edge_index_i.numel() == 0:
-            return 0.0
-        nodes = torch.unique(edge_index_i.detach().cpu()[1].view(-1))
+    if edge_index_i.numel() == 0:
+        return 0.0
+    nodes = torch.unique(edge_index_i.detach().cpu()[1].view(-1))
     valid = (nodes >= 0) & (nodes < num_nodes)
     covered = int(valid.sum().item())
     return covered / max(1, num_nodes)
@@ -470,8 +445,8 @@ def main():
         needed_L_count = 0
         cov_diff_sum = 0.0
         cov_diff_count = 0
-        do_diff_check = adaptive_enabled and adaptive_stage == "tune_L"
-        do_cov_check = adaptive_enabled and adaptive_stage == "tune_R"
+        do_diff_check = adaptive_enabled and adaptive_stage == "tune_L" and args.rank == 0
+        do_cov_check = adaptive_enabled and adaptive_stage == "tune_R" and args.rank == 0
         for idx_batch_cpu in batch_indices:
             t_iter_start = time.time()
             optimizer.zero_grad(set_to_none=True)
@@ -496,7 +471,6 @@ def main():
                     dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, group=get_sequence_parallel_group())
 
             optimizer.step()
-            torch.cuda.synchronize()
             iter_t_list.append(time.time() - t_iter_start)
             if do_diff_check and iter_idx <= args.adaptive_embed_batches:
                 needed_L = _estimate_L_star(
@@ -554,19 +528,9 @@ def main():
         avg_needed_L = None
         avg_cov_diff = None
         if adaptive_enabled and do_diff_check:
-            needed_L_sum_t = torch.tensor(needed_L_sum, device=device)
-            needed_L_count_t = torch.tensor(needed_L_count, device=device, dtype=torch.long)
-            if dist.is_initialized():
-                dist.all_reduce(needed_L_sum_t, op=dist.ReduceOp.SUM)
-                dist.all_reduce(needed_L_count_t, op=dist.ReduceOp.SUM)
-            avg_needed_L = float(needed_L_sum_t.item() / max(1, needed_L_count_t.item()))
+            avg_needed_L = float(needed_L_sum / max(1, needed_L_count))
         if adaptive_enabled and do_cov_check:
-            cov_sum_t = torch.tensor(cov_diff_sum, device=device)
-            cov_count_t = torch.tensor(cov_diff_count, device=device, dtype=torch.long)
-            if dist.is_initialized():
-                dist.all_reduce(cov_sum_t, op=dist.ReduceOp.SUM)
-                dist.all_reduce(cov_count_t, op=dist.ReduceOp.SUM)
-            avg_cov_diff = float(cov_sum_t.item() / max(1, cov_count_t.item()))
+            avg_cov_diff = float(cov_diff_sum / max(1, cov_diff_count))
 
         if args.rank == 0 and adaptive_enabled:
             if avg_needed_L is not None and adaptive_stage == "tune_L":
@@ -612,7 +576,7 @@ def main():
             stage_id = int(state[2].item())
             adaptive_stage = "tune_L" if stage_id == 0 else "tune_R" if stage_id == 1 else "stable"
 
-        if args.rank == 0 and epoch % 5 ==0:
+        if epoch % 5 == 0:
             stats = None
             t4 = time.time()
             with fixed_random_seed(args.seed):
@@ -637,42 +601,41 @@ def main():
             with fixed_random_seed(args.seed):
                 test_acc = sparse_eval_gpu(args, model, feature, y, split_idx["test"], None, edge_index_global, device)
             t5 = time.time()
-            print("------------------------------------------------------------------------------------")
-            print(f'Eval time {t5-t4}s')
-            print("Epoch: {:03d}, Loss: {:4f}, Train acc: {:.2%}, Val acc: {:.2%}, Test acc: {:.2%}, Epoch Time: {:.3f}s".format(
-                epoch, np.mean(loss_list), train_acc, val_acc, test_acc, np.mean(epoch_t_list)))
-            if stats is not None:
-                print("Attention hop-mass stats (per layer):")
-                for i, stat in enumerate(stats):
-                    if stat is None:
-                        print(f"  layer {i}: no data")
-                        continue
-                    hop_sums, hop_count, max_sum, max_count, max_hop = stat
-                    mean_max_hop = max_sum / max(1, max_count)
-                    if hop_count > 0:
-                        ratios = [h / hop_count for h in hop_sums]
-                        ratio_str = ", ".join(f"{r:.3f}" for r in ratios)
-                        print(
-                            f"  layer {i}: mean_max_hop={mean_max_hop:.3f}, max_hop={max_hop}, "
-                            f"hop_ratios=[{ratio_str}]"
-                        )
-                    else:
-                        print(f"  layer {i}: mean_max_hop={mean_max_hop:.3f}, max_hop={max_hop}, hop_ratios=NA")
-            print("------------------------------------------------------------------------------------")
+            if args.rank == 0:
+                print("------------------------------------------------------------------------------------")
+                print(f'Eval time {t5-t4}s')
+                print("Epoch: {:03d}, Loss: {:4f}, Train acc: {:.2%}, Val acc: {:.2%}, Test acc: {:.2%}, Epoch Time: {:.3f}s".format(
+                    epoch, np.mean(loss_list), train_acc, val_acc, test_acc, np.mean(epoch_t_list)))
+                if stats is not None:
+                    print("Attention hop-mass stats (per layer):")
+                    for i, stat in enumerate(stats):
+                        if stat is None:
+                            print(f"  layer {i}: no data")
+                            continue
+                        hop_sums, hop_count, max_sum, max_count, max_hop = stat
+                        mean_max_hop = max_sum / max(1, max_count)
+                        if hop_count > 0:
+                            ratios = [h / hop_count for h in hop_sums]
+                            ratio_str = ", ".join(f"{r:.3f}" for r in ratios)
+                            print(
+                                f"  layer {i}: mean_max_hop={mean_max_hop:.3f}, max_hop={max_hop}, "
+                                f"hop_ratios=[{ratio_str}]"
+                            )
+                        else:
+                            print(f"  layer {i}: mean_max_hop={mean_max_hop:.3f}, max_hop={max_hop}, hop_ratios=NA")
+                print("------------------------------------------------------------------------------------")
 
-            
+                if val_acc > best_val:
+                    best_val = val_acc
+                    best_epoch = epoch
+                    if args.save_model:
+                        torch.save(model.state_dict(), args.model_dir + f"{args.dataset}.pkl")
 
-            if val_acc > best_val:
-                best_val = val_acc
-                best_epoch = epoch
-                if args.save_model:
-                    torch.save(model.state_dict(), args.model_dir + f"{args.dataset}.pkl")
+                if test_acc > best_test:
+                    best_test = test_acc
 
-            if test_acc > best_test:
-                best_test = test_acc
-
-            val_acc_list.append(val_acc)
-            test_acc_list.append(test_acc)
+                val_acc_list.append(val_acc)
+                test_acc_list.append(test_acc)
 
         if seq_parallel_world_size > 1:
             dist.barrier()

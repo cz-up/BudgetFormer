@@ -48,11 +48,9 @@ def parser_add_main_args(parser):
                         help='repeat evaluation and average to reduce randomness')
     parser.add_argument('--adaptive_embed_batches', type=int, default=5,
                         help='number of train batches to compare L vs L+1')
-    parser.add_argument('--adaptive_embed_delta', type=float, default=0.05,
-                        help='min relative output diff to keep increasing L')
     parser.add_argument('--full_attn_hop_stats', action='store_true', default=False,
                         help='enable full attention hop-mass stats in val')
-    parser.add_argument('--full_attn_hop_mass', type=float, default=0.95,
+    parser.add_argument('--hop_coverage_target', type=float, default=0.95,
                         help='target mass for hop-mass coverage stats')
     parser.add_argument('--full_attn_hop_max_queries', type=int, default=64,
                         help='max queries per batch for hop-mass stats')
@@ -60,9 +58,7 @@ def parser_add_main_args(parser):
                         help='max batches per layer to collect hop-mass stats')
     parser.add_argument('--full_attn_hop_max_hop', type=int, default=64,
                         help='max hop to explore when collecting hop-mass stats (<=0 for no limit)')
-    parser.add_argument('--adaptive_val_delta', type=float, default=0.0,
-                        help='min val acc improvement to reset patience')
-    parser.add_argument('--adaptive_cov_delta', type=float, default=0.0,
+    parser.add_argument('--adaptive_cov_delta', type=float, default=0.03,
                         help='min coverage improvement to reset patience')
     
     # distributed args

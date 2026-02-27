@@ -817,48 +817,23 @@ def get_batch_blockize(args, x, y, idx_batch, rest_split_sizes, edge_index, N, d
             walk_length=getattr(args, "head_hop_walk_length", 4),
             walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
         )
+    # Current head-hop implementation shares the same subgraph across heads.
+    # Merge to one tensor early to avoid per-head broadcast/memory overhead.
+    if isinstance(edge_index_i_heads, list):
+        edge_index_i_heads = _merge_edge_index_list(edge_index_i_heads)
     if dev is not None and dev.type == "cuda":
-        if isinstance(edge_index_i_heads, list):
-            edge_index_i_heads = [e.to(dev) for e in edge_index_i_heads]
-        else:
-            edge_index_i_heads = edge_index_i_heads.to(dev)
+        edge_index_i_heads = edge_index_i_heads.to(dev)
     if seq_parallel_world_size > 1:
         src_rank = get_sequence_parallel_src_rank()
         group = get_sequence_parallel_group()
-        if isinstance(edge_index_i_heads, list):
-            device_ref = edge_index_i_heads[0].device if edge_index_i_heads else edge_index_i.device
-            dtype_ref = edge_index_i_heads[0].dtype if edge_index_i_heads else edge_index_i.dtype
-            if dist.get_rank() == src_rank:
-                head_count = torch.tensor([len(edge_index_i_heads)], device=device_ref, dtype=torch.long)
-            else:
-                head_count = torch.empty(1, device=device_ref, dtype=torch.long)
-            dist.broadcast(head_count, src_rank, group=group)
-            head_count_val = int(head_count.item())
-            if dist.get_rank() == src_rank:
-                size_broad = torch.tensor(
-                    [e.size(1) for e in edge_index_i_heads],
-                    device=device_ref,
-                    dtype=torch.long,
-                )
-            else:
-                size_broad = torch.empty(head_count_val, device=device_ref, dtype=torch.long)
-            dist.broadcast(size_broad, src_rank, group=group)
-            if dist.get_rank() != src_rank:
-                edge_index_i_heads = [
-                    torch.empty((2, int(size_broad[i].item())), device=device_ref, dtype=dtype_ref)
-                    for i in range(head_count_val)
-                ]
-            for i in range(head_count_val):
-                dist.broadcast(edge_index_i_heads[i], src_rank, group=group)
+        if dist.get_rank() == src_rank:
+            size_broad = torch.tensor([edge_index_i_heads.size(1)], device=edge_index_i_heads.device, dtype=torch.long)
         else:
-            if dist.get_rank() == src_rank:
-                size_broad = torch.tensor([edge_index_i_heads.size(1)], device=edge_index_i_heads.device, dtype=torch.long)
-            else:
-                size_broad = torch.empty(1, device=edge_index_i_heads.device, dtype=torch.long)
-            dist.broadcast(size_broad, src_rank, group=group)
-            if dist.get_rank() != src_rank:
-                edge_index_i_heads = torch.empty((2, int(size_broad.item())), device=edge_index_i_heads.device, dtype=edge_index_i_heads.dtype)
-            dist.broadcast(edge_index_i_heads, src_rank, group=group)
+            size_broad = torch.empty(1, device=edge_index_i_heads.device, dtype=torch.long)
+        dist.broadcast(size_broad, src_rank, group=group)
+        if dist.get_rank() != src_rank:
+            edge_index_i_heads = torch.empty((2, int(size_broad.item())), device=edge_index_i_heads.device, dtype=edge_index_i_heads.dtype)
+        dist.broadcast(edge_index_i_heads, src_rank, group=group)
 
     if idx_batch.shape[0] < seq_length:
         assert rest_split_sizes is not None, 'Rest split_sizes should not be None'
