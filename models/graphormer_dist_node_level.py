@@ -208,7 +208,7 @@ class CoreAttention(nn.Module):
 
             if attn_bias is not None:
                 score = score + \
-                        attn_bias[edge_index[0].to(torch.long), edge_index[1].to(torch.long), :] 
+                        attn_bias[edge_index[0].to(torch.long), edge_index[1].to(torch.long), :].unsqueeze(-1)
 
             # softmax -> [total_edges, np, 1]
             score = torch.exp(score) 
@@ -541,7 +541,10 @@ class MultiHeadAttention(nn.Module):
 
         local_attn = CoreAttention(
             hidden_size, attention_dropout_rate, num_heads, attn_bias_dim)
-        self.dist_attn = DistributedAttentionNoMerge(local_attn, get_sequence_parallel_group())
+        if sequence_parallel_is_initialized():
+            self.dist_attn = DistributedAttentionNoMerge(local_attn, get_sequence_parallel_group())
+        else:
+            self.dist_attn = local_attn
 
         self.output_layer = nn.Linear(num_heads * att_size, hidden_size)
 
@@ -654,7 +657,15 @@ class Graphormer(nn.Module):
         
         self.graph_token = nn.Embedding(self.num_global_node, hidden_dim)
         self.graph_token_virtual_distance = nn.Embedding(self.num_global_node, attn_bias_dim)
+        # Project structural attn_bias (one-hot / positional) to per-head scalars.
+        # Active only when attn_bias is not None (i.e. local_spd mode).
+        self.attn_bias_proj = nn.Linear(attn_bias_dim, num_heads, bias=False)
         self.apply(lambda module: init_params(module, n_layers=n_layers))
+
+    @staticmethod
+    def _get_core_attention(layer):
+        dist_attn = layer.self_attention.dist_attn
+        return getattr(dist_attn, "local_attn", dist_attn)
 
     def enable_hop_mass_tracking(
         self,
@@ -664,26 +675,26 @@ class Graphormer(nn.Module):
         max_hop: int = 15,
     ) -> None:
         for layer in self.layers:
-            core_attn = layer.self_attention.dist_attn.local_attn
+            core_attn = self._get_core_attention(layer)
             if hasattr(core_attn, "enable_hop_mass_tracking"):
                 core_attn.enable_hop_mass_tracking(mass, max_queries, max_batches, max_hop)
 
     def disable_hop_mass_tracking(self) -> None:
         for layer in self.layers:
-            core_attn = layer.self_attention.dist_attn.local_attn
+            core_attn = self._get_core_attention(layer)
             if hasattr(core_attn, "disable_hop_mass_tracking"):
                 core_attn.disable_hop_mass_tracking()
 
     def reset_hop_mass_stats(self) -> None:
         for layer in self.layers:
-            core_attn = layer.self_attention.dist_attn.local_attn
+            core_attn = self._get_core_attention(layer)
             if hasattr(core_attn, "reset_hop_mass_stats"):
                 core_attn.reset_hop_mass_stats()
 
     def get_hop_mass_stats_per_layer(self):
         stats = []
         for layer in self.layers:
-            core_attn = layer.self_attention.dist_attn.local_attn
+            core_attn = self._get_core_attention(layer)
             if hasattr(core_attn, "get_hop_mass_stats"):
                 stats.append(core_attn.get_hop_mass_stats())
             else:
@@ -693,39 +704,50 @@ class Graphormer(nn.Module):
 
 
     def forward(self, x, attn_bias, edge_index, perturb=None, attn_type=None):
-        # x -> [bs=1, s/p, x_d]
-        x = x.unsqueeze(0) 
-        n_graph = x.shape[0] 
-        
-        # [bs, s/p, x_d] -> [bs, s/p, h]
-        node_feature = self.node_encoder(x)         
-        
+        # x → [bs=1, s/p, x_d]
+        x = x.unsqueeze(0)
+        n_graph = x.shape[0]
+
+        # [bs, s/p, x_d] → [bs, s/p, h]
+        node_feature = self.node_encoder(x)
+
         if perturb is not None:
             node_feature += perturb
 
         # [bs, 1, h]
-        global_node_feature = self.graph_token.weight.unsqueeze(0).repeat(n_graph, 1, 1) 
+        global_node_feature = self.graph_token.weight.unsqueeze(0).repeat(n_graph, 1, 1)
         # [b, s/p + 1, h]
-        node_feature = torch.cat([global_node_feature, node_feature], dim=1) 
+        node_feature = torch.cat([global_node_feature, node_feature], dim=1)
 
-        output = self.input_dropout(node_feature) 
+        output = self.input_dropout(node_feature)
 
         if attn_bias is not None:
-            # attn_bias: [bs, s/p, s, attn_bias_dim]
-            attn_bias = attn_bias.unsqueeze(0) 
-            n_graph, subseq_len, seq_len = attn_bias.size()[:3]
-            graph_attn_bias = attn_bias.clone() 
+            # attn_bias: [sub_s, full_s, attn_bias_dim]  (returned by get_batch_blockize)
+            # Project to per-head scalars: [sub_s, full_s, num_heads]
+            attn_bias_proj = self.attn_bias_proj(attn_bias.to(output.device))  # [sub_s, full_s, num_heads]
 
-            # [b, s/p+1, s, attn_bias_dim]
-            graph_attn_bias = torch.cat([self.graph_token_virtual_distance.weight.unsqueeze(0).unsqueeze(2).repeat(n_graph, 1, seq_len, 1), 
-                                         graph_attn_bias], dim=1) 
-            # [b, s/p+1, s+1, attn_bias_dim]
-            graph_attn_bias = torch.cat([self.graph_token_virtual_distance.weight.unsqueeze(0).unsqueeze(0).repeat(n_graph, subseq_len+self.num_global_node, 1, 1), graph_attn_bias], dim=2)  
-            graph_attn_bias = graph_attn_bias.repeat(1, 1, 1, self.num_heads) # [b, s/p+1, s+1, n]
+            # Also build virtual-distance bias for global token (same shape as graph_token_virtual_distance)
+            # vd: [1, attn_bias_dim] → [1, num_heads]
+            vd = self.attn_bias_proj(self.graph_token_virtual_distance.weight)  # [num_global, num_heads]
+
+            sub_s = attn_bias_proj.size(0)
+            full_s = attn_bias_proj.size(1)
+
+            # Build [sub_s+1, full_s+1, num_heads] graph_attn_bias (matching sparse_attention_bias indexing)
+            # Row for global token (index 0): constant vd repeated
+            global_row = vd.unsqueeze(1).expand(self.num_global_node, full_s + self.num_global_node, self.num_heads)  # [1, full_s+1, h]
+            # Col for global token: constant vd repeated
+            global_col = vd.unsqueeze(0).expand(sub_s, self.num_global_node, self.num_heads)  # [sub_s, 1, h]
+            # Main block + global col  → [sub_s, full_s+1, num_heads]
+            main_with_gcol = torch.cat([global_col, attn_bias_proj], dim=1)
+            # Stack global row on top → [sub_s+1, full_s+1, num_heads]
+            graph_attn_bias = torch.cat([global_row, main_with_gcol], dim=0)
+            # Add batch dim expected by encoder layers (batch_size=1): [1, sub_s+1, full_s+1, num_heads]
+            graph_attn_bias = graph_attn_bias.unsqueeze(0)
         else:
-            graph_attn_bias = attn_bias
-        
-        # transfomrer encoder
+            graph_attn_bias = None
+
+        # transformer encoder
         for enc_layer in self.layers:
             output = enc_layer(output, attn_bias=graph_attn_bias, edge_index=edge_index, attn_type=attn_type)
         output = self.final_ln(output)

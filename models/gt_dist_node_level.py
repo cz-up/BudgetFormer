@@ -425,7 +425,10 @@ class MultiHeadAttention(nn.Module):
 
         local_attn = CoreAttention(
             hidden_size, attention_dropout_rate, num_heads)
-        self.dist_attn = DistributedAttentionNodeLevel(local_attn, get_sequence_parallel_group())
+        if sequence_parallel_is_initialized():
+            self.dist_attn = DistributedAttentionNodeLevel(local_attn, get_sequence_parallel_group())
+        else:
+            self.dist_attn = local_attn
 
 
     def forward(self, x, attn_bias=None, edge_index=None, attn_type=None):
@@ -458,42 +461,39 @@ class MultiHeadAttention(nn.Module):
         assert x.size() == orig_q_size
         return x
 
+    def _core_attn(self):
+        return getattr(self.dist_attn, "local_attn", self.dist_attn)
+
     def reset_head_mass_stats(self):
-        if hasattr(self.dist_attn, "local_attn"):
-            reset_fn = getattr(self.dist_attn.local_attn, "reset_head_mass_stats", None)
-            if reset_fn is not None:
-                reset_fn()
+        reset_fn = getattr(self._core_attn(), "reset_head_mass_stats", None)
+        if reset_fn is not None:
+            reset_fn()
 
     def get_head_mass_stats(self):
-        if hasattr(self.dist_attn, "local_attn"):
-            get_fn = getattr(self.dist_attn.local_attn, "get_head_mass_stats", None)
-            if get_fn is not None:
-                return get_fn()
+        get_fn = getattr(self._core_attn(), "get_head_mass_stats", None)
+        if get_fn is not None:
+            return get_fn()
         return None
 
     def enable_hop_mass_tracking(self, mass=0.95, max_queries=64, max_batches=1, max_hop=15):
-        if hasattr(self.dist_attn, "local_attn"):
-            enable_fn = getattr(self.dist_attn.local_attn, "enable_hop_mass_tracking", None)
-            if enable_fn is not None:
-                enable_fn(mass, max_queries, max_batches, max_hop)
+        enable_fn = getattr(self._core_attn(), "enable_hop_mass_tracking", None)
+        if enable_fn is not None:
+            enable_fn(mass, max_queries, max_batches, max_hop)
 
     def disable_hop_mass_tracking(self):
-        if hasattr(self.dist_attn, "local_attn"):
-            disable_fn = getattr(self.dist_attn.local_attn, "disable_hop_mass_tracking", None)
-            if disable_fn is not None:
-                disable_fn()
+        disable_fn = getattr(self._core_attn(), "disable_hop_mass_tracking", None)
+        if disable_fn is not None:
+            disable_fn()
 
     def reset_hop_mass_stats(self):
-        if hasattr(self.dist_attn, "local_attn"):
-            reset_fn = getattr(self.dist_attn.local_attn, "reset_hop_mass_stats", None)
-            if reset_fn is not None:
-                reset_fn()
+        reset_fn = getattr(self._core_attn(), "reset_hop_mass_stats", None)
+        if reset_fn is not None:
+            reset_fn()
 
     def get_hop_mass_stats(self):
-        if hasattr(self.dist_attn, "local_attn"):
-            get_fn = getattr(self.dist_attn.local_attn, "get_hop_mass_stats", None)
-            if get_fn is not None:
-                return get_fn()
+        get_fn = getattr(self._core_attn(), "get_hop_mass_stats", None)
+        if get_fn is not None:
+            return get_fn()
         return None
 
 
@@ -586,6 +586,7 @@ class GT(nn.Module):
         self.node_encoder = nn.Linear(input_dim, hidden_dim)
         self.input_dropout = nn.Dropout(input_dropout_rate)
         
+
         encoders = [
             EncoderLayer(
                 hidden_dim, ffn_dim, dropout_rate, attention_dropout_rate, num_heads
@@ -600,27 +601,28 @@ class GT(nn.Module):
         
         
     def forward(self, x, attn_bias, edge_index, perturb=None, attn_type=None):
-        # x -> [bs=1, s/p, x_d]
-        x = x.unsqueeze(0) 
-        n_graph = x.shape[0] 
-        
-        # [bs, s/p, x_d] -> [bs, s/p, h]
-        node_feature = self.node_encoder(x)     
-        
+        # x → [bs=1, s/p, x_d]
+        x = x.unsqueeze(0)
+        n_graph = x.shape[0]
+
+        # [bs, s/p, x_d] → [bs, s/p, h]
+        node_feature = self.node_encoder(x)
+
+        node_feature -= perturb if perturb is not None else 0
         output = self.input_dropout(node_feature)
-        
+
         # Graphormer encoder
-        # [b, s/p+1, h]
+
         for enc_layer in self.layers:
             output = enc_layer(
-                output, 
+                output,
                 edge_index=edge_index,
                 attn_type=attn_type,
-            ) 
-        
+            )
+
         # Output part
         output = self.MLP_layer(output[0, :, :]) 
-        
+
         return F.log_softmax(output, dim=1)
 
     def reset_head_mass_stats(self):

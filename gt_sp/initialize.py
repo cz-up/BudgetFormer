@@ -23,7 +23,33 @@ _LAST_BATCH_FLAG = False
 
 def initialize_distributed(args):
     """Initialize torch.distributed and core model parallel."""
+    global _SEQUENCE_PARALLEL_GROUP
+    global _SEQUENCE_PARALLEL_WORLD_SIZE
+    global _SEQUENCE_PARALLEL_RANK
+    global _SEQUENCE_LENGTH
+    global _GLOBAL_TOKEN_NUM
     device_count = torch.cuda.device_count()
+    env_has_dist = ("RANK" in os.environ and "WORLD_SIZE" in os.environ)
+    env_world_size = int(os.environ.get("WORLD_SIZE", "1")) if env_has_dist else 1
+    # Auto fallback to single-process mode when runtime is effectively single-card/single-process.
+    run_single = (not env_has_dist) or (env_world_size <= 1)
+    if run_single:
+        args.rank = 0
+        args.world_size = 1
+        args.sequence_parallel_size = 1
+        _SEQUENCE_PARALLEL_GROUP = None
+        _SEQUENCE_PARALLEL_WORLD_SIZE = None
+        _SEQUENCE_PARALLEL_RANK = None
+        _SEQUENCE_LENGTH = None
+        if device_count > 0:
+            local_device = int(getattr(args, "device", 0)) % device_count
+            args.local_rank = local_device
+            torch.cuda.set_device(local_device)
+        else:
+            args.local_rank = 0
+        _GLOBAL_TOKEN_NUM = args.num_global_node
+        return
+
     assert device_count != 0, 'expected GPU number > 0.'
     if torch.distributed.is_initialized():
         if torch.distributed.get_rank() == 0:
@@ -49,7 +75,6 @@ def initialize_distributed(args):
 
             torch.cuda.set_device(device) # only do so when device_count > 0
     
-    global _GLOBAL_TOKEN_NUM
     _GLOBAL_TOKEN_NUM = args.num_global_node
 
 
@@ -61,9 +86,9 @@ def initialize_distributed(args):
 
     # Set the sequence-parallel communicators.
     if device_count > 0:
-        args.sequence_parallel_size = args.world_size # sp only 
-        initialize_sequence_parallel(args.seq_len, 1, 1,
-                                        args.sequence_parallel_size)
+        args.sequence_parallel_size = args.world_size # sp only
+        seq_len = int(getattr(args, "seq_len", 1))
+        initialize_sequence_parallel(seq_len, 1, 1, args.sequence_parallel_size)
 
 
 def initialize_sequence_parallel(

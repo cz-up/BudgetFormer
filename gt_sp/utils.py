@@ -26,6 +26,55 @@ from gt_sp.initialize import (
 )
 
 
+def _compute_local_spd_bias(edge_index: Tensor, n_nodes: int, max_dist: int) -> Tensor:
+    """Compute one-hot shortest-path-distance attention bias for a local subgraph (CPU).
+
+    Args:
+        edge_index: [2, E] tensor with local 0-indexed node ids (before fix_edge_index).
+        n_nodes:    number of nodes in the subgraph.
+        max_dist:   max hop distance; distances > max_dist are clamped to the last bin.
+                    Output one-hot dimension = max_dist + 1.
+
+    Returns:
+        Tensor of shape [n_nodes, n_nodes, max_dist+1], float32, on CPU.
+    """
+    from scipy.sparse import csr_matrix
+    from scipy.sparse.csgraph import shortest_path
+
+    d = max_dist + 1
+
+    if n_nodes == 0:
+        return torch.zeros(0, 0, d, dtype=torch.float32)
+
+    if edge_index.numel() == 0:
+        bias = torch.zeros(n_nodes, n_nodes, d, dtype=torch.float32)
+        bias[:, :, -1] = 1.0
+        for i in range(n_nodes):
+            bias[i, i, -1] = 0.0
+            bias[i, i, 0] = 1.0
+        return bias
+
+    ei = edge_index.cpu().numpy()
+    rows = np.concatenate([ei[0], ei[1]])
+    cols = np.concatenate([ei[1], ei[0]])
+    data_arr = np.ones(len(rows), dtype=np.float32)
+    # Guard against out-of-range indices (e.g. if edge_index already has virtual nodes)
+    mask = (rows >= 0) & (rows < n_nodes) & (cols >= 0) & (cols < n_nodes)
+    rows, cols, data_arr = rows[mask], cols[mask], data_arr[mask]
+
+    adj = csr_matrix((data_arr, (rows, cols)), shape=(n_nodes, n_nodes))
+    dist_mat = shortest_path(adj, method='D', directed=False, unweighted=True)  # [n, n], inf → unreachable
+
+    # inf → max_dist (last bin), then clamp to [0, max_dist]
+    dist_mat = np.where(np.isinf(dist_mat), float(max_dist), dist_mat)
+    dist_mat = np.clip(dist_mat, 0, max_dist)
+    dist_int = torch.from_numpy(dist_mat.astype(np.int64))  # [n, n]
+
+    bias = torch.zeros(n_nodes, n_nodes, d, dtype=torch.float32)
+    bias.scatter_(2, dist_int.unsqueeze(2), 1.0)
+    return bias
+
+
 def fix_edge_index(x, num_node):
     # Add new edges of virtual nodes
     virt_edges = []
@@ -772,7 +821,6 @@ def build_head_subgraph_provider(args) -> HeadSubgraphProvider:
         return HopMappedHeadSubgraphProvider(hop_sequence, num_groups)
     return SharedHeadSubgraphProvider()
 
-
 def get_batch_blockize(args, x, y, idx_batch, rest_split_sizes, edge_index, N, device=None):
     """
     Generate a local subsequence in sequence parallel and slice the corresponding edge_index.
@@ -785,6 +833,8 @@ def get_batch_blockize(args, x, y, idx_batch, rest_split_sizes, edge_index, N, d
     y_i = y[idx_batch]  # [s]
 
     edge_index_i = gen_sub_edge_index(edge_index, idx_batch, N)
+    # Keep raw (0-indexed, before fix_edge_index) copy for local_spd bias
+    edge_index_i_raw = edge_index_i
 
     if args.model == "graphormer":
         edge_index_i = fix_edge_index(edge_index_i, idx_batch.shape[0])
@@ -794,6 +844,22 @@ def get_batch_blockize(args, x, y, idx_batch, rest_split_sizes, edge_index, N, d
         dev = torch.device(device) if not isinstance(device, torch.device) else device
         if dev.type == "cuda":
             edge_index_i = edge_index_i.to(dev)
+
+    # --- attn_bias (optional, controlled by args.attn_bias_mode) ---
+    _attn_bias_mode = getattr(args, 'attn_bias_mode', 'none')
+    full_attn_bias = None  # [n_real, n_real, d] on CPU (before SP split)
+    if _attn_bias_mode == 'local_spd':
+        _n_real = idx_batch.shape[0]
+        _max_dist = getattr(args, 'attn_bias_max_dist', 5)
+        if _n_real > 16384:
+            import warnings
+            warnings.warn(
+                f"[local_spd] seq_len={_n_real} is large; BFS for {_n_real}x{_n_real} may be slow. "
+                "Consider using --attn_bias_mode none or reducing --seq_len."
+            )
+        full_attn_bias = _compute_local_spd_bias(
+            edge_index_i_raw.cpu(), n_nodes=_n_real, max_dist=_max_dist,
+        )  # [n_real, n_real, d]
 
     attn_bias = None
     try:
@@ -821,6 +887,7 @@ def get_batch_blockize(args, x, y, idx_batch, rest_split_sizes, edge_index, N, d
     # Merge to one tensor early to avoid per-head broadcast/memory overhead.
     if isinstance(edge_index_i_heads, list):
         edge_index_i_heads = _merge_edge_index_list(edge_index_i_heads)
+
     if dev is not None and dev.type == "cuda":
         edge_index_i_heads = edge_index_i_heads.to(dev)
     if seq_parallel_world_size > 1:
@@ -855,6 +922,22 @@ def get_batch_blockize(args, x, y, idx_batch, rest_split_sizes, edge_index, N, d
         y_i = y_i_list[seq_parallel_world_rank]
         sub_seq_start = seq_parallel_world_rank * max(rest_split_sizes)
         sub_seq_end = sub_seq_start + x_i.size(0)
+
+        if full_attn_bias is not None:
+            # Pad [n_real, n_real, d] → [seq_length, seq_length, d] (zeros for pad nodes)
+            # Use direct padding instead of pad_attn_bias() which requires SP group init
+            n_real, _, _d = full_attn_bias.shape
+            if n_real < seq_length:
+                padded = full_attn_bias.new_zeros([seq_length, seq_length, _d])
+                padded[:n_real, :n_real, :] = full_attn_bias
+                attn_bias = padded
+            else:
+                attn_bias = full_attn_bias
+            # Slice rows for this rank: [sub_s, full_padded_s, d]
+            attn_bias = attn_bias[sub_seq_start:sub_seq_end, :, :]
+            if dev is not None:
+                attn_bias = attn_bias.to(dev)
+
         last_batch_flag(True)
     else:
         assert seq_length % seq_parallel_world_size == 0
@@ -869,6 +952,12 @@ def get_batch_blockize(args, x, y, idx_batch, rest_split_sizes, edge_index, N, d
                 edge_index_i_heads,
                 lambda e: adjust_edge_index_nomerge(e, sub_seq_length),
             )
+
+        if full_attn_bias is not None:
+            # Slice rows for this rank: [sub_s, full_s, d]
+            attn_bias = full_attn_bias[sub_seq_start:sub_seq_end, :, :]
+            if dev is not None:
+                attn_bias = attn_bias.to(dev)
 
         last_batch_flag(False)
 

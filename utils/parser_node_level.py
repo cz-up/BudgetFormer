@@ -61,6 +61,25 @@ def parser_add_main_args(parser):
     parser.add_argument('--adaptive_cov_delta', type=float, default=0.03,
                         help='min coverage improvement to reset patience')
     
+    # attn bias encoding args
+    parser.add_argument('--attn_bias_mode', type=str, default='none',
+                        choices=['none', 'local_spd'],
+                        help='Attention bias encoding mode: none (disabled) | local_spd (per-batch BFS)')
+    parser.add_argument('--attn_bias_max_dist', type=int, default=5,
+                        help='[local_spd] max hop distance; distances > this are clamped. one-hot dim = max_dist+1')
+
+    # node positional encoding args
+    parser.add_argument('--pe_modes', type=str, default='',
+                        help='Comma-separated list of Node PEs to concat (e.g., rwse,lap)')
+    parser.add_argument('--rwse_dim', type=int, default=16,
+                        help='[rwse] number of random walk steps (RWSE feature dimension per node)')
+    parser.add_argument('--lap_dim', type=int, default=10,
+                        help='[lap] number of Laplacian eigenvectors (LapPE feature dimension per node)')
+    parser.add_argument('--rwse_file', type=str, default='',
+                        help='[rwse] path to precomputed RWSE tensor; default: {dataset_dir}/{dataset}/rwse_k{rwse_dim}.pt')
+    parser.add_argument('--lap_file', type=str, default='',
+                        help='[lap] path to precomputed LapPE tensor; default: {dataset_dir}/{dataset}/lap_k{lap_dim}.pt')
+
     # distributed args
     parser.add_argument('--rank', type=int, default=None,
                        help='rank passed from distributed launcher.')

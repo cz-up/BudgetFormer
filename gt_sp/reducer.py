@@ -10,6 +10,8 @@ from gt_sp.initialize import (
 
 
 def sync_params_and_buffers(model):
+    if not dist.is_initialized():
+        return
     for name, param in model.state_dict().items():
         torch.distributed.broadcast(param.data,
                                     src=get_sequence_parallel_src_rank(),
