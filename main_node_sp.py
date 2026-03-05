@@ -16,6 +16,7 @@ from gt_sp.initialize import (
     sequence_parallel_is_initialized,
     get_sequence_parallel_group,
     get_sequence_parallel_world_size,
+    get_sequence_parallel_rank,
     get_sequence_parallel_src_rank,
     get_sequence_length_per_rank,
     set_global_token_indices,
@@ -56,14 +57,15 @@ def _load_node_level_data(args, device):
     if args.dataset == "pokec":
         y = torch.clamp(y, min=0)
 
-    if getattr(args, "use_ogbn_split", False):
-        split_idx = _load_ogbn_split(args.dataset, args.dataset_dir, wait_for_rank0=True)
-        if split_idx is None:
-            if args.rank == 0:
-                print("Warning: ogbn split unavailable, fallback to random split.")
-            split_idx = random_split_idx(y, frac_train=0.6, frac_valid=0.2, frac_test=0.2, seed=args.seed)
-    else:
+    # 始终尝试数据集官方划分，找不到时回退随机 60/20/20 分割
+    split_idx = _load_ogbn_split(args.dataset, args.dataset_dir, wait_for_rank0=True)
+    if split_idx is None:
+        if args.rank == 0:
+            print("[split] No official split found, falling back to random 60/20/20 split.")
         split_idx = random_split_idx(y, frac_train=0.6, frac_valid=0.2, frac_test=0.2, seed=args.seed)
+    else:
+        if args.rank == 0:
+            print("[split] Loaded official dataset split.")
 
     if args.rank == 0:
         print(args)
@@ -106,7 +108,26 @@ def _load_node_level_data(args, device):
     return feature, y, edge_index_global, N, split_idx
 
 
-def _prepare_sequence_training_state(args, split_idx, device):
+def _load_metis_partition(args):
+    """加载预计算的 METIS 分区文件，返回 [num_blocks, seq_len] 的节点 id 数组。"""
+    part_path = getattr(args, 'metis_partition_file', '') or \
+        f"{args.dataset_dir}{args.dataset}/part_seq_{args.seq_len}.pt"
+    if not os.path.exists(part_path):
+        raise FileNotFoundError(
+            f"[metis] Partition file not found: {part_path}\n"
+            f"Run: python utils/precompute_partitions.py --dataset {args.dataset} "
+            f"--dataset_dir {args.dataset_dir} --seq_len {args.seq_len}"
+        )
+    part_seq = torch.load(part_path, map_location='cpu')  # [num_blocks * seq_len]
+    assert part_seq.numel() % args.seq_len == 0, \
+        f"[metis] part_seq length {part_seq.numel()} not divisible by seq_len {args.seq_len}"
+    blocks = part_seq.view(-1, args.seq_len)  # [num_blocks, seq_len]
+    if args.rank == 0:
+        print(f"[metis] Loaded partition: {blocks.shape[0]} blocks x {args.seq_len} nodes from {part_path}")
+    return blocks  # LongTensor, -1 indicates padding
+
+
+def _prepare_sequence_training_state(args, split_idx, device, metis_blocks=None):
     seq_parallel_world_size = get_sequence_parallel_world_size() if sequence_parallel_is_initialized() else 1
     profile_single_machine = (not dist.is_initialized()) or (seq_parallel_world_size <= 1)
 
@@ -115,6 +136,8 @@ def _prepare_sequence_training_state(args, split_idx, device):
         group = get_sequence_parallel_group()
 
     train_idx = split_idx["train"]
+
+    # 对于 METIS 模式，不需要广播 flatten_train_idx，但仍需要广播 train_idx set 用于 mask
     if args.rank == 0:
         flatten_train_idx = train_idx.to(device)
     else:
@@ -220,7 +243,14 @@ def _load_ogbn_split(dataset_name: str, root_dir: str, wait_for_rank0: bool = Fa
     return out
 
 
-def run_step(args, model, device, feature, y, idx_batch_cpu, sub_split_seq_lens, edge_index_global, N, attn_type):
+def run_step(args, model, device, feature, y, idx_batch_cpu, sub_split_seq_lens,
+             edge_index_global, N, attn_type, train_idx_tensor=None):
+    """
+    train_idx_tensor: LongTensor of training node ids (CPU). If provided, nodes
+    in idx_batch_cpu that are NOT in train_idx_tensor will have their label masked
+    to -100 so they are ignored in the loss computation. This is used for METIS
+    batching where each block may contain val/test nodes as context.
+    """
     x_i, y_i, edge_index_i, attn_bias = get_batch_blockize(
         args,
         feature,
@@ -231,6 +261,34 @@ def run_step(args, model, device, feature, y, idx_batch_cpu, sub_split_seq_lens,
         N,
         device=device,
     )
+
+    # --- METIS 模式下屏蔽非训练节点的 loss ---
+    if train_idx_tensor is not None:
+        # 确定当前 rank 处理的节点子集
+        sp_world = get_sequence_parallel_world_size() if sequence_parallel_is_initialized() else 1
+        sp_rank  = get_sequence_parallel_rank()  if sequence_parallel_is_initialized() else 0
+        batch_n  = idx_batch_cpu.shape[0]
+
+        if batch_n < args.seq_len and sub_split_seq_lens is not None:
+            # last-batch 路径：get_batch_blockize 内部已用 max(sub_split_seq_lens) 旹式 pad
+            sub_len = max(sub_split_seq_lens)
+            # 构建与 get_batch_blockize 相同的 padded idx
+            padded_idx = torch.full((sub_len * sp_world,), -1, dtype=idx_batch_cpu.dtype)
+            padded_idx[:batch_n] = idx_batch_cpu
+            idx_for_rank = padded_idx[sp_rank * sub_len : (sp_rank + 1) * sub_len]
+        else:
+            sub_len = args.seq_len // sp_world
+            idx_for_rank = idx_batch_cpu[sp_rank * sub_len : (sp_rank + 1) * sub_len]
+
+        # 向量化 isin （-1 padding 节点全部屏蔽）
+        valid_mask = idx_for_rank >= 0
+        is_train   = torch.zeros(idx_for_rank.shape[0], dtype=torch.bool)
+        if valid_mask.any():
+            is_train[valid_mask] = torch.isin(
+                idx_for_rank[valid_mask], train_idx_tensor
+            )
+        y_i = y_i.clone()
+        y_i[~is_train] = -100   # F.nll_loss ignore_index
 
     x_i = x_i.to(device)
     y_i = y_i.to(device)
@@ -258,6 +316,21 @@ def main():
         os.makedirs(args.model_dir, exist_ok=True)
 
     feature, y, edge_index_global, N, split_idx = _load_node_level_data(args, device)
+
+    # --- METIS 预分区：自动检测分区文件，存在则启用，不存在则 fallback 随机 batching ---
+    _part_path = f"{args.dataset_dir}{args.dataset}/part_seq_{args.seq_len}.pt"
+    metis_blocks = None
+    train_idx_tensor = None
+    if os.path.exists(_part_path):
+        metis_blocks = _load_metis_partition(args)  # [num_blocks, seq_len]
+        train_idx_tensor = split_idx['train'].cpu().to(torch.long)
+        if args.rank == 0:
+            print(f"[metis] Auto-detected partition file, using METIS batching. "
+                  f"#blocks={metis_blocks.shape[0]}, #train={train_idx_tensor.numel()}")
+    else:
+        if args.rank == 0:
+            print(f"[metis] No partition file found at {_part_path}, using random batching.")
+
     flatten_train_idx, sub_split_seq_lens, seq_parallel_world_size, profile_single_machine = (
         _prepare_sequence_training_state(args, split_idx, device)
     )
@@ -304,8 +377,14 @@ def main():
             model.reset_head_mass_stats()
         idx_train_shuffle = flatten_train_idx[torch.randperm(flatten_train_idx.size(0))].to("cpu")
 
-        num_batch = idx_train_shuffle.size(0) // args.seq_len + 1
-        batch_indices = torch.split(idx_train_shuffle, args.seq_len)
+        if metis_blocks is not None:
+            # METIS 模式：block-level shuffle，保留 block 内部节点顺序，过滤 -1 padding
+            block_order = torch.randperm(metis_blocks.shape[0])
+            raw_batches = [metis_blocks[i] for i in block_order]
+            batch_indices = [b[b >= 0] for b in raw_batches]
+        else:
+            # 随机 batching
+            batch_indices = torch.split(idx_train_shuffle, args.seq_len)
 
         iter_t_list = []
         runtime = defaultdict(float) if profile_single_machine else None
@@ -335,6 +414,7 @@ def main():
                 edge_index_global,
                 N,
                 attn_type,
+                train_idx_tensor=train_idx_tensor,
             )
             if profile_single_machine:
                 runtime["run_step"] += time.time() - t_run

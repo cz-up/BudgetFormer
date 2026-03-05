@@ -10,7 +10,7 @@ def parser_add_main_args(parser):
 
     # model args
     parser.add_argument('--model', type=str, default="graphormer")
-    parser.add_argument('--n_layers', type=int, default=2)
+    parser.add_argument('--n_layers', type=int, default=4)
     parser.add_argument('--num_heads', type=int, default=8)
     parser.add_argument('--hidden_dim', type=int, default=64) #128
     parser.add_argument('--ffn_dim', type=int, default=256)
@@ -38,8 +38,6 @@ def parser_add_main_args(parser):
                         help='head hop 随机游走长度')
     parser.add_argument('--head_hop_walks_per_node', type=int, default=2,
                         help='head hop 随机游走次数/节点')
-    parser.add_argument('--use_ogbn_split', type=int, default=0,
-                        help='是否使用OGBN原始划分 (1启用, 0关闭)')
     parser.add_argument('--adaptive_walk', action='store_true', default=False,
                         help='enable adaptive tuning of walk length/num walks')
     parser.add_argument('--adaptive_patience', type=int, default=5,
