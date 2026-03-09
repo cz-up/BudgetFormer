@@ -7,7 +7,7 @@ from functools import partial
 import scipy.sparse as sp
 import scipy
 from numpy.linalg import inv
-from torch_geometric.datasets import Planetoid, Amazon, Actor, CitationFull, Coauthor
+from torch_geometric.datasets import Planetoid, Amazon, Actor, CitationFull, Coauthor, HeterophilousGraphDataset
 from torch.nn.functional import normalize
 import torch_geometric.transforms as T
 from torch_geometric.utils import coalesce
@@ -47,7 +47,15 @@ def column_normalize(mx):
     return mx
 
 
-def get_dataset(dataset_name):
+def _mask_to_index(mask: torch.Tensor, split_id: int = 0) -> torch.Tensor:
+    if mask.dim() == 2:
+        if split_id < 0 or split_id >= mask.size(1):
+            raise ValueError(f"split_id={split_id} out of range for mask with {mask.size(1)} splits")
+        mask = mask[:, split_id]
+    return torch.nonzero(mask.to(torch.bool), as_tuple=True)[0]
+
+
+def get_dataset(dataset_name, split_id: int = 0):
     print(f'Get dataset {dataset_name}...')
 
     dataset_dir = './dataset/'
@@ -231,12 +239,42 @@ def get_dataset(dataset_name):
             normalized_adj = adj_normalize(adj)
             # column_normalized_adj = column_normalize(adj)
 
+        elif dataset_name == 'roman-empire':
+            pyg_data = HeterophilousGraphDataset(root=dataset_dir, name="Roman-empire")[0]
+            data_x = pyg_data.x.to(torch.float32)
+            data_y = pyg_data.y.to(torch.long).view(-1)
+            edge_index = pyg_data.edge_index.to(torch.long)
+            num_nodes = int(data_x.size(0))
+            adj = sp.coo_matrix(
+                (np.ones(edge_index.shape[1]), (edge_index[0], edge_index[1])),
+                shape=(num_nodes, num_nodes),
+                dtype=np.float32,
+            )
+            normalized_adj = adj_normalize(adj)
+            column_normalized_adj = column_normalize(adj)
+            if not hasattr(pyg_data, "train_mask") or not hasattr(pyg_data, "val_mask") or not hasattr(pyg_data, "test_mask"):
+                raise ValueError("Roman-empire dataset does not provide default train/val/test masks.")
+            split_idx = {
+                "train": _mask_to_index(pyg_data.train_mask, split_id=split_id).to(torch.long),
+                "valid": _mask_to_index(pyg_data.val_mask, split_id=split_id).to(torch.long),
+                "test": _mask_to_index(pyg_data.test_mask, split_id=split_id).to(torch.long),
+            }
+
         # sp.save_npz(dataset_dir + dataset_name + '/adj.npz', adj)
         # sp.save_npz(dataset_dir + dataset_name + '/normalized_adj.npz', normalized_adj)
         dataset_dir = './dataset/'
         torch.save(data_x, dataset_dir + dataset_name + '/x.pt')
         torch.save(data_y, dataset_dir + dataset_name + '/y.pt')
         torch.save(edge_index, dataset_dir + dataset_name + '/edge_index.pt')
+        if 'split_idx' in locals():
+            torch.save(
+                {
+                    "train": torch.as_tensor(split_idx["train"], dtype=torch.long),
+                    "valid": torch.as_tensor(split_idx["valid"], dtype=torch.long),
+                    "test": torch.as_tensor(split_idx["test"], dtype=torch.long),
+                },
+                dataset_dir + dataset_name + '/split_idx.pt'
+            )
         # sp.save_npz(dataset_dir + dataset_name + '/column_normalized_adj.npz', column_normalized_adj)
 
 
@@ -370,5 +408,7 @@ def rand_nodes_seq(dataset_name, k1, p=None):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset', required=True)
+    parser.add_argument('--split_id', type=int, default=0,
+                        help='split column to export for datasets with multi-split masks')
     args = parser.parse_args()
-    get_dataset(args.dataset)
+    get_dataset(args.dataset, split_id=args.split_id)
