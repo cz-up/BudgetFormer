@@ -32,11 +32,13 @@ class GraphSAGE(nn.Module):
         self.layers.append(dglnn.SAGEConv(hidden_feats, out_feats, aggregator_type))
 
     def forward(self, g, features):
+        is_blocks = isinstance(g, list) or isinstance(g, tuple)
         h = features
         for i, layer in enumerate(self.layers):
             if i != 0:
                 h = self.dropout(h)
-            h = layer(g, h)
+            block = g[i] if is_blocks else g
+            h = layer(block, h)
             if i != self.n_layers - 1:
                 h = F.relu(h)
         return h
@@ -86,9 +88,10 @@ def load_dataset(dataset_name, root="./dataset", split_id: int = 0):
         val_idx = split_idx['valid']
         test_idx = split_idx['test']
 
-    elif dataset_name == 'roman-empire':
+    elif dataset_name in ["roman-empire", "amazon-ratings", "minesweeper", "tolokers", "questions"]:
         from torch_geometric.datasets import HeterophilousGraphDataset
-        pyg_data = HeterophilousGraphDataset(root=root, name="Roman-empire")[0]
+        pyg_name = dataset_name.capitalize()
+        pyg_data = HeterophilousGraphDataset(root=root, name=pyg_name)[0]
 
         src = pyg_data.edge_index[0].to(torch.long)
         dst = pyg_data.edge_index[1].to(torch.long)
@@ -100,7 +103,7 @@ def load_dataset(dataset_name, root="./dataset", split_id: int = 0):
         num_classes = int(labels.max().item()) + 1
 
         if not hasattr(pyg_data, "train_mask") or not hasattr(pyg_data, "val_mask") or not hasattr(pyg_data, "test_mask"):
-            raise ValueError("Roman-empire dataset does not provide default train/val/test masks.")
+            raise ValueError(f"{pyg_name} dataset does not provide default train/val/test masks.")
         train_idx = _mask_to_index(pyg_data.train_mask, split_id=split_id)
         val_idx = _mask_to_index(pyg_data.val_mask, split_id=split_id)
         test_idx = _mask_to_index(pyg_data.test_mask, split_id=split_id)
@@ -129,7 +132,8 @@ def evaluate(model, g, features, labels, mask):
 def main():
     parser = argparse.ArgumentParser(description='GraphSAGE Node Classification using DGL')
     parser.add_argument('--dataset', type=str, default='ogbn-arxiv',
-                        choices=['cora', 'citeseer', 'pubmed', 'reddit', 'ogbn-arxiv', 'ogbn-products', 'roman-empire'],
+                        choices=['cora', 'citeseer', 'pubmed', 'reddit', 'ogbn-arxiv', 'ogbn-products', 
+                                 'roman-empire', 'amazon-ratings', 'minesweeper', 'tolokers', 'questions'],
                         help='Dataset name')
     parser.add_argument('--dataset_dir', type=str, default='./dataset/')
     parser.add_argument('--split_id', type=int, default=0,
@@ -143,6 +147,9 @@ def main():
     parser.add_argument('--weight_decay', type=float, default=0, help='Weight decay')
     parser.add_argument('--aggregator', type=str, default='mean',
                         choices=['mean', 'gcn', 'pool', 'lstm'], help='Aggregator type')
+    parser.add_argument('--batch_size', type=int, default=1024, help='Batch size for training')
+    parser.add_argument('--fan_out', type=str, default='15,10,5', help='Fan out per layer (comma separated)')
+    parser.add_argument('--num_workers', type=int, default=0, help='Number of dataloader workers')
     args = parser.parse_args()
 
     device = torch.device(f'cuda:{args.device}' if args.device >= 0 and torch.cuda.is_available() else 'cpu')
@@ -160,8 +167,14 @@ def main():
     train_idx = train_idx.to(device)
     val_idx = val_idx.to(device)
     test_idx = test_idx.to(device)
+    
+    # Create training subgraph
+    g_train = dgl.node_subgraph(g, train_idx).to(device)
+    features_train = features[train_idx]
+    labels_train = labels[train_idx]
 
     print(f"Graph Nodes: {g.num_nodes()}, Edges: {g.num_edges()}")
+    print(f"Training Subgraph Nodes: {g_train.num_nodes()}, Edges: {g_train.num_edges()}")
     print(f"Node feature dim: {in_feats}, Classes: {num_classes}")
     print(f"Train/Val/Test sizes: {len(train_idx)}/{len(val_idx)}/{len(test_idx)}")
 
@@ -171,6 +184,27 @@ def main():
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
+    # Setup DataLoader
+    fan_out = [int(fanout) for fanout in args.fan_out.split(',')]
+    if len(fan_out) != args.n_layers:
+        print(f"Warning: fan_out length {len(fan_out)} does not match n_layers {args.n_layers}. Adjusting...")
+        if len(fan_out) < args.n_layers:
+            fan_out = fan_out + [fan_out[-1]] * (args.n_layers - len(fan_out))
+        else:
+            fan_out = fan_out[:args.n_layers]
+            
+    sampler = dgl.dataloading.NeighborSampler(fan_out)
+    train_dataloader = dgl.dataloading.DataLoader(
+        g_train,
+        torch.arange(g_train.num_nodes(), device=device),
+        sampler,
+        device=device,
+        batch_size=args.batch_size,
+        shuffle=True,
+        drop_last=False,
+        num_workers=args.num_workers
+    )
+
     best_val_acc = 0.0
     best_test_acc = 0.0
     
@@ -178,12 +212,24 @@ def main():
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
         model.train()
-        logits = model(g, features)
-        loss = F.cross_entropy(logits[train_idx], labels[train_idx])
+        total_loss = 0
+        num_batches = 0
+        
+        for input_nodes, output_nodes, blocks in train_dataloader:
+            batch_features = features_train[input_nodes]
+            batch_labels = labels_train[output_nodes]
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+            logits = model(blocks, batch_features)
+            loss = F.cross_entropy(logits, batch_labels)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+            num_batches += 1
+            
+        avg_loss = total_loss / num_batches
 
         train_acc = evaluate(model, g, features, labels, train_idx)
         val_acc = evaluate(model, g, features, labels, val_idx)
@@ -193,7 +239,7 @@ def main():
             best_val_acc = val_acc
             best_test_acc = test_acc
             
-        print(f"Epoch {epoch:03d} | Loss: {loss.item():.4f} | "
+        print(f"Epoch {epoch:03d} | Avg Loss: {avg_loss:.4f} | "
               f"Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f} | Test Acc: {test_acc:.4f} | "
               f"Time: {time.time() - t0:.4f}s")
               

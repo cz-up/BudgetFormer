@@ -239,8 +239,9 @@ def get_dataset(dataset_name, split_id: int = 0):
             normalized_adj = adj_normalize(adj)
             # column_normalized_adj = column_normalize(adj)
 
-        elif dataset_name == 'roman-empire':
-            pyg_data = HeterophilousGraphDataset(root=dataset_dir, name="Roman-empire")[0]
+        elif dataset_name in ["roman-empire", "amazon-ratings", "minesweeper", "tolokers", "questions"]:
+            pyg_name = dataset_name.capitalize()
+            pyg_data = HeterophilousGraphDataset(root=dataset_dir, name=pyg_name)[0]
             data_x = pyg_data.x.to(torch.float32)
             data_y = pyg_data.y.to(torch.long).view(-1)
             edge_index = pyg_data.edge_index.to(torch.long)
@@ -253,7 +254,7 @@ def get_dataset(dataset_name, split_id: int = 0):
             normalized_adj = adj_normalize(adj)
             column_normalized_adj = column_normalize(adj)
             if not hasattr(pyg_data, "train_mask") or not hasattr(pyg_data, "val_mask") or not hasattr(pyg_data, "test_mask"):
-                raise ValueError("Roman-empire dataset does not provide default train/val/test masks.")
+                raise ValueError(f"{pyg_name} dataset does not provide default train/val/test masks.")
             split_idx = {
                 "train": _mask_to_index(pyg_data.train_mask, split_id=split_id).to(torch.long),
                 "valid": _mask_to_index(pyg_data.val_mask, split_id=split_id).to(torch.long),

@@ -132,7 +132,7 @@ def main():
     parser.add_argument("--hidden_dim", type=int, default=64)
     parser.add_argument("--ffn_dim", type=int, default=256)
     parser.add_argument("--num_heads", type=int, default=8)
-    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--epochs", type=int, default=300)
     parser.add_argument("--peak_lr", type=float, default=2e-4)
     parser.add_argument("--end_lr", type=float, default=1e-5)
     parser.add_argument("--warmup_updates", type=int, default=0)
