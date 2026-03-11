@@ -130,6 +130,7 @@ def _load_metis_partition(args):
 def _prepare_sequence_training_state(args, split_idx, device, metis_blocks=None):
     seq_parallel_world_size = get_sequence_parallel_world_size() if sequence_parallel_is_initialized() else 1
     profile_single_machine = (not dist.is_initialized()) or (seq_parallel_world_size <= 1)
+    profile_single_machine = False
 
     if seq_parallel_world_size > 1:
         src_rank = get_sequence_parallel_src_rank()
@@ -171,6 +172,20 @@ def _prepare_sequence_training_state(args, split_idx, device, metis_blocks=None)
     set_global_token_indices(global_token_indices)
     set_last_batch_global_token_indices(global_token_indices_last_batch)
     return flatten_train_idx, sub_split_seq_lens, seq_parallel_world_size, profile_single_machine
+
+
+def _get_current_batch_split_state(args, batch_size: int):
+    seq_parallel_world_size = get_sequence_parallel_world_size() if sequence_parallel_is_initialized() else 1
+    if batch_size >= args.seq_len:
+        return None, None
+
+    x_dummy_list = [t for t in torch.tensor_split(torch.zeros(batch_size,), seq_parallel_world_size, dim=0)]
+    rest_split_sizes = [t.shape[0] for t in x_dummy_list]
+    sub_real_seq_len = max(rest_split_sizes) + args.num_global_node
+    global_token_indices_last_batch = list(
+        range(0, seq_parallel_world_size * sub_real_seq_len, sub_real_seq_len)
+    )
+    return rest_split_sizes, global_token_indices_last_batch
 
 
 def _build_node_model(args, feature, y, device):
@@ -297,12 +312,19 @@ def run_step(args, model, device, feature, y, idx_batch_cpu, sub_split_seq_lens,
     to -100 so they are ignored in the loss computation. This is used for METIS
     batching where each block may contain val/test nodes as context.
     """
+    current_split_seq_lens = sub_split_seq_lens
+    if idx_batch_cpu.shape[0] < args.seq_len:
+        current_split_seq_lens, current_global_token_indices_last_batch = _get_current_batch_split_state(
+            args, int(idx_batch_cpu.shape[0])
+        )
+        set_last_batch_global_token_indices(current_global_token_indices_last_batch)
+
     x_i, y_i, edge_index_i, attn_bias = get_batch_blockize(
         args,
         feature,
         y,
         idx_batch_cpu,
-        sub_split_seq_lens,
+        current_split_seq_lens,
         edge_index_global,
         N,
         device=device,
@@ -315,9 +337,9 @@ def run_step(args, model, device, feature, y, idx_batch_cpu, sub_split_seq_lens,
         sp_rank  = get_sequence_parallel_rank()  if sequence_parallel_is_initialized() else 0
         batch_n  = idx_batch_cpu.shape[0]
 
-        if batch_n < args.seq_len and sub_split_seq_lens is not None:
+        if batch_n < args.seq_len and current_split_seq_lens is not None:
             # last-batch 路径：get_batch_blockize 内部已用 max(sub_split_seq_lens) 旹式 pad
-            sub_len = max(sub_split_seq_lens)
+            sub_len = max(current_split_seq_lens)
             # 构建与 get_batch_blockize 相同的 padded idx
             padded_idx = torch.full((sub_len * sp_world,), -1, dtype=idx_batch_cpu.dtype)
             padded_idx[:batch_n] = idx_batch_cpu

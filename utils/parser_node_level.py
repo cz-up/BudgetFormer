@@ -26,7 +26,7 @@ def parser_add_main_args(parser):
     parser.add_argument('--weight_decay', type=float, default=0.01)
     parser.add_argument('--warmup_updates', type=int, default=10,
                         help='warmup steps for optimizer learning rate scheduling')
-    parser.add_argument('--epochs', type=int, default=1000) # larger seq len more training epochs
+    parser.add_argument('--epochs', type=int, default=300) # larger seq len more training epochs
     parser.add_argument('--patience', type=int, default=50, 
                         help='Patience for early stopping')
     parser.add_argument('--peak_lr', type=float, default=2e-4)  

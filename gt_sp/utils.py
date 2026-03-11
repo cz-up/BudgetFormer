@@ -566,18 +566,19 @@ def compute_hop_buckets_random_walk(
     walks = _run_random_walk(edge_index, rowptr, col, starts, walk_length)
 
     buckets = [edge_index.new_zeros((2, 0), dtype=edge_index.dtype) for _ in range(num_buckets)]
-    src = walks[:, 0]
+    query_nodes = walks[:, 0]
     for d in range(1, walk_length + 1):
-        dst = walks[:, d]
-        valid = dst >= 0
+        kv_nodes = walks[:, d]
+        valid = kv_nodes >= 0
         if d > 1:
             prev = walks[:, d - 1]
-            valid = valid & (dst != prev)
+            valid = valid & (kv_nodes != prev)
         if not valid.any():
             continue
-        src_valid = src[valid]
-        dst_valid = dst[valid]
-        edges = torch.stack([src_valid, dst_valid], dim=0)
+        query_nodes_valid = query_nodes[valid]
+        kv_nodes_valid = kv_nodes[valid]
+        # edge_index[0] provides key/value nodes and edge_index[1] is the updated query node.
+        edges = torch.stack([kv_nodes_valid, query_nodes_valid], dim=0)
         bucket_idx = min(d - 1, num_buckets - 1)
         buckets[bucket_idx] = torch.cat([buckets[bucket_idx], edges], dim=1)
     return buckets
@@ -832,18 +833,15 @@ def get_batch_blockize(args, x, y, idx_batch, rest_split_sizes, edge_index, N, d
     x_i = x[idx_batch]  # [s, x_d]
     y_i = y[idx_batch]  # [s]
 
-    edge_index_i = gen_sub_edge_index(edge_index, idx_batch, N)
-    # Keep raw (0-indexed, before fix_edge_index) copy for local_spd bias
-    edge_index_i_raw = edge_index_i
-
-    if args.model == "graphormer":
-        edge_index_i = fix_edge_index(edge_index_i, idx_batch.shape[0])
+    # Keep raw (0-indexed, before fix_edge_index) subgraph for local_spd and RW sampling.
+    edge_index_i_raw = gen_sub_edge_index(edge_index, idx_batch, N)
+    rw_base = edge_index_i_raw
 
     dev = None
     if device is not None:
         dev = torch.device(device) if not isinstance(device, torch.device) else device
         if dev.type == "cuda":
-            edge_index_i = edge_index_i.to(dev)
+            rw_base = rw_base.to(dev)
 
     # --- attn_bias (optional, controlled by args.attn_bias_mode) ---
     _attn_bias_mode = getattr(args, 'attn_bias_mode', 'none')
@@ -864,25 +862,32 @@ def get_batch_blockize(args, x, y, idx_batch, rest_split_sizes, edge_index, N, d
     attn_bias = None
     try:
         edge_index_i_heads = build_head_hop_edges(
-            edge_index=edge_index_i,
+            edge_index=rw_base,
             num_nodes=x_i.size(0),
             num_heads=args.num_heads,
             num_groups=1,
-            device=edge_index_i.device,
+            device=rw_base.device,
             walk_length=getattr(args, "head_hop_walk_length", 4),
             walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
         )
     except RuntimeError:
-        edge_index_i = edge_index_i.to("cpu")
+        rw_base = rw_base.to("cpu")
         edge_index_i_heads = build_head_hop_edges(
-            edge_index=edge_index_i,
+            edge_index=rw_base,
             num_nodes=x_i.size(0),
             num_heads=args.num_heads,
             num_groups=1,
-            device=edge_index_i.device,
+            device=rw_base.device,
             walk_length=getattr(args, "head_hop_walk_length", 4),
             walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
         )
+
+    if args.model == "graphormer":
+        edge_index_i_heads = _apply_to_edge_index(
+            edge_index_i_heads,
+            lambda e: fix_edge_index(e, idx_batch.shape[0]),
+        )
+
     # Current head-hop implementation shares the same subgraph across heads.
     # Merge to one tensor early to avoid per-head broadcast/memory overhead.
     if isinstance(edge_index_i_heads, list):

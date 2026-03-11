@@ -1,10 +1,11 @@
 import torch
 import torch.nn.functional as F
 import numpy as np
-from gt_sp.utils import get_batch, gen_sub_edge_index
+from gt_sp.utils import get_batch, get_batch_blockize
 from gt_sp.initialize import (
     get_sequence_parallel_world_size,
-    set_last_batch_global_token_indices
+    sequence_parallel_is_initialized,
+    set_last_batch_global_token_indices,
 )
 
 def calc_acc(y_true, y_pred):
@@ -16,6 +17,26 @@ def calc_acc(y_true, y_pred):
     acc_list.append(float(np.sum(correct)) / len(correct))
 
     return sum(acc_list) / len(acc_list)
+
+
+def _get_rest_split_sizes(idx_i, seq_parallel_world_size):
+    if idx_i.shape[0] >= 0:
+        x_dummy_list = [t for t in torch.tensor_split(
+            torch.zeros(idx_i.shape[0],), seq_parallel_world_size, dim=0
+        )]
+        return [t.shape[0] for t in x_dummy_list]
+    return None
+
+
+def _set_eval_last_batch_global_tokens(args, rest_split_sizes):
+    if rest_split_sizes is None:
+        return
+    seq_parallel_world_size = len(rest_split_sizes)
+    sub_real_seq_len = max(rest_split_sizes) + args.num_global_node
+    global_token_indices_last_batch = list(
+        range(0, seq_parallel_world_size * sub_real_seq_len, sub_real_seq_len)
+    )
+    set_last_batch_global_token_indices(global_token_indices_last_batch)
 
 
 @torch.no_grad()
@@ -195,7 +216,7 @@ def sparse_eval_cpu_subset_batch(args, model, x, y, sub_idx, adjs, edge_index):
         
         attn_bias = torch.cat([torch.tensor(i[idx_i, :][:, idx_i].toarray(), dtype=torch.float32).unsqueeze(0) for i in adjs])
         attn_bias = attn_bias.permute(1, 2, 0)
-        edge_index_i = gen_sub_edge_index(edge_index, idx_i, N) # [2, num_edges] index plused global token
+        edge_index_i = _get_eval_edge_index(args, edge_index, idx_i, N)
         
         pred = model(x_i, attn_bias, edge_index_i, attn_type=attn_type)
         loss = F.nll_loss(pred, y_i)
@@ -241,7 +262,7 @@ def sparse_eval_gpu_subset_batch(args, model, x, y, sub_idx, adjs, edge_index, d
         
         attn_bias = torch.cat([torch.tensor(i[idx_i, :][:, idx_i].toarray(), dtype=torch.float32).unsqueeze(0) for i in adjs])
         attn_bias = attn_bias.permute(1, 2, 0)
-        edge_index_i = gen_sub_edge_index(edge_index, idx_i, N) # [2, num_edges] index plused global token
+        edge_index_i = _get_eval_edge_index(args, edge_index, idx_i, N)
         
         x_i, y_i, edge_index_i, attn_bias = x_i.to(device), y_i.to(device), edge_index_i.to(device), attn_bias.to(device)
         
@@ -297,7 +318,7 @@ def sparse_eval_cpu_subset_batch_dummy_bias(args, model, x, y, sub_idx, dummy_at
         # if idx_i.shape[0] < args.seq_len:
         #     dummy_attn_bias = torch.zeros(idx_i.shape[0], idx_i.shape[0], args.attn_bias_dim, dtype=torch.float32)
 
-        edge_index_i = gen_sub_edge_index(edge_index, idx_i, N) # [2, num_edges] index plused global token
+        edge_index_i = _get_eval_edge_index(args, edge_index, idx_i, N)
         
         if isinstance(edge_index_i, list):
             edge_index_i = [e.to(device) for e in edge_index_i]
@@ -328,6 +349,9 @@ def sparse_eval_gpu(args, model, x, y, sub_idx, attn_bias, edge_index, device):
     total = 0
     correct = 0
     N = x.shape[0]
+    seq_parallel_world_size = (
+        get_sequence_parallel_world_size() if sequence_parallel_is_initialized() else 1
+    )
     
     # num_batch = sub_idx.size(0) // args.seq_len + 1
     # seq_len = 128
@@ -337,17 +361,30 @@ def sparse_eval_gpu(args, model, x, y, sub_idx, attn_bias, edge_index, device):
     # for i in tqdm(range(num_batch), desc="Iteration"):
     for i in range(num_batch):
         idx_i = sub_idx[i*args.seq_len:(i+1)*args.seq_len]
-        x_i = x[idx_i]
-        y_i = y[idx_i]
-        
-        # if idx_i.shape[0] < args.seq_len:
-        #     dummy_attn_bias = torch.zeros(idx_i.shape[0], idx_i.shape[0], args.attn_bias_dim, dtype=torch.float32)
-        edge_index_i = gen_sub_edge_index(edge_index, idx_i, N) # [2, num_edges] index plused global token
-        
-        x_i, y_i = x_i.to(device), y_i.to(device)
-        edge_index_i = edge_index_i.to(device)
+        rest_split_sizes = None
+        if idx_i.shape[0] < args.seq_len:
+            rest_split_sizes = _get_rest_split_sizes(idx_i, seq_parallel_world_size)
+            _set_eval_last_batch_global_tokens(args, rest_split_sizes)
 
-        pred = model(x_i, attn_bias, edge_index_i, attn_type=args.attn_type)
+        x_i, y_i, edge_index_i, batch_attn_bias = get_batch_blockize(
+            args,
+            x,
+            y,
+            idx_i,
+            rest_split_sizes,
+            edge_index,
+            N,
+            device=device,
+        )
+
+        x_i, y_i = x_i.to(device), y_i.to(device)
+        if isinstance(edge_index_i, list):
+            edge_index_i = [e.to(device) for e in edge_index_i]
+        else:
+            edge_index_i = edge_index_i.to(device)
+
+        model_attn_bias = batch_attn_bias if batch_attn_bias is not None else attn_bias
+        pred = model(x_i, model_attn_bias, edge_index_i, attn_type=args.attn_type)
         pred_label = pred.argmax(1)
         y_i_flat = y_i.view(-1)
         is_labeled = y_i_flat == y_i_flat

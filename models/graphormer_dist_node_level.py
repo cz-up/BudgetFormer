@@ -714,10 +714,11 @@ class Graphormer(nn.Module):
         if perturb is not None:
             node_feature += perturb
 
-        # [bs, 1, h]
-        global_node_feature = self.graph_token.weight.unsqueeze(0).repeat(n_graph, 1, 1)
-        # [b, s/p + 1, h]
-        node_feature = torch.cat([global_node_feature, node_feature], dim=1)
+        if self.num_global_node > 0:
+            # [bs, num_global_node, h]
+            global_node_feature = self.graph_token.weight.unsqueeze(0).repeat(n_graph, 1, 1)
+            # [b, s/p + num_global_node, h]
+            node_feature = torch.cat([global_node_feature, node_feature], dim=1)
 
         output = self.input_dropout(node_feature)
 
@@ -726,24 +727,27 @@ class Graphormer(nn.Module):
             # Project to per-head scalars: [sub_s, full_s, num_heads]
             attn_bias_proj = self.attn_bias_proj(attn_bias.to(output.device))  # [sub_s, full_s, num_heads]
 
-            # Also build virtual-distance bias for global token (same shape as graph_token_virtual_distance)
-            # vd: [1, attn_bias_dim] → [1, num_heads]
-            vd = self.attn_bias_proj(self.graph_token_virtual_distance.weight)  # [num_global, num_heads]
+            if self.num_global_node > 0:
+                # Also build virtual-distance bias for global token (same shape as graph_token_virtual_distance)
+                # vd: [1, attn_bias_dim] → [1, num_heads]
+                vd = self.attn_bias_proj(self.graph_token_virtual_distance.weight)  # [num_global, num_heads]
 
-            sub_s = attn_bias_proj.size(0)
-            full_s = attn_bias_proj.size(1)
+                sub_s = attn_bias_proj.size(0)
+                full_s = attn_bias_proj.size(1)
 
-            # Build [sub_s+1, full_s+1, num_heads] graph_attn_bias (matching sparse_attention_bias indexing)
-            # Row for global token (index 0): constant vd repeated
-            global_row = vd.unsqueeze(1).expand(self.num_global_node, full_s + self.num_global_node, self.num_heads)  # [1, full_s+1, h]
-            # Col for global token: constant vd repeated
-            global_col = vd.unsqueeze(0).expand(sub_s, self.num_global_node, self.num_heads)  # [sub_s, 1, h]
-            # Main block + global col  → [sub_s, full_s+1, num_heads]
-            main_with_gcol = torch.cat([global_col, attn_bias_proj], dim=1)
-            # Stack global row on top → [sub_s+1, full_s+1, num_heads]
-            graph_attn_bias = torch.cat([global_row, main_with_gcol], dim=0)
-            # Add batch dim expected by encoder layers (batch_size=1): [1, sub_s+1, full_s+1, num_heads]
-            graph_attn_bias = graph_attn_bias.unsqueeze(0)
+                # Build [sub_s+num_gl, full_s+num_gl, num_heads] graph_attn_bias
+                # Row for global token: constant vd repeated
+                global_row = vd.unsqueeze(1).expand(self.num_global_node, full_s + self.num_global_node, self.num_heads)
+                # Col for global token: constant vd repeated
+                global_col = vd.unsqueeze(0).expand(sub_s, self.num_global_node, self.num_heads)
+                # Main block + global col  → [sub_s, full_s+num_gl, num_heads]
+                main_with_gcol = torch.cat([global_col, attn_bias_proj], dim=1)
+                # Stack global row on top → [sub_s+num_gl, full_s+num_gl, num_heads]
+                graph_attn_bias = torch.cat([global_row, main_with_gcol], dim=0)
+                # Add batch dim expected by encoder layers (batch_size=1)
+                graph_attn_bias = graph_attn_bias.unsqueeze(0)
+            else:
+                graph_attn_bias = attn_bias_proj.unsqueeze(0)
         else:
             graph_attn_bias = None
 
@@ -753,7 +757,8 @@ class Graphormer(nn.Module):
         output = self.final_ln(output)
 
         # output part
-        output = self.downstream_out_proj(output[0, 1:, :])
+        start = int(self.num_global_node)
+        output = self.downstream_out_proj(output[0, start:, :])
         return F.log_softmax(output, dim=1)
 
 
