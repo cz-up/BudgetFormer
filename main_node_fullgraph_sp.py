@@ -34,6 +34,11 @@ from models.graphormer_dist_node_level import Graphormer
 from utils.lr import PolynomialDecayLR
 import argparse
 
+from utils.parser_node_level import (
+    add_node_common_args,
+    add_node_fullgraph_sp_args,
+    normalize_main_node_fullgraph_sp_args,
+)
 from gt_sp.initialize import (
     initialize_distributed,
     sequence_parallel_is_initialized,
@@ -335,59 +340,18 @@ def main():
     parser = argparse.ArgumentParser(
         description="Full-Graph Node-Level Training with Sequence Parallel."
     )
-
-    # Data
-    parser.add_argument("--dataset_dir", type=str, default="./dataset/")
-    parser.add_argument("--dataset", type=str, default="ogbn-arxiv")
-
-    # Model
-    parser.add_argument("--model", type=str, default="graphormer")
-    parser.add_argument("--n_layers", type=int, default=4)
-    parser.add_argument("--num_heads", type=int, default=8)
-    parser.add_argument("--hidden_dim", type=int, default=64)
-    parser.add_argument("--ffn_dim", type=int, default=256)
-    parser.add_argument("--attn_bias_dim", type=int, default=1)
-    parser.add_argument("--dropout_rate", type=float, default=0.3)
-    parser.add_argument("--input_dropout_rate", type=float, default=0.1)
-    parser.add_argument("--attention_dropout_rate", type=float, default=0.5)
-    parser.add_argument("--attn_type", type=str, default="sparse")
-
-    # Training
-    parser.add_argument("--epochs", type=int, default=500)
-    parser.add_argument("--peak_lr", type=float, default=1e-3)
-    parser.add_argument("--end_lr", type=float, default=1e-9)
-    parser.add_argument("--weight_decay", type=float, default=0.01)
-    parser.add_argument("--warmup_updates", type=int, default=20)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--eval_every", type=int, default=5)
-    parser.add_argument("--save_model", action="store_true", default=False)
-    parser.add_argument("--model_dir", type=str, default="./model_ckpt/")
-
-    # Random-walk edges
-    parser.add_argument("--head_hop_walk_length", type=int, default=4)
-    parser.add_argument("--head_hop_walks_per_node", type=int, default=2)
-    parser.add_argument("--include_real_edges", type=int, default=0)
-    parser.add_argument("--include_self_loops", type=int, default=0)
-
-    # Distributed (reuse main_node_sp.py args)
-    parser.add_argument("--rank", type=int, default=None)
-    parser.add_argument("--local-rank", "--local_rank", type=int, default=None)
-    parser.add_argument("--world-size", type=int, default=None)
-    parser.add_argument("--distributed-backend", default="nccl",
-                        choices=["nccl", "gloo", "ccl"])
-    parser.add_argument("--distributed-timeout-minutes", type=int, default=10)
-    parser.add_argument("--sequence-parallel-size", type=int, default=1)
-
-    # Compat
-    parser.add_argument("--seq_len", type=int, default=0)
-    parser.add_argument("--num_global_node", type=int, default=1,
-                        help="Number of virtual graph tokens used by Graphormer.")
-
-    args = parser.parse_args()
-    if args.model != "graphormer":
-        args.num_global_node = 0
-    elif args.num_global_node not in (0, 1):
-        raise ValueError("main_node_fullgraph_sp.py currently supports at most one Graphormer virtual node.")
+    add_node_common_args(
+        parser,
+        defaults={
+            "epochs": 500,
+            "peak_lr": 1e-3,
+            "warmup_updates": 20,
+            "sequence_parallel_size": 1,
+            "num_global_node": 1,
+        },
+    )
+    add_node_fullgraph_sp_args(parser)
+    args = normalize_main_node_fullgraph_sp_args(parser.parse_args())
 
     # ── Distributed init ────────────────────────────────────────────────────
     initialize_distributed(args)
