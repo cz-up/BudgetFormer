@@ -29,6 +29,7 @@ def add_node_common_args(parser, defaults=None):
         help="warmup steps for optimizer learning rate scheduling",
     )
     parser.add_argument("--epochs", type=int, default=defaults.get("epochs", 300))
+    parser.add_argument("--eval_every", type=int, default=defaults.get("eval_every", 5))
     parser.add_argument("--peak_lr", type=float, default=defaults.get("peak_lr", 2e-4))
     parser.add_argument("--end_lr", type=float, default=defaults.get("end_lr", 1e-9))
     parser.add_argument("--seed", type=int, default=defaults.get("seed", 42))
@@ -46,6 +47,12 @@ def add_node_common_args(parser, defaults=None):
         type=int,
         default=defaults.get("head_hop_walks_per_node", 2),
         help="head hop random walks per node",
+    )
+    parser.add_argument(
+        "--random_walk_device",
+        type=str,
+        default=defaults.get("random_walk_device", "same"),
+        help="device for random-walk subgraph construction: same|cpu|cuda|cuda:N",
     )
 
     parser.add_argument("--rank", type=int, default=defaults.get("rank"))
@@ -86,6 +93,7 @@ def add_node_batch_sp_args(parser, defaults=None):
     parser.add_argument("--adaptive_eval_repeats", type=int, default=defaults.get("adaptive_eval_repeats", 3), help="repeat evaluation and average to reduce randomness")
     parser.add_argument("--adaptive_embed_batches", type=int, default=defaults.get("adaptive_embed_batches", 5), help="number of train batches to compare L vs L+1")
     parser.add_argument("--full_attn_hop_stats", action="store_true", default=False, help="enable full attention hop-mass stats in val")
+    parser.add_argument("--full_attn_hop_mass", type=float, default=0.95, help="target hop mass ratio (e.g., 0.95)")
     parser.add_argument("--full_attn_hop_max_queries", type=int, default=defaults.get("full_attn_hop_max_queries", 64), help="max queries per batch for hop-mass stats")
     parser.add_argument("--full_attn_hop_max_batches", type=int, default=defaults.get("full_attn_hop_max_batches", 1), help="max batches per layer to collect hop-mass stats")
     parser.add_argument("--full_attn_hop_max_hop", type=int, default=defaults.get("full_attn_hop_max_hop", 64), help="max hop to explore when collecting hop-mass stats (<=0 for no limit)")
@@ -104,9 +112,13 @@ def add_node_batch_sp_args(parser, defaults=None):
 def add_node_fullgraph_sp_args(parser, defaults=None):
     defaults = defaults or {}
 
-    parser.add_argument("--eval_every", type=int, default=defaults.get("eval_every", 5))
     parser.add_argument("--include_real_edges", type=int, default=defaults.get("include_real_edges", 0))
     parser.add_argument("--include_self_loops", type=int, default=defaults.get("include_self_loops", 0))
+    parser.add_argument(
+        "--to_bidirected",
+        action="store_true",
+        default=defaults.get("to_bidirected", False),
+    )
     parser.add_argument("--seq_len", type=int, default=defaults.get("seq_len", 0), help="compat arg for shared launch scripts")
 
 
@@ -125,4 +137,3 @@ def normalize_main_node_fullgraph_sp_args(args):
 def parser_add_main_args(parser):
     add_node_common_args(parser)
     add_node_batch_sp_args(parser)
-

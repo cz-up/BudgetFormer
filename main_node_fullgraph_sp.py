@@ -28,6 +28,7 @@ import time
 import random
 import contextlib
 import torch.distributed as dist
+from torch_geometric.utils import coalesce
 
 from models.gt_dist_node_level import GT
 from models.graphormer_dist_node_level import Graphormer
@@ -57,6 +58,7 @@ from gt_sp.utils import (
     _merge_edge_index_list,
     fix_edge_index,
     adjust_edge_index_nomerge,
+    resolve_random_walk_device,
 )
 
 
@@ -76,6 +78,11 @@ def _set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def _to_bidirected_edge_index(edge_index: torch.Tensor, num_nodes: int) -> torch.Tensor:
+    edge_index_bi = torch.cat([edge_index, edge_index.flip(0)], dim=1)
+    return coalesce(edge_index_bi, num_nodes=num_nodes)
 
 
 def _load_default_split(dataset_name: str, root_dir: str, wait_for_rank0: bool = False):
@@ -156,6 +163,9 @@ def _load_data(args):
     edge_index_global = torch.load(data_path + "/edge_index.pt")
     N = feature.shape[0]
 
+    if args.to_bidirected:
+        edge_index_global = _to_bidirected_edge_index(edge_index_global, num_nodes=N)
+
     if args.dataset == "pokec":
         y = torch.clamp(y, min=0)
 
@@ -172,6 +182,8 @@ def _load_data(args):
 
     if args.rank == 0:
         print(args)
+        if args.to_bidirected:
+            print("[graph] Converted edge_index to bidirected after loading.")
         print(f"Dataset loaded: N={N:,}  E={edge_index_global.shape[1]:,}")
         print(f"  train={split_idx['train'].shape[0]:,}  "
               f"val={split_idx['valid'].shape[0]:,}  "
@@ -208,7 +220,7 @@ def _build_model(args, feature, y, device):
     return model
 
 
-def _build_and_broadcast_edges(args, edge_index_global, N, device, sp_group,
+def _build_and_broadcast_edges(args, edge_index_global, N, device, rw_device, sp_group,
                                 sp_src_rank, sp_rank, nodes_per_rank):
     """Build sparse-attention edges on src_rank and broadcast to all ranks."""
     if sp_rank == sp_src_rank:
@@ -219,18 +231,20 @@ def _build_and_broadcast_edges(args, edge_index_global, N, device, sp_group,
             parts.append(self_loop)
         if getattr(args, "include_real_edges", 0):
             parts.append(edge_index_global.to(device))
-        if getattr(args, "head_hop_walks_per_node", 2) > 0:
+        if getattr(args, "head_hop_walks_per_node", 0) > 0:
             rw_heads = build_head_hop_edges(
-                edge_index=edge_index_global.to(device),
+                edge_index=edge_index_global.to(rw_device),
                 num_nodes=N,
                 num_heads=args.num_heads,
                 num_groups=1,
-                device=device,
+                device=rw_device,
                 walk_length=getattr(args, "head_hop_walk_length", 4),
                 walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
             )
             if isinstance(rw_heads, list):
                 rw_heads = _merge_edge_index_list(rw_heads)
+            if rw_heads.device != torch.device(device):
+                rw_heads = rw_heads.to(device)
             parts.append(rw_heads)
         merged = _merge_edge_index_list(parts)
         if merged is None:
@@ -270,7 +284,7 @@ def _restore_dropout(states):
         m.train(st)
 
 def _eval_sp(args, model, feature, y, split_idx, edge_index_global, N,
-             device, sp_group, sp_src_rank, sp_rank, sp_world_size,
+             device, rw_device, sp_group, sp_src_rank, sp_rank, sp_world_size,
              rank_start, rank_end, local_N):
     """Full-graph SP evaluation.
 
@@ -281,7 +295,7 @@ def _eval_sp(args, model, feature, y, split_idx, edge_index_global, N,
     # Build eval edges (fixed seed, rank-0 builds and broadcasts)
     with fixed_random_seed(args.seed):
         edge_index_eval = _build_and_broadcast_edges(
-            args, edge_index_global, N, device,
+            args, edge_index_global, N, device, rw_device,
             sp_group, sp_src_rank, sp_rank, local_N,
         )
 
@@ -343,7 +357,6 @@ def main():
     add_node_common_args(
         parser,
         defaults={
-            "epochs": 500,
             "peak_lr": 1e-3,
             "warmup_updates": 20,
             "sequence_parallel_size": 1,
@@ -363,6 +376,7 @@ def main():
     sp_group = get_sequence_parallel_group() if sp_initialized else None
 
     device = _resolve_device()
+    rw_device = resolve_random_walk_device(args, device)
     _set_seed(args.seed)
 
     if args.rank == 0:
@@ -406,6 +420,7 @@ def main():
         print(f"  Sparse edges: real={int(bool(args.include_real_edges))} "
               f"self={int(bool(args.include_self_loops))} "
               f"rw={int(getattr(args, 'head_hop_walks_per_node', 0) > 0)}")
+        print(f"  Random-walk device: {rw_device}")
         print(f"{'='*72}\n")
 
     # ── Build model ───────────────────────────────────────────────────────
@@ -443,7 +458,7 @@ def main():
         # ── Build edges (rank-0 builds, broadcast to all) ─────────────────
         t_rw = time.time()
         edge_index_rw = _build_and_broadcast_edges(
-            args, edge_index_global, N, device,
+            args, edge_index_global, N, device, rw_device,
             sp_group, sp_src_rank, sp_rank, local_N,
         )
         rw_time = time.time() - t_rw
@@ -499,7 +514,7 @@ def main():
             t_eval = time.time()
             accs = _eval_sp(
                 args, model, feature, y, split_idx, edge_index_global, N,
-                device, sp_group, sp_src_rank, sp_rank, sp_world_size,
+                device, rw_device, sp_group, sp_src_rank, sp_rank, sp_world_size,
                 rank_start, rank_end, local_N,
             )
             eval_time = time.time() - t_eval

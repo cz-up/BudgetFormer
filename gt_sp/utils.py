@@ -95,6 +95,31 @@ def fix_edge_index(x, num_node):
     return x
 
 
+def resolve_random_walk_device(args, default_device) -> torch.device:
+    """Resolve the device used for random-walk sampling."""
+    spec = getattr(args, "random_walk_device", "same")
+    if spec in (None, "", "same"):
+        return torch.device(default_device)
+
+    try:
+        rw_device = torch.device(spec)
+    except (TypeError, RuntimeError) as exc:
+        raise ValueError(
+            f"Invalid --random_walk_device={spec!r}; expected same/cpu/cuda/cuda:N."
+        ) from exc
+
+    if rw_device.type == "cuda":
+        if not torch.cuda.is_available():
+            raise ValueError("--random_walk_device requests CUDA, but CUDA is not available.")
+        if rw_device.index is None:
+            default_dev = torch.device(default_device)
+            if default_dev.type == "cuda" and default_dev.index is not None:
+                return torch.device(f"cuda:{default_dev.index}")
+            return torch.device(f"cuda:{torch.cuda.current_device()}")
+
+    return rw_device
+
+
 @contextlib.contextmanager
 def fixed_random_seed(seed: int):
     """Temporarily set RNG seeds and restore states afterward."""
@@ -840,8 +865,9 @@ def get_batch_blockize(args, x, y, idx_batch, rest_split_sizes, edge_index, N, d
     dev = None
     if device is not None:
         dev = torch.device(device) if not isinstance(device, torch.device) else device
-        if dev.type == "cuda":
-            rw_base = rw_base.to(dev)
+    rw_dev = resolve_random_walk_device(args, dev if dev is not None else rw_base.device)
+    if rw_base.device != rw_dev:
+        rw_base = rw_base.to(rw_dev)
 
     # --- attn_bias (optional, controlled by args.attn_bias_mode) ---
     _attn_bias_mode = getattr(args, 'attn_bias_mode', 'none')
@@ -893,7 +919,7 @@ def get_batch_blockize(args, x, y, idx_batch, rest_split_sizes, edge_index, N, d
     if isinstance(edge_index_i_heads, list):
         edge_index_i_heads = _merge_edge_index_list(edge_index_i_heads)
 
-    if dev is not None and dev.type == "cuda":
+    if dev is not None and edge_index_i_heads.device != dev:
         edge_index_i_heads = edge_index_i_heads.to(dev)
     if seq_parallel_world_size > 1:
         src_rank = get_sequence_parallel_src_rank()
