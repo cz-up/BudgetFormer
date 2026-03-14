@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 import numpy as np
-from gt_sp.utils import get_batch, get_batch_blockize
+from gt_sp.utils import get_batch, get_batch_blockize, get_seed_batch_size
 from gt_sp.initialize import (
     get_sequence_parallel_world_size,
     sequence_parallel_is_initialized,
@@ -355,14 +355,15 @@ def sparse_eval_gpu(args, model, x, y, sub_idx, attn_bias, edge_index, device):
     
     # num_batch = sub_idx.size(0) // args.seq_len + 1
     # seq_len = 128
-    num_batch = sub_idx.size(0) // args.seq_len + 1
+    eval_batch_size = get_seed_batch_size(args) if getattr(args, "batch_subgraph_mode", "induced") == "seed_rw" else args.seq_len
+    num_batch = (sub_idx.size(0) + eval_batch_size - 1) // eval_batch_size
     
     
     # for i in tqdm(range(num_batch), desc="Iteration"):
     for i in range(num_batch):
-        idx_i = sub_idx[i*args.seq_len:(i+1)*args.seq_len]
+        idx_i = sub_idx[i*eval_batch_size:(i+1)*eval_batch_size]
         rest_split_sizes = None
-        if idx_i.shape[0] < args.seq_len:
+        if getattr(args, "batch_subgraph_mode", "induced") != "seed_rw" and idx_i.shape[0] < args.seq_len:
             rest_split_sizes = _get_rest_split_sizes(idx_i, seq_parallel_world_size)
             _set_eval_last_batch_global_tokens(args, rest_split_sizes)
 
@@ -387,7 +388,7 @@ def sparse_eval_gpu(args, model, x, y, sub_idx, attn_bias, edge_index, device):
         pred = model(x_i, model_attn_bias, edge_index_i, attn_type=args.attn_type)
         pred_label = pred.argmax(1)
         y_i_flat = y_i.view(-1)
-        is_labeled = y_i_flat == y_i_flat
+        is_labeled = y_i_flat != -100
         if is_labeled.any():
             correct += int((pred_label[is_labeled] == y_i_flat[is_labeled]).sum().item())
             total += int(is_labeled.sum().item())

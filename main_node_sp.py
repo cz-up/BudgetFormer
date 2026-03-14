@@ -28,6 +28,7 @@ from gt_sp.adaptive_walk import estimate_L_star, coverage_for_R
 from gt_sp.evaluate import sparse_eval_gpu
 from gt_sp.utils import (
     get_batch_blockize,
+    get_seed_batch_size,
     random_split_idx,
     fixed_random_seed,
 )
@@ -312,12 +313,17 @@ def run_step(args, model, device, feature, y, idx_batch_cpu, sub_split_seq_lens,
     to -100 so they are ignored in the loss computation. This is used for METIS
     batching where each block may contain val/test nodes as context.
     """
-    current_split_seq_lens = sub_split_seq_lens
-    if idx_batch_cpu.shape[0] < args.seq_len:
+    batch_mode = getattr(args, "batch_subgraph_mode", "induced")
+    current_split_seq_lens = None if batch_mode == "seed_rw" else sub_split_seq_lens
+    if batch_mode != "seed_rw" and idx_batch_cpu.shape[0] < args.seq_len:
         current_split_seq_lens, current_global_token_indices_last_batch = _get_current_batch_split_state(
             args, int(idx_batch_cpu.shape[0])
         )
         set_last_batch_global_token_indices(current_global_token_indices_last_batch)
+
+    seed_label_mask = None
+    if batch_mode == "seed_rw" and train_idx_tensor is not None:
+        seed_label_mask = torch.isin(idx_batch_cpu.cpu(), train_idx_tensor)
 
     x_i, y_i, edge_index_i, attn_bias = get_batch_blockize(
         args,
@@ -328,10 +334,11 @@ def run_step(args, model, device, feature, y, idx_batch_cpu, sub_split_seq_lens,
         edge_index_global,
         N,
         device=device,
+        seed_label_mask=seed_label_mask,
     )
 
     # --- METIS 模式下屏蔽非训练节点的 loss ---
-    if train_idx_tensor is not None:
+    if train_idx_tensor is not None and batch_mode != "seed_rw":
         # 确定当前 rank 处理的节点子集
         sp_world = get_sequence_parallel_world_size() if sequence_parallel_is_initialized() else 1
         sp_rank  = get_sequence_parallel_rank()  if sequence_parallel_is_initialized() else 0
@@ -384,12 +391,17 @@ def main():
         os.makedirs(args.model_dir, exist_ok=True)
 
     feature, y, edge_index_global, N, split_idx = _load_node_level_data(args, device)
+    seed_batch_size = get_seed_batch_size(args)
+    batch_mode = getattr(args, "batch_subgraph_mode", "induced")
 
     # --- METIS 预分区：自动检测分区文件，存在则启用，不存在则 fallback 随机 batching ---
     _part_path = f"{args.dataset_dir}{args.dataset}/part_seq_{args.seq_len}.pt"
     metis_blocks = None
     train_idx_tensor = None
-    if os.path.exists(_part_path):
+    if batch_mode == "seed_rw":
+        if args.rank == 0:
+            print(f"[batch] Using seed_rw mode with seed_batch_size={seed_batch_size}; METIS block batching disabled.")
+    elif os.path.exists(_part_path):
         metis_blocks = _load_metis_partition(args)  # [num_blocks, seq_len]
         train_idx_tensor = split_idx['train'].cpu().to(torch.long)
         if args.rank == 0:
@@ -452,7 +464,7 @@ def main():
             batch_indices = [b[b >= 0] for b in raw_batches]
         else:
             # 随机 batching
-            batch_indices = torch.split(idx_train_shuffle, args.seq_len)
+            batch_indices = torch.split(idx_train_shuffle, seed_batch_size)
 
         iter_t_list = []
         runtime = defaultdict(float) if profile_single_machine else None

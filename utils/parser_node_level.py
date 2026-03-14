@@ -82,6 +82,20 @@ def add_node_batch_sp_args(parser, defaults=None):
     defaults = defaults or {}
 
     parser.add_argument(
+        "--batch_subgraph_mode",
+        type=str,
+        default=defaults.get("batch_subgraph_mode", "induced"),
+        choices=["induced", "seed_rw"],
+        help="batch subgraph construction: induced subgraph or seed-based full-graph random walk",
+    )
+    parser.add_argument(
+        "--seed_batch_size",
+        type=int,
+        default=defaults.get("seed_batch_size"),
+        help="number of seed/query nodes per batch when --batch_subgraph_mode seed_rw; defaults to seq_len",
+    )
+
+    parser.add_argument(
         "--seq_len",
         type=int,
         default=defaults.get("seq_len", 256000),

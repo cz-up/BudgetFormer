@@ -21,9 +21,12 @@ from gt_sp.initialize import (
     set_global_token_indices,
     get_global_token_indices,
     get_global_token_num,
+    set_last_batch_global_token_indices,
     last_batch_flag,
     get_last_batch_flag,
 )
+
+_RANDOM_WALK_GRAPH_CACHE = {}
 
 
 def _compute_local_spd_bias(edge_index: Tensor, n_nodes: int, max_dist: int) -> Tensor:
@@ -118,6 +121,13 @@ def resolve_random_walk_device(args, default_device) -> torch.device:
             return torch.device(f"cuda:{torch.cuda.current_device()}")
 
     return rw_device
+
+
+def get_seed_batch_size(args) -> int:
+    seed_batch_size = getattr(args, "seed_batch_size", None)
+    if seed_batch_size is None:
+        seed_batch_size = getattr(args, "seq_len")
+    return max(1, int(seed_batch_size))
 
 
 @contextlib.contextmanager
@@ -498,6 +508,99 @@ def _merge_edge_index_list(edge_list: List[Tensor]) -> Tensor:
     return torch.stack([src_u, dst_u], dim=0).to(device)
 
 
+def _get_random_walk_graph(edge_index: Tensor, num_nodes: int, device) -> tuple[Tensor, Tensor, Tensor]:
+    dev = torch.device(device)
+    key = (int(edge_index.data_ptr()), int(edge_index.size(1)), int(num_nodes), dev.type, dev.index)
+    cached = _RANDOM_WALK_GRAPH_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    edge_index_dev = edge_index if edge_index.device == dev else edge_index.to(dev)
+    adj = SparseTensor(
+        row=edge_index_dev[0],
+        col=edge_index_dev[1],
+        sparse_sizes=(num_nodes, num_nodes),
+    ).coalesce()
+    rowptr, col, _ = adj.csr()
+    cached = (edge_index_dev, rowptr, col)
+    _RANDOM_WALK_GRAPH_CACHE[key] = cached
+    return cached
+
+
+def _map_global_nodes_to_local(nodes_global: Tensor, sampled_nodes: Tensor) -> Tensor:
+    sampled_nodes = sampled_nodes.to(torch.long)
+    nodes_global = nodes_global.to(torch.long)
+    if nodes_global.numel() == 0:
+        return torch.empty((0,), dtype=torch.long, device=sampled_nodes.device)
+    sorted_nodes, order = torch.sort(sampled_nodes)
+    sorted_local = torch.arange(sampled_nodes.numel(), dtype=torch.long, device=sampled_nodes.device)[order]
+    pos = torch.searchsorted(sorted_nodes, nodes_global)
+    pos = torch.clamp(pos, max=max(int(sorted_nodes.numel()) - 1, 0))
+    return sorted_local[pos]
+
+
+def sample_seed_rw_subgraph(
+    edge_index: Tensor,
+    seed_nodes: Tensor,
+    num_nodes: int,
+    device,
+    walk_length: int,
+    walks_per_node: int,
+) -> tuple[Tensor, Tensor]:
+    """Sample a seed-centric subgraph by random walks on the full graph.
+
+    The returned sampled nodes keep seeds first, followed by visited context nodes.
+    Edge semantics follow attention message flow: src provides k/v, dst is the query.
+    We keep both walk trajectory edges (curr -> prev) and direct seed-query edges
+    (visited -> seed).
+    """
+    seed_nodes = seed_nodes.to(torch.long).view(-1).cpu()
+    if seed_nodes.numel() == 0:
+        return seed_nodes, edge_index.new_zeros((2, 0), dtype=torch.long).cpu()
+
+    walk_length = max(1, int(walk_length))
+    walks_per_node = max(1, int(walks_per_node))
+    rw_device = torch.device(device)
+    edge_index_dev, rowptr, col = _get_random_walk_graph(edge_index, num_nodes, rw_device)
+
+    seed_nodes_dev = seed_nodes.to(rw_device)
+    starts = seed_nodes_dev.repeat_interleave(walks_per_node)
+    walks = _run_random_walk(edge_index_dev, rowptr, col, starts, walk_length)
+    starts_walk = walks[:, 0]
+
+    visited_nodes = [seed_nodes_dev]
+    edge_parts: List[Tensor] = []
+    for d in range(1, walk_length + 1):
+        curr = walks[:, d]
+        prev = walks[:, d - 1]
+        valid = (curr >= 0) & (prev >= 0)
+        if not valid.any():
+            continue
+        curr_valid = curr[valid]
+        prev_valid = prev[valid]
+        seed_valid = starts_walk[valid]
+        edge_parts.append(torch.stack([curr_valid, prev_valid], dim=0))
+        edge_parts.append(torch.stack([curr_valid, seed_valid], dim=0))
+        visited_nodes.append(curr_valid)
+
+    if len(visited_nodes) > 1:
+        context_nodes = torch.unique(torch.cat(visited_nodes[1:], dim=0))
+        context_nodes = context_nodes[~torch.isin(context_nodes, seed_nodes_dev)]
+        sampled_nodes = torch.cat([seed_nodes_dev, context_nodes], dim=0)
+    else:
+        sampled_nodes = seed_nodes_dev
+
+    if edge_parts:
+        sampled_edges_global = _merge_edge_index_list(edge_parts)
+        edge_src_local = _map_global_nodes_to_local(sampled_edges_global[0], sampled_nodes)
+        edge_dst_local = _map_global_nodes_to_local(sampled_edges_global[1], sampled_nodes)
+        sampled_edge_index = torch.stack([edge_src_local, edge_dst_local], dim=0)
+    else:
+        sampled_edge_index = edge_index.new_zeros((2, 0), dtype=torch.long, device=rw_device)
+
+    return sampled_nodes.cpu(), sampled_edge_index.cpu()
+
+
 def compute_hops_random_walk(
     edge_index: Tensor,
     num_nodes: int,
@@ -847,33 +950,95 @@ def build_head_subgraph_provider(args) -> HeadSubgraphProvider:
         return HopMappedHeadSubgraphProvider(hop_sequence, num_groups)
     return SharedHeadSubgraphProvider()
 
-def get_batch_blockize(args, x, y, idx_batch, rest_split_sizes, edge_index, N, device=None):
+def get_batch_blockize(args, x, y, idx_batch, rest_split_sizes, edge_index, N, device=None, seed_label_mask=None):
     """
     Generate a local subsequence in sequence parallel and slice the corresponding edge_index.
     """
     seq_parallel_world_size = get_sequence_parallel_world_size() if sequence_parallel_is_initialized() else 1
     seq_parallel_world_rank = get_sequence_parallel_rank() if sequence_parallel_is_initialized() else 0
     seq_length = args.seq_len
-
-    x_i = x[idx_batch]  # [s, x_d]
-    y_i = y[idx_batch]  # [s]
-
-    # Keep raw (0-indexed, before fix_edge_index) subgraph for local_spd and RW sampling.
-    edge_index_i_raw = gen_sub_edge_index(edge_index, idx_batch, N)
-    rw_base = edge_index_i_raw
-
+    batch_mode = getattr(args, "batch_subgraph_mode", "induced")
+    dynamic_split_sizes = None
     dev = None
     if device is not None:
         dev = torch.device(device) if not isinstance(device, torch.device) else device
-    rw_dev = resolve_random_walk_device(args, dev if dev is not None else rw_base.device)
-    if rw_base.device != rw_dev:
-        rw_base = rw_base.to(rw_dev)
+
+    if batch_mode == "seed_rw":
+        if seq_parallel_world_size > 1:
+            src_rank = get_sequence_parallel_src_rank()
+            group = get_sequence_parallel_group()
+        else:
+            src_rank = None
+            group = None
+
+        do_sample = (seq_parallel_world_size <= 1) or (dist.get_rank() == src_rank)
+        if do_sample:
+            sampled_nodes, edge_index_i_raw = sample_seed_rw_subgraph(
+                edge_index=edge_index,
+                seed_nodes=idx_batch,
+                num_nodes=N,
+                device=resolve_random_walk_device(args, device if device is not None else edge_index.device),
+                walk_length=getattr(args, "head_hop_walk_length", 4),
+                walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
+            )
+        else:
+            sampled_nodes = None
+            edge_index_i_raw = None
+
+        if seq_parallel_world_size > 1:
+            assert dev is not None, "seed_rw broadcasting requires a concrete device in sequence parallel mode."
+            broad_device = dev
+            if do_sample:
+                sizes_broad = torch.tensor(
+                    [
+                        int(sampled_nodes.size(0)),
+                        int(edge_index_i_raw.size(1)),
+                    ],
+                    device=broad_device,
+                    dtype=torch.long,
+                )
+            else:
+                sizes_broad = torch.empty(2, device=broad_device, dtype=torch.long)
+            dist.broadcast(sizes_broad, src_rank, group=group)
+
+            sampled_node_count = int(sizes_broad[0].item())
+            sampled_edge_count = int(sizes_broad[1].item())
+            if do_sample:
+                sampled_nodes_broad = sampled_nodes.to(broad_device)
+                edge_index_broad = edge_index_i_raw.to(broad_device)
+            else:
+                sampled_nodes_broad = torch.empty(sampled_node_count, device=broad_device, dtype=torch.long)
+                edge_index_broad = torch.empty((2, sampled_edge_count), device=broad_device, dtype=torch.long)
+            dist.broadcast(sampled_nodes_broad, src_rank, group=group)
+            dist.broadcast(edge_index_broad, src_rank, group=group)
+            sampled_nodes = sampled_nodes_broad.cpu()
+            edge_index_i_raw = edge_index_broad.cpu()
+
+        x_i = x[sampled_nodes]
+        y_i = y.new_full((sampled_nodes.size(0),) + tuple(y.shape[1:]), -100)
+        seed_labels = y[idx_batch].clone()
+        if seed_label_mask is not None:
+            seed_mask_cpu = seed_label_mask.to(torch.bool).cpu()
+            seed_labels[~seed_mask_cpu] = -100
+        y_i[:idx_batch.shape[0]] = seed_labels
+
+        split_sizes = [t.shape[0] for t in torch.tensor_split(torch.zeros(sampled_nodes.size(0)), seq_parallel_world_size, dim=0)]
+        dynamic_split_sizes = split_sizes
+        sub_real_seq_len = max(split_sizes) + args.num_global_node
+        set_last_batch_global_token_indices(
+            list(range(0, seq_parallel_world_size * sub_real_seq_len, sub_real_seq_len))
+        )
+    else:
+        x_i = x[idx_batch]  # [s, x_d]
+        y_i = y[idx_batch]  # [s]
+        # Keep raw (0-indexed, before fix_edge_index) subgraph for local_spd and RW sampling.
+        edge_index_i_raw = gen_sub_edge_index(edge_index, idx_batch, N)
 
     # --- attn_bias (optional, controlled by args.attn_bias_mode) ---
     _attn_bias_mode = getattr(args, 'attn_bias_mode', 'none')
     full_attn_bias = None  # [n_real, n_real, d] on CPU (before SP split)
     if _attn_bias_mode == 'local_spd':
-        _n_real = idx_batch.shape[0]
+        _n_real = x_i.shape[0]
         _max_dist = getattr(args, 'attn_bias_max_dist', 5)
         if _n_real > 16384:
             import warnings
@@ -886,32 +1051,39 @@ def get_batch_blockize(args, x, y, idx_batch, rest_split_sizes, edge_index, N, d
         )  # [n_real, n_real, d]
 
     attn_bias = None
-    try:
-        edge_index_i_heads = build_head_hop_edges(
-            edge_index=rw_base,
-            num_nodes=x_i.size(0),
-            num_heads=args.num_heads,
-            num_groups=1,
-            device=rw_base.device,
-            walk_length=getattr(args, "head_hop_walk_length", 4),
-            walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
-        )
-    except RuntimeError:
-        rw_base = rw_base.to("cpu")
-        edge_index_i_heads = build_head_hop_edges(
-            edge_index=rw_base,
-            num_nodes=x_i.size(0),
-            num_heads=args.num_heads,
-            num_groups=1,
-            device=rw_base.device,
-            walk_length=getattr(args, "head_hop_walk_length", 4),
-            walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
-        )
+    if batch_mode == "seed_rw":
+        edge_index_i_heads = edge_index_i_raw
+    else:
+        rw_base = edge_index_i_raw
+        rw_dev = resolve_random_walk_device(args, dev if dev is not None else rw_base.device)
+        if rw_base.device != rw_dev:
+            rw_base = rw_base.to(rw_dev)
+        try:
+            edge_index_i_heads = build_head_hop_edges(
+                edge_index=rw_base,
+                num_nodes=x_i.size(0),
+                num_heads=args.num_heads,
+                num_groups=1,
+                device=rw_base.device,
+                walk_length=getattr(args, "head_hop_walk_length", 4),
+                walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
+            )
+        except RuntimeError:
+            rw_base = rw_base.to("cpu")
+            edge_index_i_heads = build_head_hop_edges(
+                edge_index=rw_base,
+                num_nodes=x_i.size(0),
+                num_heads=args.num_heads,
+                num_groups=1,
+                device=rw_base.device,
+                walk_length=getattr(args, "head_hop_walk_length", 4),
+                walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
+            )
 
     if args.model == "graphormer":
         edge_index_i_heads = _apply_to_edge_index(
             edge_index_i_heads,
-            lambda e: fix_edge_index(e, idx_batch.shape[0]),
+            lambda e: fix_edge_index(e, x_i.shape[0]),
         )
 
     # Current head-hop implementation shares the same subgraph across heads.
@@ -933,25 +1105,26 @@ def get_batch_blockize(args, x, y, idx_batch, rest_split_sizes, edge_index, N, d
             edge_index_i_heads = torch.empty((2, int(size_broad.item())), device=edge_index_i_heads.device, dtype=edge_index_i_heads.dtype)
         dist.broadcast(edge_index_i_heads, src_rank, group=group)
 
-    if idx_batch.shape[0] < seq_length:
-        assert rest_split_sizes is not None, 'Rest split_sizes should not be None'
-        seq_length = max(rest_split_sizes) * seq_parallel_world_size
+    if batch_mode == "seed_rw" or idx_batch.shape[0] < seq_length:
+        split_sizes = dynamic_split_sizes if batch_mode == "seed_rw" else rest_split_sizes
+        assert split_sizes is not None, 'Rest split_sizes should not be None'
+        seq_length = max(split_sizes) * seq_parallel_world_size
         x_i = pad_2d(x_i, seq_length)
         y_i = pad_y(y_i, seq_length)
 
-        afterpad_split_sizes = [max(rest_split_sizes)] * seq_parallel_world_size
+        afterpad_split_sizes = [max(split_sizes)] * seq_parallel_world_size
         x_i_list = [t for t in torch.split(x_i, afterpad_split_sizes, dim=0)]
         y_i_list = [t for t in torch.split(y_i, afterpad_split_sizes, dim=0)]
 
         if args.model == "graphormer":
             edge_index_i_heads = _apply_to_edge_index(
                 edge_index_i_heads,
-                lambda e: adjust_edge_index_nomerge(e, max(rest_split_sizes)),
+                lambda e: adjust_edge_index_nomerge(e, max(split_sizes)),
             )
 
         x_i = x_i_list[seq_parallel_world_rank]
         y_i = y_i_list[seq_parallel_world_rank]
-        sub_seq_start = seq_parallel_world_rank * max(rest_split_sizes)
+        sub_seq_start = seq_parallel_world_rank * max(split_sizes)
         sub_seq_end = sub_seq_start + x_i.size(0)
 
         if full_attn_bias is not None:

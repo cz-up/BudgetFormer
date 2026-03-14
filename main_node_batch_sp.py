@@ -28,6 +28,7 @@ from gt_sp.adaptive_walk import estimate_L_star, coverage_for_R
 from gt_sp.evaluate import sparse_eval_gpu
 from gt_sp.utils import (
     get_batch_blockize,
+    get_seed_batch_size,
     random_split_idx,
     fixed_random_seed,
 )
@@ -260,8 +261,9 @@ def _load_default_split(dataset_name: str, root_dir: str, wait_for_rank0: bool =
 
 def run_step(args, model, device, feature, y, idx_batch_cpu, sub_split_seq_lens,
              edge_index_global, N, attn_type):
-    current_split_seq_lens = sub_split_seq_lens
-    if idx_batch_cpu.shape[0] < args.seq_len:
+    batch_mode = getattr(args, "batch_subgraph_mode", "induced")
+    current_split_seq_lens = None if batch_mode == "seed_rw" else sub_split_seq_lens
+    if batch_mode != "seed_rw" and idx_batch_cpu.shape[0] < args.seq_len:
         current_split_seq_lens, current_global_token_indices_last_batch = _get_current_batch_split_state(
             args, int(idx_batch_cpu.shape[0])
         )
@@ -276,6 +278,7 @@ def run_step(args, model, device, feature, y, idx_batch_cpu, sub_split_seq_lens,
         edge_index_global,
         N,
         device=device,
+        seed_label_mask=None,
     )
 
     x_i = x_i.to(device)
@@ -305,6 +308,7 @@ def main():
         os.makedirs(args.model_dir, exist_ok=True)
 
     feature, y, edge_index_global, N, split_idx = _load_node_level_data(args, device)
+    seed_batch_size = get_seed_batch_size(args)
 
     flatten_train_idx, sub_split_seq_lens, seq_parallel_world_size, profile_single_machine = (
         _prepare_sequence_training_state(args, split_idx, device)
@@ -351,7 +355,7 @@ def main():
         if hasattr(model, "reset_head_mass_stats"):
             model.reset_head_mass_stats()
         idx_train_shuffle = flatten_train_idx[torch.randperm(flatten_train_idx.size(0))].to("cpu")
-        batch_indices = torch.split(idx_train_shuffle, args.seq_len)
+        batch_indices = torch.split(idx_train_shuffle, seed_batch_size)
 
         iter_t_list = []
         runtime = defaultdict(float) if profile_single_machine else None
