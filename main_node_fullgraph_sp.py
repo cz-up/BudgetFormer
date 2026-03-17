@@ -72,6 +72,27 @@ def _resolve_device() -> str:
     return "cpu"
 
 
+def _resolve_amp_dtype(args):
+    amp_mode = getattr(args, "amp_dtype", "none")
+    if amp_mode == "none" or not torch.cuda.is_available():
+        return None
+    if amp_mode == "bf16":
+        if torch.cuda.is_bf16_supported():
+            return torch.bfloat16
+        if args.rank == 0:
+            print("[amp] bf16 is not supported on this GPU; falling back to fp16.")
+        return torch.float16
+    if amp_mode == "fp16":
+        return torch.float16
+    raise ValueError(f"Unsupported amp dtype: {amp_mode}")
+
+
+def _autocast_context(device: str, amp_dtype):
+    if amp_dtype is None or not device.startswith("cuda"):
+        return contextlib.nullcontext()
+    return torch.autocast(device_type="cuda", dtype=amp_dtype)
+
+
 def _set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -210,6 +231,10 @@ def _build_model(args, feature, y, device):
             **common,
             num_global_node=args.num_global_node,
         ).to(device)
+        if getattr(args, "sparse_query_chunk_size", 0) > 0:
+            model.set_sparse_attention_query_chunk_size(args.sparse_query_chunk_size)
+        if getattr(args, "activation_checkpoint", False):
+            model.set_activation_checkpoint(True)
     elif args.model == "gt":
         model = GT(
             **common,
@@ -267,6 +292,141 @@ def _build_and_broadcast_edges(args, edge_index_global, N, device, rw_device, sp
     return merged
 
 
+def _pin_cpu_tensor(tensor):
+    if tensor.device.type == "cpu" and torch.cuda.is_available():
+        try:
+            return tensor.pin_memory()
+        except RuntimeError:
+            return tensor
+    return tensor
+
+
+def _build_merged_edges(args, edge_index_global, N, final_device, rw_device, nodes_per_rank):
+    parts = []
+    final_torch_device = torch.device(final_device)
+    if getattr(args, "include_self_loops", 0):
+        self_loop = torch.arange(N, device=final_torch_device, dtype=torch.long)
+        self_loop = torch.stack([self_loop, self_loop], dim=0)
+        parts.append(self_loop)
+    if getattr(args, "include_real_edges", 0):
+        parts.append(edge_index_global.to(final_torch_device))
+    if getattr(args, "head_hop_walks_per_node", 0) > 0:
+        rw_heads = build_head_hop_edges(
+            edge_index=edge_index_global.to(rw_device),
+            num_nodes=N,
+            num_heads=args.num_heads,
+            num_groups=1,
+            device=rw_device,
+            walk_length=getattr(args, "head_hop_walk_length", 4),
+            walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
+        )
+        if isinstance(rw_heads, list):
+            rw_heads = _merge_edge_index_list(rw_heads)
+        if rw_heads is not None:
+            if rw_heads.device != final_torch_device:
+                rw_heads = rw_heads.to(final_torch_device)
+            parts.append(rw_heads)
+    merged = _merge_edge_index_list(parts)
+    if merged is None:
+        merged = edge_index_global.new_zeros((2, 0), dtype=torch.long).to(final_torch_device)
+    if args.model == "graphormer" and args.num_global_node > 0:
+        merged = fix_edge_index(merged, N)
+        merged = adjust_edge_index_nomerge(merged, nodes_per_rank)
+    return merged
+
+
+def _pack_chunked_edges(merged, chunk_size, mode):
+    chunk = max(int(chunk_size), 1)
+    edge_store = merged.detach()
+
+    if mode == "cpu_stream":
+        edge_store = edge_store.cpu()
+    elif mode != "gpu_chunk":
+        raise ValueError(f"Unsupported chunked edge payload mode: {mode}")
+
+    if edge_store.numel() == 0:
+        empty = torch.empty((0,), dtype=torch.long, device=edge_store.device)
+        offsets = torch.zeros(1, dtype=torch.long, device=edge_store.device)
+        if mode == "cpu_stream":
+            empty = _pin_cpu_tensor(empty)
+            offsets = _pin_cpu_tensor(offsets)
+        return {
+            "mode": mode,
+            "src": empty,
+            "dst": empty.clone(),
+            "offsets": offsets,
+            "chunk_size": chunk,
+        }
+
+    edge_index = edge_store[:2].to(torch.long).contiguous()
+    edge_hops = edge_store[2].to(torch.long).contiguous() if edge_store.size(0) == 3 else None
+
+    order = torch.argsort(edge_index[1])
+    src_sorted = edge_index[0].index_select(0, order).contiguous()
+    dst_sorted = edge_index[1].index_select(0, order).contiguous()
+    hop_sorted = edge_hops.index_select(0, order).contiguous() if edge_hops is not None else None
+
+    max_dst = int(dst_sorted.max().item()) if dst_sorted.numel() > 0 else -1
+    num_chunks = max((max_dst + chunk) // chunk, 0)
+    offsets = torch.zeros(num_chunks + 1, dtype=torch.long, device=dst_sorted.device)
+    if dst_sorted.numel() > 0 and num_chunks > 0:
+        dst_bins = torch.div(dst_sorted, chunk, rounding_mode="floor")
+        counts = torch.bincount(dst_bins, minlength=num_chunks)
+        offsets[1:] = counts.cumsum(dim=0)
+
+    if mode == "cpu_stream":
+        src_sorted = _pin_cpu_tensor(src_sorted)
+        dst_sorted = _pin_cpu_tensor(dst_sorted)
+        offsets = _pin_cpu_tensor(offsets)
+        if hop_sorted is not None:
+            hop_sorted = _pin_cpu_tensor(hop_sorted)
+
+    payload = {
+        "mode": mode,
+        "src": src_sorted,
+        "dst": dst_sorted,
+        "offsets": offsets,
+        "chunk_size": chunk,
+    }
+    if hop_sorted is not None:
+        payload["hops"] = hop_sorted
+    return payload
+
+
+def _build_streaming_edges(args, edge_index_global, N, rw_device, nodes_per_rank, edge_seed=None):
+    seed_ctx = fixed_random_seed(edge_seed) if edge_seed is not None else contextlib.nullcontext()
+    with seed_ctx:
+        merged = _build_merged_edges(args, edge_index_global, N, "cpu", rw_device, nodes_per_rank)
+    return _pack_chunked_edges(merged, args.sparse_query_chunk_size, mode="cpu_stream")
+
+
+def _build_attention_edges(args, edge_index_global, N, device, rw_device, sp_group,
+                           sp_src_rank, sp_rank, nodes_per_rank, edge_seed=None):
+    if getattr(args, "stream_edges_from_cpu", False):
+        return _build_streaming_edges(
+            args,
+            edge_index_global,
+            N,
+            rw_device,
+            nodes_per_rank,
+            edge_seed=edge_seed,
+        )
+    merged = _build_and_broadcast_edges(
+        args,
+        edge_index_global,
+        N,
+        device,
+        rw_device,
+        sp_group,
+        sp_src_rank,
+        sp_rank,
+        nodes_per_rank,
+    )
+    if args.attn_type == "sparse" and getattr(args, "sparse_query_chunk_size", 0) > 0:
+        return _pack_chunked_edges(merged, args.sparse_query_chunk_size, mode="gpu_chunk")
+    return merged
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Evaluation (using model.train() so all-to-all is active across all ranks)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -285,7 +445,7 @@ def _restore_dropout(states):
 
 def _eval_sp(args, model, feature, y, split_idx, edge_index_global, N,
              device, rw_device, sp_group, sp_src_rank, sp_rank, sp_world_size,
-             rank_start, rank_end, local_N):
+             rank_start, rank_end, local_N, amp_dtype=None, cached_edge_index=None):
     """Full-graph SP evaluation.
 
     Runs in model.train() mode so _SeqAllToAll is triggered and each rank
@@ -293,11 +453,15 @@ def _eval_sp(args, model, feature, y, split_idx, edge_index_global, N,
     Predictions are all-gathered on rank-0.
     """
     # Build eval edges (fixed seed, rank-0 builds and broadcasts)
-    with fixed_random_seed(args.seed):
-        edge_index_eval = _build_and_broadcast_edges(
-            args, edge_index_global, N, device, rw_device,
-            sp_group, sp_src_rank, sp_rank, local_N,
-        )
+    if cached_edge_index is None:
+        with fixed_random_seed(args.seed):
+            edge_index_eval = _build_attention_edges(
+                args, edge_index_global, N, device, rw_device,
+                sp_group, sp_src_rank, sp_rank, local_N,
+                edge_seed=args.seed if getattr(args, "stream_edges_from_cpu", False) else None,
+            )
+    else:
+        edge_index_eval = cached_edge_index
 
     # Forward in train mode so all-to-all fires
     was_training = model.training
@@ -305,7 +469,8 @@ def _eval_sp(args, model, feature, y, split_idx, edge_index_global, N,
     drop_states = _set_dropout_eval(model)
     with torch.no_grad():
         x_local = feature[rank_start:rank_end].float().to(device)
-        out_local = model(x_local, None, edge_index_eval, attn_type=args.attn_type)
+        with _autocast_context(device, amp_dtype):
+            out_local = model(x_local, None, edge_index_eval, attn_type=args.attn_type)
         pred_local = out_local.argmax(dim=1)  # [local_N] — keep on device for NCCL
 
     _restore_dropout(drop_states)
@@ -361,10 +526,15 @@ def main():
             "warmup_updates": 20,
             "sequence_parallel_size": 1,
             "num_global_node": 1,
+            "amp_dtype": "none",
         },
     )
     add_node_fullgraph_sp_args(parser)
     args = normalize_main_node_fullgraph_sp_args(parser.parse_args())
+    if args.stream_edges_from_cpu and args.attn_type != "sparse":
+        raise ValueError("--stream_edges_from_cpu currently requires --attn_type sparse.")
+    if args.stream_edges_from_cpu and args.sparse_query_chunk_size <= 0:
+        raise ValueError("--stream_edges_from_cpu requires --sparse_query_chunk_size > 0.")
 
     # ── Distributed init ────────────────────────────────────────────────────
     initialize_distributed(args)
@@ -376,6 +546,7 @@ def main():
     sp_group = get_sequence_parallel_group() if sp_initialized else None
 
     device = _resolve_device()
+    amp_dtype = _resolve_amp_dtype(args)
     rw_device = resolve_random_walk_device(args, device)
     _set_seed(args.seed)
 
@@ -421,11 +592,15 @@ def main():
               f"self={int(bool(args.include_self_loops))} "
               f"rw={int(getattr(args, 'head_hop_walks_per_node', 0) > 0)}")
         print(f"  Random-walk device: {rw_device}")
+        print(f"  AMP dtype: {args.amp_dtype}")
+        print(f"  CPU edge streaming: {int(bool(getattr(args, 'stream_edges_from_cpu', False)))}")
+        print(f"  Sparse query chunk size: {getattr(args, 'sparse_query_chunk_size', 0)}")
         print(f"{'='*72}\n")
 
     # ── Build model ───────────────────────────────────────────────────────
     model = _build_model(args, feature, y, device)
     sync_params_and_buffers(model)
+    scaler = torch.cuda.amp.GradScaler(enabled=(amp_dtype == torch.float16 and device.startswith("cuda")))
 
     if args.rank == 0:
         print(f"Model params: {sum(p.numel() for p in model.parameters()):,}")
@@ -449,6 +624,20 @@ def main():
     loss_ema = None
 
     x_local = feature[rank_start:rank_end].to(device)  # [nodes_per_rank, d] – padded if needed
+    dynamic_edges = getattr(args, "head_hop_walks_per_node", 0) > 0
+    cached_edge_index = None
+    if not dynamic_edges:
+        cached_edge_index = _build_attention_edges(
+            args,
+            edge_index_global,
+            N,
+            device,
+            rw_device,
+            sp_group,
+            sp_src_rank,
+            sp_rank,
+            local_N,
+        )
 
     for epoch in range(1, args.epochs + 1):
         t_epoch = time.time()
@@ -457,10 +646,15 @@ def main():
 
         # ── Build edges (rank-0 builds, broadcast to all) ─────────────────
         t_rw = time.time()
-        edge_index_rw = _build_and_broadcast_edges(
-            args, edge_index_global, N, device, rw_device,
-            sp_group, sp_src_rank, sp_rank, local_N,
-        )
+        if cached_edge_index is not None:
+            edge_index_rw = cached_edge_index
+        else:
+            edge_seed = args.seed + epoch if getattr(args, "stream_edges_from_cpu", False) else None
+            edge_index_rw = _build_attention_edges(
+                args, edge_index_global, N, device, rw_device,
+                sp_group, sp_src_rank, sp_rank, local_N,
+                edge_seed=edge_seed,
+            )
         rw_time = time.time() - t_rw
 
         # ── Forward ────────────────────────────────────────────────────────
@@ -468,26 +662,28 @@ def main():
         # Each rank inputs its slice [local_N, d]; after _SeqAllToAll inside
         # DistributedAttentionNodeLevel the full N nodes are visible for
         # sparse attention; output returns to [local_N, classes].
-        out_local = model(x_local, None, edge_index_rw, attn_type=args.attn_type)
+        with _autocast_context(device, amp_dtype):
+            out_local = model(x_local, None, edge_index_rw, attn_type=args.attn_type)
+            out_rows = int(out_local.size(0))
+            local_y_eff = local_y[:out_rows]
+            valid_train_mask = (local_train_idx >= 0) & (local_train_idx < out_rows)
+            local_train_idx_eff = local_train_idx[valid_train_mask]
+
+            if local_train_idx_eff.numel() > 0:
+                loss = F.nll_loss(
+                    out_local.index_select(0, local_train_idx_eff),
+                    local_y_eff.index_select(0, local_train_idx_eff).long(),
+                )
+            else:
+                loss = out_local.sum() * 0.0  # zero gradient on ranks with no train nodes
         fwd_time = time.time() - t_fwd
-
-        # ── Loss (only on this rank's train nodes) ─────────────────────────
-        out_rows = int(out_local.size(0))
-        local_y_eff = local_y[:out_rows]
-        valid_train_mask = (local_train_idx >= 0) & (local_train_idx < out_rows)
-        local_train_idx_eff = local_train_idx[valid_train_mask]
-
-        if local_train_idx_eff.numel() > 0:
-            loss = F.nll_loss(
-                out_local.index_select(0, local_train_idx_eff),
-                local_y_eff.index_select(0, local_train_idx_eff).long(),
-            )
-        else:
-            loss = out_local.sum() * 0.0  # zero gradient on ranks with no train nodes
 
         # ── Backward ───────────────────────────────────────────────────────
         t_bwd = time.time()
-        loss.backward()
+        if scaler.is_enabled():
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
         bwd_time = time.time() - t_bwd
 
         # ── Gradient sync across SP ranks ─────────────────────────────────
@@ -497,7 +693,11 @@ def main():
                     param.grad.div_(sp_world_size)
                     dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, group=sp_group)
 
-        optimizer.step()
+        if scaler.is_enabled():
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
         lr_scheduler.step()
 
         loss_val = loss.item()
@@ -515,7 +715,8 @@ def main():
             accs = _eval_sp(
                 args, model, feature, y, split_idx, edge_index_global, N,
                 device, rw_device, sp_group, sp_src_rank, sp_rank, sp_world_size,
-                rank_start, rank_end, local_N,
+                rank_start, rank_end, local_N, amp_dtype=amp_dtype,
+                cached_edge_index=cached_edge_index,
             )
             eval_time = time.time() - t_eval
 

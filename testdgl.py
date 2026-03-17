@@ -83,39 +83,92 @@ class DGLGraphormer(th.nn.Module):
         return th.log_softmax(self.out_proj(x), dim=-1)
 
 
-def run_epoch(model, optimizer, x, y, idx, seq_len, device, train=True):
-    num_batch = idx.size(0) // seq_len + 1
+def run_epoch(model, optimizer, x, y, idx, seq_len, device, train=True,
+              transductive=False, all_idx=None):
+    """
+    Args:
+        idx      : the split indices whose loss/accuracy should be computed
+                   (train / valid / test).
+        transductive: if True, each batch is built from *all* nodes (all_idx)
+                   so every node participates in self-attention; loss and
+                   accuracy are still computed only on nodes in `idx`.
+        all_idx  : full node index pool used as the sequence source when
+                   transductive=True.  Ignored when transductive=False.
+    """
+    if transductive and all_idx is not None:
+        # Shuffle for training so context nodes are randomly mixed;
+        # for eval keep a deterministic order (avoids re-shuffling noise).
+        pool = th.randperm(all_idx.size(0)) if train else th.arange(all_idx.size(0))
+        pool = all_idx[pool]
+        idx_set = set(idx.tolist())
+    else:
+        pool = idx
+        idx_set = None  # not needed; every node in pool is a target node
+
+    num_batch = pool.size(0) // seq_len + 1
     total_loss = 0.0
     correct = 0
     total = 0
     for i in range(num_batch):
-        idx_i = idx[i * seq_len:(i + 1) * seq_len]
-        if idx_i.numel() == 0:
+        batch_nodes = pool[i * seq_len:(i + 1) * seq_len]
+        if batch_nodes.numel() == 0:
             continue
-        x_i = x[idx_i].to(device)
-        y_i = y[idx_i].to(device)
-        if idx_i.numel() < seq_len:
+        x_i = x[batch_nodes].to(device)
+        y_i = y[batch_nodes].to(device)
+
+        # Build padding mask when this slice is smaller than seq_len
+        actual = batch_nodes.numel()
+        if actual < seq_len:
             x_i = pad_x(x_i, seq_len)
             y_i = pad_y(y_i, seq_len)
-            num_nodes = th.tensor([idx_i.numel()], device=device)
+            num_nodes = th.tensor([actual], device=device)
             attn_mask = make_padding_mask(num_nodes, seq_len, device)
         else:
             attn_mask = None
 
         x_i = x_i.unsqueeze(0)  # [1, N, D]
+
+        if transductive and idx_set is not None:
+            # Build a boolean mask: which positions in this batch are
+            # target nodes (belong to `idx`)?
+            loss_mask = th.tensor(
+                [n.item() in idx_set for n in batch_nodes],
+                dtype=th.bool, device=device
+            )  # length == actual (un-padded)
+            # Extend mask to seq_len if padded
+            if actual < seq_len:
+                pad_extra = th.zeros(seq_len - actual, dtype=th.bool, device=device)
+                loss_mask = th.cat([loss_mask, pad_extra])
+        else:
+            loss_mask = None  # use all valid (non-padded) nodes
+
         if train:
             optimizer.zero_grad(set_to_none=True)
             logits = model(x_i, attn_mask=attn_mask)[0]
-            loss = th.nn.functional.nll_loss(logits, y_i)
+            if loss_mask is not None and loss_mask.any():
+                loss = th.nn.functional.nll_loss(logits[loss_mask], y_i[loss_mask])
+            elif loss_mask is None:
+                loss = th.nn.functional.nll_loss(logits, y_i)
+            else:
+                continue  # no target nodes in this batch
             loss.backward()
             optimizer.step()
         else:
             with th.no_grad():
                 logits = model(x_i, attn_mask=attn_mask)[0]
-                loss = th.nn.functional.nll_loss(logits, y_i)
+                if loss_mask is not None and loss_mask.any():
+                    loss = th.nn.functional.nll_loss(logits[loss_mask], y_i[loss_mask])
+                elif loss_mask is None:
+                    loss = th.nn.functional.nll_loss(logits, y_i)
+                else:
+                    continue
 
         total_loss += float(loss.item())
-        valid = y_i >= 0
+        # Accuracy: only over target positions that have a valid label
+        if loss_mask is not None:
+            valid = (y_i >= 0) & loss_mask
+        else:
+            valid = y_i >= 0
         pred = logits.argmax(dim=-1)
         correct += int((pred[valid] == y_i[valid]).sum().item())
         total += int(valid.sum().item())
@@ -127,7 +180,7 @@ def main():
     parser = argparse.ArgumentParser(description="DGL GraphormerLayer node-level training")
     parser.add_argument("--dataset", type=str, default="pubmed")
     parser.add_argument("--dataset_dir", type=str, default="./dataset/")
-    parser.add_argument("--seq_len", type=int, default=64000)
+    parser.add_argument("--seq_len", type=int, default=8000)
     parser.add_argument("--n_layers", type=int, default=4)
     parser.add_argument("--hidden_dim", type=int, default=64)
     parser.add_argument("--ffn_dim", type=int, default=256)
@@ -141,6 +194,9 @@ def main():
     parser.add_argument("--attention_dropout_rate", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--use_ogbn_split", type=int, default=0)
+    parser.add_argument("--transductive", type=int, default=0,
+                        help="1 = transductive: all nodes see each other in attention; "
+                             "0 = inductive (default): each batch contains only the target split nodes")
     parser.add_argument("--device", type=str, default="cuda")
     args = parser.parse_args()
 
@@ -190,16 +246,21 @@ def main():
     best_test = 0.0
     for epoch in range(1, args.epochs + 1):
         model.train()
+        transductive = bool(args.transductive)
+        all_idx = th.arange(x.size(0)) if transductive else None
         train_loss, train_acc = run_epoch(
-            model, optimizer, x, y, split_idx["train"], args.seq_len, device, train=True
+            model, optimizer, x, y, split_idx["train"], args.seq_len, device, train=True,
+            transductive=transductive, all_idx=all_idx
         )
         lr_scheduler.step()
         model.eval()
         val_loss, val_acc = run_epoch(
-            model, optimizer, x, y, split_idx["valid"], args.seq_len, device, train=False
+            model, optimizer, x, y, split_idx["valid"], args.seq_len, device, train=False,
+            transductive=transductive, all_idx=all_idx
         )
         test_loss, test_acc = run_epoch(
-            model, optimizer, x, y, split_idx["test"], args.seq_len, device, train=False
+            model, optimizer, x, y, split_idx["test"], args.seq_len, device, train=False,
+            transductive=transductive, all_idx=all_idx
         )
         print(
             f"Epoch {epoch:03d} "

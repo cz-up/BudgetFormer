@@ -54,6 +54,31 @@ def add_node_common_args(parser, defaults=None):
         default=defaults.get("random_walk_device", "same"),
         help="device for random-walk subgraph construction: same|cpu|cuda|cuda:N",
     )
+    parser.add_argument(
+        "--sparse_query_chunk_size",
+        type=int,
+        default=defaults.get("sparse_query_chunk_size", 0),
+        help="exact sparse-attention query chunk size; <=0 disables chunking",
+    )
+    parser.add_argument(
+        "--activation_checkpoint",
+        action="store_true",
+        default=defaults.get("activation_checkpoint", False),
+        help="enable encoder-layer activation checkpointing",
+    )
+    parser.add_argument(
+        "--amp_dtype",
+        type=str,
+        default=defaults.get("amp_dtype", "none"),
+        choices=["none", "bf16", "fp16"],
+        help="mixed precision dtype for model forward: none|bf16|fp16",
+    )
+    parser.add_argument(
+        "--stream_edges_from_cpu",
+        action="store_true",
+        default=defaults.get("stream_edges_from_cpu", False),
+        help="keep sparse full-graph edges on CPU and stream dst-sorted chunks to GPU",
+    )
 
     parser.add_argument("--rank", type=int, default=defaults.get("rank"))
     parser.add_argument("--local-rank", "--local_rank", type=int, default=defaults.get("local_rank"))

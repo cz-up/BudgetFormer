@@ -3,6 +3,7 @@ import math
 from collections import deque
 import torch.nn as nn
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
 from torch_geometric.utils import degree
 from torch_sparse import SparseTensor, matmul
 from torch_scatter import scatter
@@ -65,6 +66,8 @@ class CoreAttention(nn.Module):
 
         env_chunk = os.getenv("TORCH_FULL_ATTN_CHUNK", "").strip()
         self.full_chunk_size = chunk_size if chunk_size else (int(env_chunk) if env_chunk.isdigit() else 0)
+        env_sparse_chunk = os.getenv("TORCH_SPARSE_QUERY_CHUNK", "").strip()
+        self.sparse_query_chunk_size = int(env_sparse_chunk) if env_sparse_chunk.isdigit() else 0
 
 
         # entropy 统计参数
@@ -144,10 +147,30 @@ class CoreAttention(nn.Module):
         if attn_bias is not None:
             attn_bias = attn_bias.unsqueeze(2).repeat(1, 1, batch_size, 1, 1)
             attn_bias = attn_bias.view(batch_size * node_num, batch_size * node_num, -1)
+        if isinstance(edge_index, dict):
+            edge_mode = edge_index.get("mode")
+            if edge_mode == "cpu_stream":
+                return self._sparse_attention_chunked_cpu_stream(
+                    k,
+                    q,
+                    v,
+                    edge_index,
+                    attn_bias,
+                    num_heads,
+                )
+            if edge_mode == "gpu_chunk":
+                return self._sparse_attention_chunked_prepacked(
+                    k,
+                    q,
+                    v,
+                    edge_index,
+                    attn_bias,
+                    num_heads,
+                )
 
         if isinstance(edge_index, list):
-            wV = torch.zeros_like(v)
-            Z = v.new_zeros(v.size(0), num_heads, 1)
+            wV = None
+            Z = None
             groups = max(1, len(edge_index))
             heads_per_group = (num_heads + groups - 1) // groups
             for g, edge_index_g in enumerate(edge_index):
@@ -176,10 +199,19 @@ class CoreAttention(nn.Module):
                     ]
                 score = torch.exp(score)
                 msg = v[edge_index_g[0].to(torch.long), h_start:h_end, :] * score
+                if wV is None:
+                    wV = msg.new_zeros(v.size(0), num_heads, self.hidden_size_per_attention_head)
+                    Z = score.new_zeros(v.size(0), num_heads, 1)
                 scatter(msg, edge_index_g[1], dim=0, out=wV[:, h_start:h_end, :], reduce='add')
                 scatter(score, edge_index_g[1], dim=0, out=Z[:, h_start:h_end, :], reduce='add')
+            if wV is None:
+                wV = v.new_zeros(v.size(0), num_heads, self.hidden_size_per_attention_head)
+                Z = v.new_zeros(v.size(0), num_heads, 1)
             x = wV / (Z + 1e-6)
         else:
+            if self.sparse_query_chunk_size and self.sparse_query_chunk_size > 0:
+                return self._sparse_attention_chunked(k, q, v, edge_index, attn_bias, edge_hops, num_heads)
+
             if self._shuffle: # Only apply shuffling during training
                 destinations = edge_index[1, :].clone() # 克隆一份原始目标节点用于比较
                 shuffled_indices = torch.randperm(destinations.size(0), device=destinations.device)
@@ -219,12 +251,12 @@ class CoreAttention(nn.Module):
             
             # Add-up real msgs in destination nodes as given by edge_index[1]
             # -> [total_s, np, hn]
-            wV = torch.zeros_like(v)  
+            wV = msg.new_zeros(v.size(0), num_heads, self.hidden_size_per_attention_head)
             scatter(msg, edge_index[1], dim=0, out=wV, reduce='add')
 
             # Compute attention normalization coefficient
             # -> [total_s, np, 1]
-            Z = score.new_zeros(v.size(0), num_heads, 1)    
+            Z = score.new_zeros(v.size(0), num_heads, 1)
             scatter(score, edge_index[1], dim=0, out=Z, reduce='add')
 
             if getattr(self, "track_hop_mass", False) and edge_hops is not None:
@@ -233,6 +265,192 @@ class CoreAttention(nn.Module):
             x = wV / (Z + 1e-6)
         
         return x
+
+    def set_sparse_attention_query_chunk_size(self, chunk_size: int | None) -> None:
+        self.sparse_query_chunk_size = int(chunk_size) if chunk_size else 0
+
+    def _sparse_attention_chunked(self, k, q, v, edge_index, attn_bias, edge_hops, num_heads):
+        src_idx = edge_index[0].to(torch.long)
+        dst_idx = edge_index[1].to(torch.long)
+        if src_idx.numel() == 0:
+            return torch.zeros_like(v)
+
+        order = torch.argsort(dst_idx)
+        src_sorted = src_idx[order]
+        dst_sorted = dst_idx[order]
+        if edge_hops is not None:
+            edge_hops = edge_hops[order]
+
+        chunk = max(int(self.sparse_query_chunk_size), 1)
+        total_nodes = int(v.size(0))
+        wV = None
+        Z = None
+
+        for start in range(0, total_nodes, chunk):
+            end = min(start + chunk, total_nodes)
+            start_t = dst_sorted.new_tensor(start)
+            end_t = dst_sorted.new_tensor(end)
+            left = int(torch.searchsorted(dst_sorted, start_t, right=False).item())
+            right = int(torch.searchsorted(dst_sorted, end_t, right=False).item())
+            if right <= left:
+                continue
+
+            src_chunk = src_sorted[left:right]
+            dst_chunk = dst_sorted[left:right]
+            local_dst = dst_chunk - start
+
+            src = k[src_chunk]
+            dest = q[dst_chunk]
+            score = torch.mul(src, dest)
+            score = score / self.scale
+            score = score.sum(-1, keepdim=True).clamp(-5, 5)
+
+            if attn_bias is not None:
+                score = score + attn_bias[src_chunk, dst_chunk, :].unsqueeze(-1)
+
+            score = torch.exp(score)
+            msg = v[src_chunk] * score
+
+            if wV is None:
+                wV = msg.new_zeros(v.size(0), num_heads, self.hidden_size_per_attention_head)
+                Z = score.new_zeros(v.size(0), num_heads, 1)
+            chunk_nodes = end - start
+            wV_chunk = msg.new_zeros(chunk_nodes, num_heads, self.hidden_size_per_attention_head)
+            Z_chunk = score.new_zeros(chunk_nodes, num_heads, 1)
+            scatter(msg, local_dst, dim=0, out=wV_chunk, reduce='add')
+            scatter(score, local_dst, dim=0, out=Z_chunk, reduce='add')
+
+            wV[start:end] = wV_chunk
+            Z[start:end] = Z_chunk
+
+        if wV is None:
+            wV = v.new_zeros(v.size(0), num_heads, self.hidden_size_per_attention_head)
+            Z = v.new_zeros(v.size(0), num_heads, 1)
+        return wV / (Z + 1e-6)
+
+    def _sparse_attention_chunked_prepacked(self, k, q, v, edge_payload, attn_bias, num_heads):
+        src_sorted = edge_payload["src"]
+        dst_sorted = edge_payload["dst"]
+        offsets = edge_payload["offsets"]
+        chunk = max(int(edge_payload["chunk_size"]), 1)
+        edge_hops = edge_payload.get("hops")
+
+        if src_sorted.numel() == 0:
+            return torch.zeros_like(v)
+
+        total_nodes = int(v.size(0))
+        wV = None
+        Z = None
+
+        for chunk_id in range(max(int(offsets.numel()) - 1, 0)):
+            left = int(offsets[chunk_id].item())
+            right = int(offsets[chunk_id + 1].item())
+            if right <= left:
+                continue
+
+            start = chunk_id * chunk
+            end = min(start + chunk, total_nodes)
+            src_chunk = src_sorted[left:right]
+            dst_chunk = dst_sorted[left:right]
+            local_dst = dst_chunk - start
+
+            src = k[src_chunk]
+            dest = q[dst_chunk]
+            score = torch.mul(src, dest)
+            score = score / self.scale
+            score = score.sum(-1, keepdim=True).clamp(-5, 5)
+
+            if attn_bias is not None:
+                score = score + attn_bias[src_chunk, dst_chunk, :].unsqueeze(-1)
+
+            score = torch.exp(score)
+            msg = v[src_chunk] * score
+
+            if wV is None:
+                wV = msg.new_zeros(v.size(0), num_heads, self.hidden_size_per_attention_head)
+                Z = score.new_zeros(v.size(0), num_heads, 1)
+            chunk_nodes = end - start
+            wV_chunk = msg.new_zeros(chunk_nodes, num_heads, self.hidden_size_per_attention_head)
+            Z_chunk = score.new_zeros(chunk_nodes, num_heads, 1)
+            scatter(msg, local_dst, dim=0, out=wV_chunk, reduce='add')
+            scatter(score, local_dst, dim=0, out=Z_chunk, reduce='add')
+
+            wV[start:end] = wV_chunk
+            Z[start:end] = Z_chunk
+
+            if getattr(self, "track_hop_mass", False) and edge_hops is not None:
+                edge_hops_chunk = edge_hops[left:right]
+                edge_index_chunk = torch.stack([src_chunk, dst_chunk], dim=0)
+                self._accumulate_sparse_hop_mass(edge_index_chunk, edge_hops_chunk, score, Z)
+
+        if wV is None:
+            wV = v.new_zeros(v.size(0), num_heads, self.hidden_size_per_attention_head)
+            Z = v.new_zeros(v.size(0), num_heads, 1)
+        return wV / (Z + 1e-6)
+
+    def _sparse_attention_chunked_cpu_stream(self, k, q, v, edge_payload, attn_bias, num_heads):
+        src_cpu = edge_payload["src"]
+        dst_cpu = edge_payload["dst"]
+        offsets_cpu = edge_payload["offsets"]
+        chunk = max(int(edge_payload["chunk_size"]), 1)
+        edge_hops_cpu = edge_payload.get("hops")
+
+        if src_cpu.numel() == 0:
+            return torch.zeros_like(v)
+
+        total_nodes = int(v.size(0))
+        num_chunks = (total_nodes + chunk - 1) // chunk
+        wV = None
+        Z = None
+
+        for chunk_id in range(num_chunks):
+            if chunk_id + 1 >= offsets_cpu.numel():
+                continue
+            left = int(offsets_cpu[chunk_id].item())
+            right = int(offsets_cpu[chunk_id + 1].item())
+            if right <= left:
+                continue
+
+            start = chunk_id * chunk
+            end = min(start + chunk, total_nodes)
+
+            src_chunk = src_cpu[left:right].to(k.device, dtype=torch.long, non_blocking=True)
+            dst_chunk = dst_cpu[left:right].to(k.device, dtype=torch.long, non_blocking=True)
+            local_dst = dst_chunk - start
+
+            src = k[src_chunk]
+            dest = q[dst_chunk]
+            score = torch.mul(src, dest)
+            score = score / self.scale
+            score = score.sum(-1, keepdim=True).clamp(-5, 5)
+
+            if attn_bias is not None:
+                score = score + attn_bias[src_chunk, dst_chunk, :].unsqueeze(-1)
+
+            score = torch.exp(score)
+            msg = v[src_chunk] * score
+
+            if wV is None:
+                wV = msg.new_zeros(v.size(0), num_heads, self.hidden_size_per_attention_head)
+                Z = score.new_zeros(v.size(0), num_heads, 1)
+            chunk_nodes = end - start
+            wV_chunk = msg.new_zeros(chunk_nodes, num_heads, self.hidden_size_per_attention_head)
+            Z_chunk = score.new_zeros(chunk_nodes, num_heads, 1)
+            scatter(msg, local_dst, dim=0, out=wV_chunk, reduce='add')
+            scatter(score, local_dst, dim=0, out=Z_chunk, reduce='add')
+
+            wV[start:end] = wV_chunk
+            Z[start:end] = Z_chunk
+
+            if getattr(self, "track_hop_mass", False) and edge_hops_cpu is not None:
+                edge_hops_chunk = edge_hops_cpu[left:right].to(score.device, dtype=torch.long, non_blocking=True)
+                edge_index_chunk = torch.stack([src_chunk, dst_chunk], dim=0)
+                self._accumulate_sparse_hop_mass(edge_index_chunk, edge_hops_chunk, score, Z)
+
+        if wV is None:
+            wV = v.new_zeros(v.size(0), num_heads, self.hidden_size_per_attention_head)
+            Z = v.new_zeros(v.size(0), num_heads, 1)
+        return wV / (Z + 1e-6)
 
     def set_full_attention_chunk_size(self, chunk_size: int | None) -> None:
         self.full_chunk_size = int(chunk_size) if chunk_size else 0
@@ -660,6 +878,7 @@ class Graphormer(nn.Module):
         # Project structural attn_bias (one-hot / positional) to per-head scalars.
         # Active only when attn_bias is not None (i.e. local_spd mode).
         self.attn_bias_proj = nn.Linear(attn_bias_dim, num_heads, bias=False)
+        self.activation_checkpoint = False
         self.apply(lambda module: init_params(module, n_layers=n_layers))
 
     @staticmethod
@@ -684,6 +903,15 @@ class Graphormer(nn.Module):
             core_attn = self._get_core_attention(layer)
             if hasattr(core_attn, "disable_hop_mass_tracking"):
                 core_attn.disable_hop_mass_tracking()
+
+    def set_sparse_attention_query_chunk_size(self, chunk_size: int | None) -> None:
+        for layer in self.layers:
+            core_attn = self._get_core_attention(layer)
+            if hasattr(core_attn, "set_sparse_attention_query_chunk_size"):
+                core_attn.set_sparse_attention_query_chunk_size(chunk_size)
+
+    def set_activation_checkpoint(self, enabled: bool = True) -> None:
+        self.activation_checkpoint = bool(enabled)
 
     def reset_hop_mass_stats(self) -> None:
         for layer in self.layers:
@@ -753,7 +981,12 @@ class Graphormer(nn.Module):
 
         # transformer encoder
         for enc_layer in self.layers:
-            output = enc_layer(output, attn_bias=graph_attn_bias, edge_index=edge_index, attn_type=attn_type)
+            if self.activation_checkpoint and self.training and torch.is_grad_enabled():
+                def custom_forward(hidden_states, layer=enc_layer):
+                    return layer(hidden_states, attn_bias=graph_attn_bias, edge_index=edge_index, attn_type=attn_type)
+                output = checkpoint(custom_forward, output)
+            else:
+                output = enc_layer(output, attn_bias=graph_attn_bias, edge_index=edge_index, attn_type=attn_type)
         output = self.final_ln(output)
 
         # output part
