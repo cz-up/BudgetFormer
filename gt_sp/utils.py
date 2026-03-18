@@ -621,19 +621,17 @@ def compute_hops_random_walk(
 
     inferred_nodes = int(edge_index.max().item()) + 1
     num_nodes = max(num_nodes, inferred_nodes)
-    edge_index = edge_index.to(device)
+    rw_device = torch.device(device)
+    edge_index_dev, rowptr, col = _get_random_walk_graph(edge_index, num_nodes, rw_device)
 
-    adj = SparseTensor(row=edge_index[0], col=edge_index[1], sparse_sizes=(num_nodes, num_nodes)).coalesce()
-    rowptr, col, _ = adj.csr()
-
-    starts = torch.arange(num_nodes, device=device, dtype=torch.long)
+    starts = torch.arange(num_nodes, device=rw_device, dtype=torch.long)
     starts = starts.repeat_interleave(walks_per_node * num_groups)
 
-    walks = _run_random_walk(edge_index, rowptr, col, starts, walk_length)
+    walks = _run_random_walk(edge_index_dev, rowptr, col, starts, walk_length)
     walks = walks.view(num_groups, -1, walk_length + 1)
 
     group_edges: List[List[Tensor]] = [[] for _ in range(num_groups)]
-    seen = torch.zeros(num_nodes, device=device, dtype=torch.bool)
+    seen = torch.zeros(num_nodes, device=rw_device, dtype=torch.bool)
     for d in range(1, walk_length + 1):
         g = (d - 1) % num_groups
         walks_g = walks[g]
@@ -658,7 +656,7 @@ def compute_hops_random_walk(
     buckets: List[Tensor] = []
     for edges in group_edges:
         if not edges:
-            buckets.append(edge_index.new_zeros((2, 0), dtype=edge_index.dtype))
+            buckets.append(edge_index_dev.new_zeros((2, 0), dtype=edge_index_dev.dtype))
         else:
             buckets.append(torch.cat(edges, dim=1))
     return buckets
@@ -684,16 +682,14 @@ def compute_hop_buckets_random_walk(
 
     inferred_nodes = int(edge_index.max().item()) + 1
     num_nodes = max(num_nodes, inferred_nodes)
-    edge_index = edge_index.to(device)
+    rw_device = torch.device(device)
+    edge_index_dev, rowptr, col = _get_random_walk_graph(edge_index, num_nodes, rw_device)
 
-    adj = SparseTensor(row=edge_index[0], col=edge_index[1], sparse_sizes=(num_nodes, num_nodes)).coalesce()
-    rowptr, col, _ = adj.csr()
-
-    starts = torch.arange(num_nodes, device=device, dtype=torch.long)
+    starts = torch.arange(num_nodes, device=rw_device, dtype=torch.long)
     starts = starts.repeat_interleave(walks_per_node)
-    walks = _run_random_walk(edge_index, rowptr, col, starts, walk_length)
+    walks = _run_random_walk(edge_index_dev, rowptr, col, starts, walk_length)
 
-    buckets = [edge_index.new_zeros((2, 0), dtype=edge_index.dtype) for _ in range(num_buckets)]
+    buckets = [edge_index_dev.new_zeros((2, 0), dtype=edge_index_dev.dtype) for _ in range(num_buckets)]
     query_nodes = walks[:, 0]
     for d in range(1, walk_length + 1):
         kv_nodes = walks[:, d]
@@ -724,7 +720,9 @@ def build_head_hop_edges(
     """
     构建 per-head edge_index 列表。
     当前实现不再按 head 分桶：所有 head 共享同一份随机游走子图。
+    返回单个共享 edge_index，避免调用方把同一张图复制多份后再去重。
     """
+    _ = num_heads
     _ = num_groups  # kept for backward-compatible call signature
     buckets = compute_hop_buckets_random_walk(
         edge_index=edge_index,
@@ -734,8 +732,7 @@ def build_head_hop_edges(
         walk_length=walk_length,
         walks_per_node=walks_per_node,
     )
-    shared_edge_index = buckets[0] if buckets else edge_index.new_zeros((2, 0), dtype=edge_index.dtype)
-    return [shared_edge_index for _ in range(max(1, int(num_heads)))]
+    return buckets[0] if buckets else edge_index.new_zeros((2, 0), dtype=edge_index.dtype)
 
 
 def _run_random_walk(edge_index: Tensor, rowptr: Tensor, col: Tensor, starts: Tensor, walk_length: int) -> Tensor:
@@ -772,16 +769,11 @@ def compute_group_nodes_random_walk(
 
     inferred_nodes = int(edge_index.max().item()) + 1
     num_nodes = max(int(num_nodes), inferred_nodes)
-    edge_index = edge_index.to(device)
-    adj = SparseTensor(
-        row=edge_index[0],
-        col=edge_index[1],
-        sparse_sizes=(num_nodes, num_nodes),
-    ).coalesce()
-    rowptr, col, _ = adj.csr()
+    rw_device = torch.device(device)
+    edge_index_dev, rowptr, col = _get_random_walk_graph(edge_index, num_nodes, rw_device)
 
     group_nodes: List[Tensor] = []
-    all_nodes = torch.arange(num_nodes, device=device, dtype=torch.long)
+    all_nodes = torch.arange(num_nodes, device=rw_device, dtype=torch.long)
     for g in range(num_groups):
         seeds = all_nodes[g::num_groups]
         if seeds.numel() > max_nodes_per_group:
@@ -790,8 +782,8 @@ def compute_group_nodes_random_walk(
             group_nodes.append(seeds)
             continue
         starts = seeds.repeat_interleave(walks_per_node)
-        walks = _run_random_walk(edge_index, rowptr, col, starts, walk_length)
-        seen = torch.zeros(num_nodes, device=device, dtype=torch.bool)
+        walks = _run_random_walk(edge_index_dev, rowptr, col, starts, walk_length)
+        seen = torch.zeros(num_nodes, device=rw_device, dtype=torch.bool)
         seen[seeds] = True
         nodes_g = [seeds]
         total = int(seeds.numel())

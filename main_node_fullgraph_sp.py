@@ -27,6 +27,7 @@ import os
 import time
 import random
 import contextlib
+from concurrent.futures import ThreadPoolExecutor
 import torch.distributed as dist
 from torch_geometric.utils import coalesce
 
@@ -246,37 +247,43 @@ def _build_model(args, feature, y, device):
 
 
 def _build_and_broadcast_edges(args, edge_index_global, N, device, rw_device, sp_group,
-                                sp_src_rank, sp_rank, nodes_per_rank):
+                                sp_src_rank, sp_rank, nodes_per_rank, edge_seed=None):
     """Build sparse-attention edges on src_rank and broadcast to all ranks."""
     if sp_rank == sp_src_rank:
-        parts = []
-        if getattr(args, "include_self_loops", 0):
-            self_loop = torch.arange(N, device=device, dtype=torch.long)
-            self_loop = torch.stack([self_loop, self_loop], dim=0)
-            parts.append(self_loop)
-        if getattr(args, "include_real_edges", 0):
-            parts.append(edge_index_global.to(device))
-        if getattr(args, "head_hop_walks_per_node", 0) > 0:
-            rw_heads = build_head_hop_edges(
-                edge_index=edge_index_global.to(rw_device),
-                num_nodes=N,
-                num_heads=args.num_heads,
-                num_groups=1,
-                device=rw_device,
-                walk_length=getattr(args, "head_hop_walk_length", 4),
-                walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
-            )
-            if isinstance(rw_heads, list):
-                rw_heads = _merge_edge_index_list(rw_heads)
-            if rw_heads.device != torch.device(device):
-                rw_heads = rw_heads.to(device)
-            parts.append(rw_heads)
-        merged = _merge_edge_index_list(parts)
-        if merged is None:
-            merged = edge_index_global.new_zeros((2, 0), dtype=torch.long).to(device)
-        if args.model == "graphormer" and args.num_global_node > 0:
-            merged = fix_edge_index(merged, N)
-            merged = adjust_edge_index_nomerge(merged, nodes_per_rank)
+        seed_ctx = (
+            _fixed_torch_cpu_seed(edge_seed)
+            if edge_seed is not None and torch.device(rw_device).type == "cpu"
+            else contextlib.nullcontext()
+        )
+        with seed_ctx:
+            parts = []
+            if getattr(args, "include_self_loops", 0):
+                self_loop = torch.arange(N, device=device, dtype=torch.long)
+                self_loop = torch.stack([self_loop, self_loop], dim=0)
+                parts.append(self_loop)
+            if getattr(args, "include_real_edges", 0):
+                parts.append(edge_index_global.to(device))
+            if getattr(args, "head_hop_walks_per_node", 0) > 0:
+                rw_heads = build_head_hop_edges(
+                    edge_index=edge_index_global.to(rw_device),
+                    num_nodes=N,
+                    num_heads=args.num_heads,
+                    num_groups=1,
+                    device=rw_device,
+                    walk_length=getattr(args, "head_hop_walk_length", 4),
+                    walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
+                )
+                if isinstance(rw_heads, list):
+                    rw_heads = _merge_edge_index_list(rw_heads)
+                if rw_heads.device != torch.device(device):
+                    rw_heads = rw_heads.to(device)
+                parts.append(rw_heads)
+            merged = _merge_edge_index_list(parts)
+            if merged is None:
+                merged = edge_index_global.new_zeros((2, 0), dtype=torch.long).to(device)
+            if args.model == "graphormer" and args.num_global_node > 0:
+                merged = fix_edge_index(merged, N)
+                merged = adjust_edge_index_nomerge(merged, nodes_per_rank)
         size_t = torch.tensor([merged.shape[1]], device=device, dtype=torch.long)
     else:
         size_t = torch.empty(1, device=device, dtype=torch.long)
@@ -299,6 +306,53 @@ def _pin_cpu_tensor(tensor):
         except RuntimeError:
             return tensor
     return tensor
+
+
+@contextlib.contextmanager
+def _fixed_torch_cpu_seed(seed: int):
+    """Temporarily set CPU torch RNG without touching CUDA RNG state."""
+    torch_state = torch.random.get_rng_state()
+    torch.manual_seed(seed)
+    try:
+        yield
+    finally:
+        torch.random.set_rng_state(torch_state)
+
+
+class _CpuRandomWalkEdgePrefetcher:
+    """Build next epoch's CPU random-walk edges while the current epoch trains."""
+
+    def __init__(self, enabled: bool) -> None:
+        self._executor = ThreadPoolExecutor(max_workers=1) if enabled else None
+        self._future = None
+        self._epoch = None
+
+    @property
+    def enabled(self) -> bool:
+        return self._executor is not None
+
+    def submit(self, epoch: int, fn) -> None:
+        if self._executor is None or epoch <= 0 or self._future is not None:
+            return
+        self._epoch = int(epoch)
+        self._future = self._executor.submit(fn)
+
+    def pop(self, epoch: int):
+        if self._future is None or self._epoch != int(epoch):
+            return None
+        result = self._future.result()
+        self._future = None
+        self._epoch = None
+        return result
+
+    def close(self) -> None:
+        if self._future is not None:
+            self._future.result()
+            self._future = None
+            self._epoch = None
+        if self._executor is not None:
+            self._executor.shutdown(wait=True)
+            self._executor = None
 
 
 def _build_merged_edges(args, edge_index_global, N, final_device, rw_device, nodes_per_rank):
@@ -332,6 +386,37 @@ def _build_merged_edges(args, edge_index_global, N, final_device, rw_device, nod
     if args.model == "graphormer" and args.num_global_node > 0:
         merged = fix_edge_index(merged, N)
         merged = adjust_edge_index_nomerge(merged, nodes_per_rank)
+    return merged
+
+
+def _finalize_attention_edges(args, merged):
+    if args.attn_type == "sparse" and getattr(args, "sparse_query_chunk_size", 0) > 0:
+        return _pack_chunked_edges(merged, args.sparse_query_chunk_size, mode="gpu_chunk")
+    return merged
+
+
+def _build_prefetched_cpu_edges(args, edge_index_global, N, rw_device, nodes_per_rank, edge_seed):
+    seed_ctx = _fixed_torch_cpu_seed(edge_seed) if edge_seed is not None else contextlib.nullcontext()
+    with seed_ctx:
+        merged_cpu = _build_merged_edges(args, edge_index_global, N, "cpu", rw_device, nodes_per_rank)
+    if merged_cpu.device.type == "cpu":
+        merged_cpu = _pin_cpu_tensor(merged_cpu.contiguous())
+    return merged_cpu
+
+
+def _broadcast_prefetched_edges(merged_cpu, device, sp_group, sp_src_rank, sp_rank):
+    if sp_rank == sp_src_rank:
+        merged = merged_cpu.to(device=device, dtype=torch.long, non_blocking=(merged_cpu.device.type == "cpu"))
+        size_t = torch.tensor([merged.shape[1]], device=device, dtype=torch.long)
+    else:
+        size_t = torch.empty(1, device=device, dtype=torch.long)
+        merged = None
+
+    if dist.is_initialized():
+        dist.broadcast(size_t, sp_src_rank, group=sp_group)
+        if sp_rank != sp_src_rank:
+            merged = torch.empty((2, int(size_t.item())), device=device, dtype=torch.long)
+        dist.broadcast(merged, sp_src_rank, group=sp_group)
     return merged
 
 
@@ -421,10 +506,9 @@ def _build_attention_edges(args, edge_index_global, N, device, rw_device, sp_gro
         sp_src_rank,
         sp_rank,
         nodes_per_rank,
+        edge_seed=edge_seed,
     )
-    if args.attn_type == "sparse" and getattr(args, "sparse_query_chunk_size", 0) > 0:
-        return _pack_chunked_edges(merged, args.sparse_query_chunk_size, mode="gpu_chunk")
-    return merged
+    return _finalize_attention_edges(args, merged)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -581,6 +665,15 @@ def main():
     local_train_mask = (train_idx_global >= rank_start) & (train_idx_global < min(rank_end, N))
     local_train_idx = (train_idx_global[local_train_mask] - rank_start).to(device=device, dtype=torch.long)
     local_y = y[rank_start:rank_end].to(device)  # y is already padded to pad_N
+    dynamic_edges = getattr(args, "head_hop_walks_per_node", 0) > 0
+    prefetch_cpu_rw = (
+        dynamic_edges
+        and getattr(args, "random_walk_prefetch", False)
+        and not getattr(args, "stream_edges_from_cpu", False)
+        and rw_device.type == "cpu"
+        and device.startswith("cuda")
+    )
+    edge_prefetcher = _CpuRandomWalkEdgePrefetcher(prefetch_cpu_rw and sp_rank == sp_src_rank)
 
     if args.rank == 0:
         print(f"\n{'='*72}")
@@ -592,6 +685,7 @@ def main():
               f"self={int(bool(args.include_self_loops))} "
               f"rw={int(getattr(args, 'head_hop_walks_per_node', 0) > 0)}")
         print(f"  Random-walk device: {rw_device}")
+        print(f"  CPU RW prefetch: {int(prefetch_cpu_rw)}")
         print(f"  AMP dtype: {args.amp_dtype}")
         print(f"  CPU edge streaming: {int(bool(getattr(args, 'stream_edges_from_cpu', False)))}")
         print(f"  Sparse query chunk size: {getattr(args, 'sparse_query_chunk_size', 0)}")
@@ -624,7 +718,6 @@ def main():
     loss_ema = None
 
     x_local = feature[rank_start:rank_end].to(device)  # [nodes_per_rank, d] – padded if needed
-    dynamic_edges = getattr(args, "head_hop_walks_per_node", 0) > 0
     cached_edge_index = None
     if not dynamic_edges:
         cached_edge_index = _build_attention_edges(
@@ -649,12 +742,32 @@ def main():
         if cached_edge_index is not None:
             edge_index_rw = cached_edge_index
         else:
-            edge_seed = args.seed + epoch if getattr(args, "stream_edges_from_cpu", False) else None
-            edge_index_rw = _build_attention_edges(
-                args, edge_index_global, N, device, rw_device,
-                sp_group, sp_src_rank, sp_rank, local_N,
-                edge_seed=edge_seed,
-            )
+            use_epoch_seed = getattr(args, "stream_edges_from_cpu", False) or prefetch_cpu_rw
+            edge_seed = args.seed + epoch if use_epoch_seed else None
+            prefetched_cpu = edge_prefetcher.pop(epoch) if edge_prefetcher.enabled else None
+            if prefetched_cpu is not None:
+                merged = _broadcast_prefetched_edges(prefetched_cpu, device, sp_group, sp_src_rank, sp_rank)
+                edge_index_rw = _finalize_attention_edges(args, merged)
+            else:
+                edge_index_rw = _build_attention_edges(
+                    args, edge_index_global, N, device, rw_device,
+                    sp_group, sp_src_rank, sp_rank, local_N,
+                    edge_seed=edge_seed,
+                )
+            if edge_prefetcher.enabled and epoch < args.epochs:
+                next_epoch = epoch + 1
+                next_seed = args.seed + next_epoch
+                edge_prefetcher.submit(
+                    next_epoch,
+                    lambda next_seed=next_seed: _build_prefetched_cpu_edges(
+                        args,
+                        edge_index_global,
+                        N,
+                        rw_device,
+                        local_N,
+                        next_seed,
+                    ),
+                )
         rw_time = time.time() - t_rw
 
         # ── Forward ────────────────────────────────────────────────────────
@@ -739,6 +852,8 @@ def main():
 
         if sp_world_size > 1:
             dist.barrier(group=sp_group)
+
+    edge_prefetcher.close()
 
     if args.rank == 0:
         print(f"\n{'='*72}")

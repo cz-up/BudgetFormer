@@ -79,6 +79,12 @@ def add_node_common_args(parser, defaults=None):
         default=defaults.get("stream_edges_from_cpu", False),
         help="keep sparse full-graph edges on CPU and stream dst-sorted chunks to GPU",
     )
+    parser.add_argument(
+        "--random_walk_prefetch",
+        action="store_true",
+        default=defaults.get("random_walk_prefetch", False),
+        help="prefetch next epoch's CPU random-walk edges in a background thread (full-graph SP)",
+    )
 
     parser.add_argument("--rank", type=int, default=defaults.get("rank"))
     parser.add_argument("--local-rank", "--local_rank", type=int, default=defaults.get("local_rank"))
