@@ -264,9 +264,6 @@ def get_dataset(dataset_name, split_id: int = 0):
         # sp.save_npz(dataset_dir + dataset_name + '/adj.npz', adj)
         # sp.save_npz(dataset_dir + dataset_name + '/normalized_adj.npz', normalized_adj)
         dataset_dir = './dataset/'
-        torch.save(data_x, dataset_dir + dataset_name + '/x.pt')
-        torch.save(data_y, dataset_dir + dataset_name + '/y.pt')
-        torch.save(edge_index, dataset_dir + dataset_name + '/edge_index.pt')
         if 'split_idx' in locals():
             torch.save(
                 {
@@ -276,6 +273,9 @@ def get_dataset(dataset_name, split_id: int = 0):
                 },
                 dataset_dir + dataset_name + '/split_idx.pt'
             )
+        torch.save(data_x, dataset_dir + dataset_name + '/x.pt')
+        torch.save(data_y, dataset_dir + dataset_name + '/y.pt')
+        torch.save(edge_index, dataset_dir + dataset_name + '/edge_index.pt')
         # sp.save_npz(dataset_dir + dataset_name + '/column_normalized_adj.npz', column_normalized_adj)
 
 

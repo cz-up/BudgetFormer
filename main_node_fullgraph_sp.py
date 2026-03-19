@@ -23,7 +23,10 @@ Evaluation:
 import torch
 import torch.nn.functional as F
 import numpy as np
+import gc
 import os
+import resource
+import sys
 import time
 import random
 import contextlib
@@ -100,6 +103,34 @@ def _set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def _get_process_rss_mib() -> float:
+    try:
+        with open("/proc/self/statm", "r", encoding="utf-8") as handle:
+            fields = handle.readline().strip().split()
+        if len(fields) >= 2:
+            rss_pages = int(fields[1])
+            page_size = os.sysconf("SC_PAGE_SIZE")
+            return rss_pages * page_size / (1024 ** 2)
+    except Exception:
+        pass
+    return _get_process_peak_rss_mib()
+
+
+def _get_process_peak_rss_mib() -> float:
+    usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    if sys.platform == "darwin":
+        return usage / (1024 ** 2)
+    return usage / 1024.0
+
+
+def _maybe_cuda_empty_cache(args) -> None:
+    if not getattr(args, "cuda_empty_cache", False):
+        return
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def _to_bidirected_edge_index(edge_index: torch.Tensor, num_nodes: int) -> torch.Tensor:
@@ -265,7 +296,11 @@ def _build_and_broadcast_edges(args, edge_index_global, N, device, rw_device, sp
                 parts.append(edge_index_global.to(device))
             if getattr(args, "head_hop_walks_per_node", 0) > 0:
                 rw_heads = build_head_hop_edges(
-                    edge_index=edge_index_global.to(rw_device),
+                    # Keep the original graph tensor stable across epochs.
+                    # _get_random_walk_graph() caches by the input tensor identity;
+                    # passing a fresh GPU copy here makes rank0 accumulate a new
+                    # cached CSR every epoch when rw_device is CUDA.
+                    edge_index=edge_index_global,
                     num_nodes=N,
                     num_heads=args.num_heads,
                     num_groups=1,
@@ -366,7 +401,9 @@ def _build_merged_edges(args, edge_index_global, N, final_device, rw_device, nod
         parts.append(edge_index_global.to(final_torch_device))
     if getattr(args, "head_hop_walks_per_node", 0) > 0:
         rw_heads = build_head_hop_edges(
-            edge_index=edge_index_global.to(rw_device),
+            # See _build_and_broadcast_edges(): keep the source edge tensor stable
+            # so the random-walk graph cache can be reused across epochs.
+            edge_index=edge_index_global,
             num_nodes=N,
             num_heads=args.num_heads,
             num_groups=1,
@@ -582,6 +619,7 @@ def _eval_sp(args, model, feature, y, split_idx, edge_index_global, N,
     else:
         pred_global = pred_local.cpu()
 
+    result = None
     if args.rank == 0:
         valid_n = min(int(pred_global.size(0)), int(N))
         pred_global = pred_global[:valid_n]
@@ -591,8 +629,13 @@ def _eval_sp(args, model, feature, y, split_idx, edge_index_global, N,
             idx_valid = idx[idx < valid_n]
             correct = (pred_global[idx_valid] == y_cpu[idx_valid]).sum().item()
             accs[sname] = float(correct) / max(1, len(idx_valid))
-        return accs
-    return None
+        result = accs
+
+    del pred_local, pred_global, out_local, x_local
+    if cached_edge_index is None:
+        del edge_index_eval
+    _maybe_cuda_empty_cache(args)
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -816,11 +859,23 @@ def main():
         loss_val = loss.item()
         loss_ema = loss_val if loss_ema is None else 0.9 * loss_ema + 0.1 * loss_val
 
+        del out_local, loss, local_y_eff, valid_train_mask, local_train_idx_eff
+        if cached_edge_index is None:
+            del edge_index_rw
+        if 'merged' in locals():
+            del merged
+        if 'prefetched_cpu' in locals():
+            del prefetched_cpu
+        _maybe_cuda_empty_cache(args)
+
         epoch_time = time.time() - t_epoch
+        cpu_rss = _get_process_rss_mib()
+        cpu_rss_peak = _get_process_peak_rss_mib()
         if args.rank == 0:
             print(f"Epoch {epoch:04d} | loss={loss_val:.4f} (ema={loss_ema:.4f}) "
                   f"| t={epoch_time:.2f}s "
-                  f"(rw={rw_time:.2f}s fwd={fwd_time:.2f}s bwd={bwd_time:.2f}s)")
+                  f"(rw={rw_time:.2f}s fwd={fwd_time:.2f}s bwd={bwd_time:.2f}s) "
+                  f"| cpu_rss={cpu_rss:.1f}/{cpu_rss_peak:.1f} MiB")
 
         # ── Evaluation ─────────────────────────────────────────────────────
         if epoch % args.eval_every == 0:
@@ -849,6 +904,8 @@ def main():
                 if test_acc > best_test:
                     best_test = test_acc
                 print(f"  ↳ Best: epoch={best_epoch}  val={best_val:.2%}  test={best_test:.2%}")
+            del accs
+            _maybe_cuda_empty_cache(args)
 
         if sp_world_size > 1:
             dist.barrier(group=sp_group)
@@ -874,6 +931,20 @@ def main():
                     print(f"  rank {r}: allocated={t[0]:.1f}  reserved={t[1]:.1f}")
         else:
             print(f"Peak GPU memory: allocated={alloc:.1f} MiB  reserved={rsvd:.1f} MiB")
+
+    cpu_rss = _get_process_rss_mib()
+    cpu_rss_peak = _get_process_peak_rss_mib()
+    cpu_mem_device = device if torch.cuda.is_available() else "cpu"
+    if dist.is_initialized():
+        mem = torch.tensor([cpu_rss, cpu_rss_peak], device=cpu_mem_device, dtype=torch.float32)
+        gathered = [torch.zeros_like(mem) for _ in range(dist.get_world_size())]
+        dist.all_gather(gathered, mem)
+        if args.rank == 0:
+            print("CPU RSS per rank (MiB):")
+            for r, t in enumerate(gathered):
+                print(f"  rank {r}: current={t[0]:.1f}  peak={t[1]:.1f}")
+    elif args.rank == 0:
+        print(f"CPU RSS: current={cpu_rss:.1f} MiB  peak={cpu_rss_peak:.1f} MiB")
 
 
 if __name__ == "__main__":
