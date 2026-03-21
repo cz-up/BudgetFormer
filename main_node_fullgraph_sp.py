@@ -278,7 +278,8 @@ def _build_model(args, feature, y, device):
 
 
 def _build_and_broadcast_edges(args, edge_index_global, N, device, rw_device, sp_group,
-                                sp_src_rank, sp_rank, nodes_per_rank, edge_seed=None):
+                                sp_src_rank, sp_rank, nodes_per_rank, edge_seed=None,
+                                edge_budget_state=None):
     """Build sparse-attention edges on src_rank and broadcast to all ranks."""
     if sp_rank == sp_src_rank:
         seed_ctx = (
@@ -292,9 +293,11 @@ def _build_and_broadcast_edges(args, edge_index_global, N, device, rw_device, sp
                 self_loop = torch.arange(N, device=device, dtype=torch.long)
                 self_loop = torch.stack([self_loop, self_loop], dim=0)
                 parts.append(self_loop)
-            if getattr(args, "include_real_edges", 0):
-                parts.append(edge_index_global.to(device))
-            if getattr(args, "head_hop_walks_per_node", 0) > 0:
+            real_edges = None
+            if _use_real_edges_for_state(args, edge_budget_state):
+                real_edges = edge_index_global.to(device)
+            rw_heads = None
+            if _use_rw_edges(args, edge_budget_state):
                 rw_heads = build_head_hop_edges(
                     # Keep the original graph tensor stable across epochs.
                     # _get_random_walk_graph() caches by the input tensor identity;
@@ -312,6 +315,12 @@ def _build_and_broadcast_edges(args, edge_index_global, N, device, rw_device, sp
                     rw_heads = _merge_edge_index_list(rw_heads)
                 if rw_heads.device != torch.device(device):
                     rw_heads = rw_heads.to(device)
+            real_edges, rw_heads = _sample_random_edge_blocks_with_state(
+                args, real_edges, rw_heads, edge_seed=edge_seed, edge_budget_state=edge_budget_state
+            )
+            if real_edges is not None:
+                parts.append(real_edges)
+            if rw_heads is not None:
                 parts.append(rw_heads)
             merged = _merge_edge_index_list(parts)
             if merged is None:
@@ -341,6 +350,338 @@ def _pin_cpu_tensor(tensor):
         except RuntimeError:
             return tensor
     return tensor
+
+
+def _random_block_sampling_enabled(args) -> bool:
+    return bool(getattr(args, "random_edge_blocks", False))
+
+
+def _adaptive_edge_budget_enabled(args) -> bool:
+    return bool(getattr(args, "adaptive_edge_budget", False))
+
+
+def _get_real_edge_budget(args, edge_budget_state=None) -> int:
+    if edge_budget_state is not None and "real_edges_per_query" in edge_budget_state:
+        return int(edge_budget_state["real_edges_per_query"])
+    return int(getattr(args, "real_edges_per_query", 0))
+
+
+def _get_rw_edge_budget(args, edge_budget_state=None) -> int:
+    if edge_budget_state is not None and "rw_edges_per_query" in edge_budget_state:
+        return int(edge_budget_state["rw_edges_per_query"])
+    return int(getattr(args, "rw_edges_per_query", 0))
+
+
+def _use_real_edges(args) -> bool:
+    if _random_block_sampling_enabled(args) and int(getattr(args, "real_edges_per_query", 0)) > 0:
+        return True
+    return bool(getattr(args, "include_real_edges", 0))
+
+
+def _use_real_edges_for_state(args, edge_budget_state=None) -> bool:
+    if _random_block_sampling_enabled(args):
+        return _get_real_edge_budget(args, edge_budget_state) > 0
+    return bool(getattr(args, "include_real_edges", 0))
+
+
+def _use_rw_edges(args, edge_budget_state=None) -> bool:
+    if int(getattr(args, "head_hop_walks_per_node", 0)) <= 0:
+        return False
+    if _random_block_sampling_enabled(args):
+        return _get_rw_edge_budget(args, edge_budget_state) > 0
+    return True
+
+
+def _edge_block_seed(args, edge_seed, offset: int) -> int:
+    base = getattr(args, "seed", 0) if edge_seed is None else int(edge_seed)
+    return int(base) + int(offset)
+
+
+def _sample_edges_per_query_random(edge_index, max_edges_per_query: int, seed: int):
+    if edge_index is None or edge_index.numel() == 0 or int(max_edges_per_query) <= 0:
+        return edge_index
+
+    max_edges_per_query = int(max_edges_per_query)
+    src = edge_index[0].to(torch.long)
+    dst = edge_index[1].to(torch.long)
+    if src.numel() <= max_edges_per_query:
+        return edge_index
+
+    # Build a per-edge pseudo-random key and sort by (dst, rand_key).
+    scale = 1 << 31
+    rand_key = torch.remainder(
+        src * 1103515245 + dst * 214013 + int(seed) * 2654435761 + 12345,
+        scale,
+    )
+    composite = dst * scale + rand_key
+    perm = torch.argsort(composite)
+    dst_sorted = dst[perm]
+
+    arange = torch.arange(dst_sorted.numel(), device=dst_sorted.device, dtype=torch.long)
+    is_new = torch.ones_like(dst_sorted, dtype=torch.bool)
+    is_new[1:] = dst_sorted[1:] != dst_sorted[:-1]
+    group_starts = torch.where(is_new, arange, torch.zeros_like(arange))
+    group_starts = torch.cummax(group_starts, dim=0).values
+    pos_in_group = arange - group_starts
+    keep = pos_in_group < max_edges_per_query
+    return edge_index[:, perm[keep]]
+
+
+def _sample_random_edge_blocks(args, real_edges, rw_edges, edge_seed=None):
+    if not _random_block_sampling_enabled(args):
+        return real_edges, rw_edges
+
+    if real_edges is not None and int(getattr(args, "real_edges_per_query", 0)) > 0:
+        real_edges = _sample_edges_per_query_random(
+            real_edges,
+            getattr(args, "real_edges_per_query", 0),
+            _edge_block_seed(args, edge_seed, 17),
+        )
+
+    if rw_edges is not None and int(getattr(args, "rw_edges_per_query", 0)) > 0:
+        rw_edges = _sample_edges_per_query_random(
+            rw_edges,
+            getattr(args, "rw_edges_per_query", 0),
+            _edge_block_seed(args, edge_seed, 37),
+        )
+
+    return real_edges, rw_edges
+
+
+def _sample_random_edge_blocks_with_state(args, real_edges, rw_edges, edge_seed=None, edge_budget_state=None):
+    if not _random_block_sampling_enabled(args):
+        return real_edges, rw_edges
+
+    real_budget = _get_real_edge_budget(args, edge_budget_state)
+    rw_budget = _get_rw_edge_budget(args, edge_budget_state)
+
+    if real_edges is not None and real_budget > 0:
+        real_edges = _sample_edges_per_query_random(
+            real_edges,
+            real_budget,
+            _edge_block_seed(args, edge_seed, 17),
+        )
+
+    if rw_edges is not None and rw_budget > 0:
+        rw_edges = _sample_edges_per_query_random(
+            rw_edges,
+            rw_budget,
+            _edge_block_seed(args, edge_seed, 37),
+        )
+
+    return real_edges, rw_edges
+
+
+class _AdaptiveEdgeBudgetController:
+    def __init__(self, args) -> None:
+        self.enabled = _adaptive_edge_budget_enabled(args)
+        self.block_size = max(1, int(getattr(args, "adaptive_edge_budget_block_size", 2)))
+        self.max_real = max(0, int(getattr(args, "real_edges_per_query", 0)))
+        self.max_rw = max(0, int(getattr(args, "rw_edges_per_query", 0)))
+        self.warmup_epochs = max(0, int(getattr(args, "adaptive_edge_budget_warmup_epochs", 0)))
+        self.gain_threshold = float(getattr(args, "adaptive_edge_budget_gain_threshold", 0.0))
+        self.patience = max(3, int(getattr(args, "adaptive_edge_budget_patience", 1)))
+        self.bad_rounds = 0
+        self.frozen = not self.enabled
+        if not self.enabled:
+            self.real_budget = self.max_real
+            self.rw_budget = self.max_rw
+            return
+
+        self.real_budget = min(self.block_size, self.max_real) if self.max_real > 0 else 0
+        self.rw_budget = min(self.block_size, self.max_rw) if self.max_rw > 0 else 0
+        if self.warmup_epochs <= 0:
+            self.frozen = True
+
+    def current_state(self):
+        return {
+            "real_edges_per_query": int(self.real_budget),
+            "rw_edges_per_query": int(self.rw_budget),
+        }
+
+    def candidate_states(self):
+        out = {}
+        if self.real_budget < self.max_real:
+            out["real"] = {
+                "real_edges_per_query": min(self.max_real, self.real_budget + self.block_size),
+                "rw_edges_per_query": self.rw_budget,
+            }
+        if self.rw_budget < self.max_rw:
+            out["rw"] = {
+                "real_edges_per_query": self.real_budget,
+                "rw_edges_per_query": min(self.max_rw, self.rw_budget + self.block_size),
+            }
+        return out
+
+    def update(self, choice, best_gain, next_state=None):
+        if next_state is not None and choice is not None:
+            self.real_budget = int(next_state["real_edges_per_query"])
+            self.rw_budget = int(next_state["rw_edges_per_query"])
+            self.bad_rounds = 0
+            return
+        if best_gain <= self.gain_threshold:
+            self.bad_rounds += 1
+            if self.bad_rounds >= self.patience:
+                self.frozen = True
+
+
+def _select_probe_nodes(split_idx, probe_size: int, seed: int):
+    probe_size = max(0, int(probe_size))
+    if probe_size <= 0:
+        return None
+    valid_idx = split_idx.get("valid")
+    if valid_idx is None or valid_idx.numel() == 0:
+        return None
+    valid_idx = valid_idx.to(torch.long).cpu()
+    if valid_idx.numel() <= probe_size:
+        return valid_idx
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(int(seed))
+    perm = torch.randperm(valid_idx.numel(), generator=gen)[:probe_size]
+    return valid_idx.index_select(0, perm).to(torch.long)
+
+
+def _resolve_adaptive_edge_budget_args(args, split_idx):
+    if not _adaptive_edge_budget_enabled(args):
+        return
+    args.random_edge_blocks = True
+    if getattr(args, "adaptive_edge_budget_probe_size", 0) <= 0:
+        valid_idx = split_idx.get("valid")
+        valid_n = int(valid_idx.numel()) if valid_idx is not None else 0
+        args.adaptive_edge_budget_probe_size = min(512, valid_n) if valid_n > 0 else 0
+    if getattr(args, "adaptive_edge_budget_block_size", 0) <= 0:
+        args.adaptive_edge_budget_block_size = 2
+    if getattr(args, "adaptive_edge_budget_warmup_epochs", 0) <= 0:
+        args.adaptive_edge_budget_warmup_epochs = max(1, min(5, max(1, int(args.epochs) // 10)))
+    if getattr(args, "adaptive_edge_budget_patience", 0) <= 0:
+        args.adaptive_edge_budget_patience = 1
+
+
+def _edge_count(attn_edges) -> int:
+    if isinstance(attn_edges, dict):
+        return int(attn_edges["src"].numel())
+    return int(attn_edges.size(1))
+
+
+def _probe_loss_sp(args, model, x_local, local_y, local_probe_idx, edge_index_probe,
+                   device, amp_dtype, sp_group, sp_world_size):
+    was_training = model.training
+    model.train()
+    drop_states = _set_dropout_eval(model)
+
+    loss_sum = torch.zeros(1, device=device, dtype=torch.float32)
+    count = torch.zeros(1, device=device, dtype=torch.long)
+    with torch.no_grad():
+        with _autocast_context(device, amp_dtype):
+            out_local = model(x_local, None, edge_index_probe, attn_type=args.attn_type)
+        out_rows = int(out_local.size(0))
+        if local_probe_idx is not None and local_probe_idx.numel() > 0:
+            valid_probe = (local_probe_idx >= 0) & (local_probe_idx < out_rows)
+            probe_idx_eff = local_probe_idx[valid_probe]
+            if probe_idx_eff.numel() > 0:
+                local_y_eff = local_y[:out_rows]
+                loss_sum = F.nll_loss(
+                    out_local.index_select(0, probe_idx_eff),
+                    local_y_eff.index_select(0, probe_idx_eff).long(),
+                    reduction="sum",
+                ).to(torch.float32).view(1)
+                count = torch.tensor([probe_idx_eff.numel()], device=device, dtype=torch.long)
+
+    if sp_world_size > 1:
+        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM, group=sp_group)
+        dist.all_reduce(count, op=dist.ReduceOp.SUM, group=sp_group)
+
+    _restore_dropout(drop_states)
+    if not was_training:
+        model.eval()
+
+    mean_loss = float(loss_sum.item() / max(int(count.item()), 1))
+    del out_local
+    _maybe_cuda_empty_cache(args)
+    return mean_loss
+
+
+def _maybe_update_edge_budget(
+    args,
+    controller,
+    epoch: int,
+    model,
+    x_local,
+    local_y,
+    local_probe_idx,
+    edge_index_global,
+    N,
+    device,
+    rw_device,
+    sp_group,
+    sp_src_rank,
+    sp_rank,
+    local_N,
+    amp_dtype,
+    sp_world_size,
+):
+    if (not controller.enabled) or controller.frozen or epoch > controller.warmup_epochs:
+        return
+    if local_probe_idx is None:
+        controller.frozen = True
+        return
+
+    probe_seed = int(getattr(args, "seed", 0)) + 100000 + int(epoch)
+    base_state = controller.current_state()
+    base_edges = _build_attention_edges(
+        args, edge_index_global, N, device, rw_device,
+        sp_group, sp_src_rank, sp_rank, local_N,
+        edge_seed=probe_seed,
+        edge_budget_state=base_state,
+    )
+    base_loss = _probe_loss_sp(
+        args, model, x_local, local_y, local_probe_idx, base_edges,
+        device, amp_dtype, sp_group, sp_world_size,
+    )
+    base_count = _edge_count(base_edges)
+    del base_edges
+
+    best_kind = None
+    best_gain = float("-inf")
+    best_state = None
+    best_loss = None
+    best_count = None
+    for kind, cand_state in controller.candidate_states().items():
+        cand_edges = _build_attention_edges(
+            args, edge_index_global, N, device, rw_device,
+            sp_group, sp_src_rank, sp_rank, local_N,
+            edge_seed=probe_seed,
+            edge_budget_state=cand_state,
+        )
+        cand_loss = _probe_loss_sp(
+            args, model, x_local, local_y, local_probe_idx, cand_edges,
+            device, amp_dtype, sp_group, sp_world_size,
+        )
+        cand_count = _edge_count(cand_edges)
+        delta_edges = max(cand_count - base_count, 1)
+        gain = (base_loss - cand_loss) / float(delta_edges)
+        if gain > best_gain:
+            best_kind = kind
+            best_gain = gain
+            best_state = cand_state
+            best_loss = cand_loss
+            best_count = cand_count
+        del cand_edges
+
+    controller.update(best_kind if best_gain > controller.gain_threshold else None,
+                      best_gain, best_state if best_gain > controller.gain_threshold else None)
+
+    if args.rank == 0:
+        print(
+            f"  ↳ BudgetCtrl epoch={epoch} probe_loss={base_loss:.4f} "
+            f"edges={base_count} choice={best_kind} gain={best_gain:.6e} "
+            f"next_real={controller.real_budget} next_rw={controller.rw_budget}"
+            + (
+                f" cand_loss={best_loss:.4f} cand_edges={best_count}"
+                if best_loss is not None and best_count is not None
+                else ""
+            )
+        )
 
 
 @contextlib.contextmanager
@@ -390,16 +731,19 @@ class _CpuRandomWalkEdgePrefetcher:
             self._executor = None
 
 
-def _build_merged_edges(args, edge_index_global, N, final_device, rw_device, nodes_per_rank):
+def _build_merged_edges(args, edge_index_global, N, final_device, rw_device, nodes_per_rank,
+                        edge_seed=None, edge_budget_state=None):
     parts = []
     final_torch_device = torch.device(final_device)
     if getattr(args, "include_self_loops", 0):
         self_loop = torch.arange(N, device=final_torch_device, dtype=torch.long)
         self_loop = torch.stack([self_loop, self_loop], dim=0)
         parts.append(self_loop)
-    if getattr(args, "include_real_edges", 0):
-        parts.append(edge_index_global.to(final_torch_device))
-    if getattr(args, "head_hop_walks_per_node", 0) > 0:
+    real_edges = None
+    if _use_real_edges_for_state(args, edge_budget_state):
+        real_edges = edge_index_global.to(final_torch_device)
+    rw_heads = None
+    if _use_rw_edges(args, edge_budget_state):
         rw_heads = build_head_hop_edges(
             # See _build_and_broadcast_edges(): keep the source edge tensor stable
             # so the random-walk graph cache can be reused across epochs.
@@ -416,7 +760,13 @@ def _build_merged_edges(args, edge_index_global, N, final_device, rw_device, nod
         if rw_heads is not None:
             if rw_heads.device != final_torch_device:
                 rw_heads = rw_heads.to(final_torch_device)
-            parts.append(rw_heads)
+    real_edges, rw_heads = _sample_random_edge_blocks_with_state(
+        args, real_edges, rw_heads, edge_seed=edge_seed, edge_budget_state=edge_budget_state
+    )
+    if real_edges is not None:
+        parts.append(real_edges)
+    if rw_heads is not None:
+        parts.append(rw_heads)
     merged = _merge_edge_index_list(parts)
     if merged is None:
         merged = edge_index_global.new_zeros((2, 0), dtype=torch.long).to(final_torch_device)
@@ -432,10 +782,14 @@ def _finalize_attention_edges(args, merged):
     return merged
 
 
-def _build_prefetched_cpu_edges(args, edge_index_global, N, rw_device, nodes_per_rank, edge_seed):
+def _build_prefetched_cpu_edges(args, edge_index_global, N, rw_device, nodes_per_rank, edge_seed,
+                                edge_budget_state=None):
     seed_ctx = _fixed_torch_cpu_seed(edge_seed) if edge_seed is not None else contextlib.nullcontext()
     with seed_ctx:
-        merged_cpu = _build_merged_edges(args, edge_index_global, N, "cpu", rw_device, nodes_per_rank)
+        merged_cpu = _build_merged_edges(
+            args, edge_index_global, N, "cpu", rw_device, nodes_per_rank,
+            edge_seed=edge_seed, edge_budget_state=edge_budget_state
+        )
     if merged_cpu.device.type == "cpu":
         merged_cpu = _pin_cpu_tensor(merged_cpu.contiguous())
     return merged_cpu
@@ -515,15 +869,20 @@ def _pack_chunked_edges(merged, chunk_size, mode):
     return payload
 
 
-def _build_streaming_edges(args, edge_index_global, N, rw_device, nodes_per_rank, edge_seed=None):
+def _build_streaming_edges(args, edge_index_global, N, rw_device, nodes_per_rank, edge_seed=None,
+                           edge_budget_state=None):
     seed_ctx = fixed_random_seed(edge_seed) if edge_seed is not None else contextlib.nullcontext()
     with seed_ctx:
-        merged = _build_merged_edges(args, edge_index_global, N, "cpu", rw_device, nodes_per_rank)
+        merged = _build_merged_edges(
+            args, edge_index_global, N, "cpu", rw_device, nodes_per_rank,
+            edge_seed=edge_seed, edge_budget_state=edge_budget_state
+        )
     return _pack_chunked_edges(merged, args.sparse_query_chunk_size, mode="cpu_stream")
 
 
 def _build_attention_edges(args, edge_index_global, N, device, rw_device, sp_group,
-                           sp_src_rank, sp_rank, nodes_per_rank, edge_seed=None):
+                           sp_src_rank, sp_rank, nodes_per_rank, edge_seed=None,
+                           edge_budget_state=None):
     if getattr(args, "stream_edges_from_cpu", False):
         return _build_streaming_edges(
             args,
@@ -532,6 +891,7 @@ def _build_attention_edges(args, edge_index_global, N, device, rw_device, sp_gro
             rw_device,
             nodes_per_rank,
             edge_seed=edge_seed,
+            edge_budget_state=edge_budget_state,
         )
     merged = _build_and_broadcast_edges(
         args,
@@ -544,6 +904,7 @@ def _build_attention_edges(args, edge_index_global, N, device, rw_device, sp_gro
         sp_rank,
         nodes_per_rank,
         edge_seed=edge_seed,
+        edge_budget_state=edge_budget_state,
     )
     return _finalize_attention_edges(args, merged)
 
@@ -566,7 +927,8 @@ def _restore_dropout(states):
 
 def _eval_sp(args, model, feature, y, split_idx, edge_index_global, N,
              device, rw_device, sp_group, sp_src_rank, sp_rank, sp_world_size,
-             rank_start, rank_end, local_N, amp_dtype=None, cached_edge_index=None):
+             rank_start, rank_end, local_N, amp_dtype=None, cached_edge_index=None,
+             edge_budget_state=None):
     """Full-graph SP evaluation.
 
     Runs in model.train() mode so _SeqAllToAll is triggered and each rank
@@ -580,6 +942,7 @@ def _eval_sp(args, model, feature, y, split_idx, edge_index_global, N,
                 args, edge_index_global, N, device, rw_device,
                 sp_group, sp_src_rank, sp_rank, local_N,
                 edge_seed=args.seed if getattr(args, "stream_edges_from_cpu", False) else None,
+                edge_budget_state=edge_budget_state,
             )
     else:
         edge_index_eval = cached_edge_index
@@ -662,6 +1025,8 @@ def main():
         raise ValueError("--stream_edges_from_cpu currently requires --attn_type sparse.")
     if args.stream_edges_from_cpu and args.sparse_query_chunk_size <= 0:
         raise ValueError("--stream_edges_from_cpu requires --sparse_query_chunk_size > 0.")
+    if _adaptive_edge_budget_enabled(args) and args.random_walk_prefetch:
+        raise ValueError("--adaptive_edge_budget is not compatible with --random_walk_prefetch.")
 
     # ── Distributed init ────────────────────────────────────────────────────
     initialize_distributed(args)
@@ -683,6 +1048,7 @@ def main():
     # ── Load data ─────────────────────────────────────────────────────────
     feature, y, edge_index_global, N, split_idx = _load_data(args)
     feature = feature.float()
+    _resolve_adaptive_edge_budget_args(args, split_idx)
 
     # ── Per-rank node slice ───────────────────────────────────────────────
     # _SeqAllToAll requires equal seq-dim length on all ranks: pad N to multiple of P
@@ -708,7 +1074,25 @@ def main():
     local_train_mask = (train_idx_global >= rank_start) & (train_idx_global < min(rank_end, N))
     local_train_idx = (train_idx_global[local_train_mask] - rank_start).to(device=device, dtype=torch.long)
     local_y = y[rank_start:rank_end].to(device)  # y is already padded to pad_N
-    dynamic_edges = getattr(args, "head_hop_walks_per_node", 0) > 0
+    edge_budget_controller = _AdaptiveEdgeBudgetController(args)
+    probe_idx_global = _select_probe_nodes(
+        split_idx,
+        getattr(args, "adaptive_edge_budget_probe_size", 0),
+        getattr(args, "seed", 0),
+    ) if edge_budget_controller.enabled else None
+    if probe_idx_global is not None:
+        local_probe_mask = (probe_idx_global >= rank_start) & (probe_idx_global < min(rank_end, N))
+        local_probe_idx = (probe_idx_global[local_probe_mask] - rank_start).to(device=device, dtype=torch.long)
+    else:
+        local_probe_idx = None
+    random_blocks_dynamic = (
+        (_random_block_sampling_enabled(args) or edge_budget_controller.enabled)
+        and (
+            (_use_real_edges(args) and max(getattr(args, "real_edges_per_query", 0), edge_budget_controller.real_budget) > 0)
+            or (int(getattr(args, "head_hop_walks_per_node", 0)) > 0 and max(getattr(args, "rw_edges_per_query", 0), edge_budget_controller.rw_budget) > 0)
+        )
+    )
+    dynamic_edges = _use_rw_edges(args) or random_blocks_dynamic
     prefetch_cpu_rw = (
         dynamic_edges
         and getattr(args, "random_walk_prefetch", False)
@@ -724,14 +1108,22 @@ def main():
         print(f"  Nodes per rank: {nodes_per_rank:,}  "
               f"(rank {sp_rank}: {rank_start:,}–{rank_end:,})")
         print(f"  Edge_index: full graph E={edge_index_global.shape[1]:,}")
-        print(f"  Sparse edges: real={int(bool(args.include_real_edges))} "
+        print(f"  Sparse edges: real={int(_use_real_edges(args))} "
               f"self={int(bool(args.include_self_loops))} "
-              f"rw={int(getattr(args, 'head_hop_walks_per_node', 0) > 0)}")
+              f"rw={int(_use_rw_edges(args))}")
         print(f"  Random-walk device: {rw_device}")
         print(f"  CPU RW prefetch: {int(prefetch_cpu_rw)}")
         print(f"  AMP dtype: {args.amp_dtype}")
         print(f"  CPU edge streaming: {int(bool(getattr(args, 'stream_edges_from_cpu', False)))}")
         print(f"  Sparse query chunk size: {getattr(args, 'sparse_query_chunk_size', 0)}")
+        print(f"  Random edge blocks: {int(bool(_random_block_sampling_enabled(args)))} "
+              f"(real={getattr(args, 'real_edges_per_query', 0)} "
+              f"rw={getattr(args, 'rw_edges_per_query', 0)})")
+        print(f"  Adaptive edge budget: {int(edge_budget_controller.enabled)} "
+              f"(probe={getattr(args, 'adaptive_edge_budget_probe_size', 0)} "
+              f"block={edge_budget_controller.block_size} "
+              f"warmup={edge_budget_controller.warmup_epochs} "
+              f"patience={edge_budget_controller.patience})")
         print(f"{'='*72}\n")
 
     # ── Build model ───────────────────────────────────────────────────────
@@ -773,6 +1165,7 @@ def main():
             sp_src_rank,
             sp_rank,
             local_N,
+            edge_budget_state=edge_budget_controller.current_state(),
         )
 
     for epoch in range(1, args.epochs + 1):
@@ -785,7 +1178,11 @@ def main():
         if cached_edge_index is not None:
             edge_index_rw = cached_edge_index
         else:
-            use_epoch_seed = getattr(args, "stream_edges_from_cpu", False) or prefetch_cpu_rw
+            use_epoch_seed = (
+                getattr(args, "stream_edges_from_cpu", False)
+                or prefetch_cpu_rw
+                or random_blocks_dynamic
+            )
             edge_seed = args.seed + epoch if use_epoch_seed else None
             prefetched_cpu = edge_prefetcher.pop(epoch) if edge_prefetcher.enabled else None
             if prefetched_cpu is not None:
@@ -796,6 +1193,7 @@ def main():
                     args, edge_index_global, N, device, rw_device,
                     sp_group, sp_src_rank, sp_rank, local_N,
                     edge_seed=edge_seed,
+                    edge_budget_state=edge_budget_controller.current_state(),
                 )
             if edge_prefetcher.enabled and epoch < args.epochs:
                 next_epoch = epoch + 1
@@ -885,6 +1283,7 @@ def main():
                 device, rw_device, sp_group, sp_src_rank, sp_rank, sp_world_size,
                 rank_start, rank_end, local_N, amp_dtype=amp_dtype,
                 cached_edge_index=cached_edge_index,
+                edge_budget_state=edge_budget_controller.current_state(),
             )
             eval_time = time.time() - t_eval
 
@@ -906,6 +1305,26 @@ def main():
                 print(f"  ↳ Best: epoch={best_epoch}  val={best_val:.2%}  test={best_test:.2%}")
             del accs
             _maybe_cuda_empty_cache(args)
+
+        _maybe_update_edge_budget(
+            args,
+            edge_budget_controller,
+            epoch,
+            model,
+            x_local,
+            local_y,
+            local_probe_idx,
+            edge_index_global,
+            N,
+            device,
+            rw_device,
+            sp_group,
+            sp_src_rank,
+            sp_rank,
+            local_N,
+            amp_dtype,
+            sp_world_size,
+        )
 
         if sp_world_size > 1:
             dist.barrier(group=sp_group)

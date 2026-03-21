@@ -85,6 +85,60 @@ def add_node_common_args(parser, defaults=None):
         default=defaults.get("random_walk_prefetch", False),
         help="prefetch next epoch's CPU random-walk edges in a background thread (full-graph SP)",
     )
+    parser.add_argument(
+        "--random_edge_blocks",
+        action="store_true",
+        default=defaults.get("random_edge_blocks", False),
+        help="for full-graph sparse attention, randomly sample per-query real/RW edge blocks before merging; enabled automatically with --adaptive_edge_budget",
+    )
+    parser.add_argument(
+        "--real_edges_per_query",
+        type=int,
+        default=defaults.get("real_edges_per_query", 0),
+        help="when --random_edge_blocks is enabled, keep at most this many real edges per query (<=0 disables)",
+    )
+    parser.add_argument(
+        "--rw_edges_per_query",
+        type=int,
+        default=defaults.get("rw_edges_per_query", 0),
+        help="when --random_edge_blocks is enabled, keep at most this many RW edges per query (<=0 disables)",
+    )
+    parser.add_argument(
+        "--adaptive_edge_budget",
+        action="store_true",
+        default=defaults.get("adaptive_edge_budget", False),
+        help="enable probe-based greedy allocation between real-edge and RW edge budgets in full-graph sparse attention",
+    )
+    parser.add_argument(
+        "--adaptive_edge_budget_probe_size",
+        type=int,
+        default=defaults.get("adaptive_edge_budget_probe_size", 0),
+        help="advanced override; <=0 uses an automatic probe size based on validation split",
+    )
+    parser.add_argument(
+        "--adaptive_edge_budget_block_size",
+        type=int,
+        default=defaults.get("adaptive_edge_budget_block_size", 0),
+        help="advanced override; <=0 uses the default per-query edge block size",
+    )
+    parser.add_argument(
+        "--adaptive_edge_budget_warmup_epochs",
+        type=int,
+        default=defaults.get("adaptive_edge_budget_warmup_epochs", 0),
+        help="advanced override; <=0 uses an automatic warmup length",
+    )
+    parser.add_argument(
+        "--adaptive_edge_budget_gain_threshold",
+        type=float,
+        default=defaults.get("adaptive_edge_budget_gain_threshold", 0.0),
+        help="advanced override for minimum probe-loss improvement per added edge required to keep expanding the budget",
+    )
+    parser.add_argument(
+        "--adaptive_edge_budget_patience",
+        type=int,
+        default=defaults.get("adaptive_edge_budget_patience", 0),
+        help="advanced override; <=0 uses the default stop patience",
+    )
 
     parser.add_argument("--rank", type=int, default=defaults.get("rank"))
     parser.add_argument("--local-rank", "--local_rank", type=int, default=defaults.get("local_rank"))
@@ -157,7 +211,12 @@ def add_node_batch_sp_args(parser, defaults=None):
 def add_node_fullgraph_sp_args(parser, defaults=None):
     defaults = defaults or {}
 
-    parser.add_argument("--include_real_edges", type=int, default=defaults.get("include_real_edges", 0))
+    parser.add_argument(
+        "--include_real_edges",
+        type=int,
+        default=defaults.get("include_real_edges", 0),
+        help="legacy full-graph flag for including all real edges; with --random_edge_blocks and --real_edges_per_query > 0, real-edge blocks are enabled automatically",
+    )
     parser.add_argument("--include_self_loops", type=int, default=defaults.get("include_self_loops", 0))
     parser.add_argument(
         "--to_bidirected",
