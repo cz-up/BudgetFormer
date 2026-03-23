@@ -64,6 +64,7 @@ from gt_sp.utils import (
     adjust_edge_index_nomerge,
     resolve_random_walk_device,
 )
+from utils.split_utils import load_default_split
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -139,74 +140,12 @@ def _to_bidirected_edge_index(edge_index: torch.Tensor, num_nodes: int) -> torch
 
 
 def _load_default_split(dataset_name: str, root_dir: str, wait_for_rank0: bool = False):
-    import os
-    # 1. 如果已经有预先保存好的划分，直接加载
-    split_path = os.path.join(root_dir, dataset_name, 'split_idx.pt')
-    if os.path.exists(split_path):
-        if wait_for_rank0 and dist.is_initialized() and dist.get_rank() != 0:
-            dist.barrier()
-        split_idx = torch.load(split_path, map_location='cpu', weights_only=True)
-        if wait_for_rank0 and dist.is_initialized() and dist.get_rank() == 0:
-            dist.barrier()
-        return split_idx
-
-    name = dataset_name
-    
-    # 2. 如果是 ogbn 数据集，使用 ogb 官方包
-    if name.startswith("ogbn-"):
-        try:
-            from ogb.nodeproppred import NodePropPredDataset
-        except Exception:
-            return None
-        if wait_for_rank0 and dist.is_initialized() and dist.get_rank() != 0:
-            dist.barrier()
-        dataset = NodePropPredDataset(name=name, root=root_dir)
-        split_idx = dataset.get_idx_split()
-        out = {}
-        for key, val in split_idx.items():
-            if isinstance(val, torch.Tensor):
-                out[key] = val.to(torch.long)
-            else:
-                out[key] = torch.tensor(val, dtype=torch.long)
-        if wait_for_rank0 and dist.is_initialized() and dist.get_rank() == 0:
-            dist.barrier()
-        return out
-
-    # 3. 尝试从 PyTorch Geometric 加载其它数据集的默认划分
-    if wait_for_rank0 and dist.is_initialized() and dist.get_rank() != 0:
-        dist.barrier()
-        
-    out = None
-    try:
-        data = None
-        if name in ['cora', 'citeseer', 'pubmed']:
-            from torch_geometric.datasets import Planetoid
-            dataset = Planetoid(root=root_dir, name=name)
-            data = dataset[0]
-        elif name in ["roman-empire", "amazon-ratings", "minesweeper", "tolokers", "questions"]:
-            from torch_geometric.datasets import HeterophilousGraphDataset
-            pyg_name = name.capitalize()
-            dataset = HeterophilousGraphDataset(root=root_dir, name=pyg_name)
-            data = dataset[0]
-            
-        if data is not None and hasattr(data, 'train_mask'):
-            def mask_to_idx(mask):
-                if mask.dim() == 2:
-                    mask = mask[:, 0]  # 对于多维 mask 默认取第一列
-                return torch.nonzero(mask, as_tuple=True)[0].to(torch.long)
-            
-            out = {
-                "train": mask_to_idx(data.train_mask),
-                "valid": mask_to_idx(data.val_mask),
-                "test": mask_to_idx(data.test_mask)
-            }
-    except Exception:
-        pass
-
-    if wait_for_rank0 and dist.is_initialized() and dist.get_rank() == 0:
-        dist.barrier()
-        
-    return out
+    return load_default_split(
+        dataset_name,
+        root_dir,
+        dist_module=dist,
+        wait_for_rank0=wait_for_rank0,
+    )
 
 
 def _load_data(args):

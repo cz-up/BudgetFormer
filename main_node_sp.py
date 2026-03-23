@@ -3,6 +3,7 @@ import torch.nn.functional as F
 import numpy as np
 import math
 from collections import defaultdict
+import json
 from models.graphormer_dist_node_level import Graphormer
 from models.gt_dist_node_level import GT
 from utils.lr import PolynomialDecayLR
@@ -24,7 +25,6 @@ from gt_sp.initialize import (
     last_batch_flag,
 )
 from gt_sp.reducer import sync_params_and_buffers
-from gt_sp.adaptive_walk import estimate_L_star, coverage_for_R
 from gt_sp.evaluate import sparse_eval_gpu
 from gt_sp.utils import (
     get_batch_blockize,
@@ -32,7 +32,12 @@ from gt_sp.utils import (
     random_split_idx,
     fixed_random_seed,
 )
-from utils.parser_node_level import parser_add_main_args
+from utils.parser_node_level import (
+    add_node_batch_sp_args,
+    add_node_common_args,
+    normalize_main_node_batch_sp_args,
+)
+from utils.split_utils import load_default_split
 
 
 def _resolve_device() -> str:
@@ -78,57 +83,10 @@ def _load_node_level_data(args, device):
             f"Training iters: {split_idx['train'].size(0) // args.seq_len + 1}, Val iters: {split_idx['valid'].size(0) // args.seq_len + 1}, Test iters: {split_idx['test'].size(0) // args.seq_len + 1}"
         )
 
-    # Optional Node Positional Encodings (precomputed, concat to feature)
-    pe_modes = [p.strip().lower() for p in getattr(args, 'pe_modes', '').split(',')]
-    pe_modes = [p for p in pe_modes if p and p != 'none']
-    
-    if 'rwse' in pe_modes:
-        rwse_path = getattr(args, 'rwse_file', '') or \
-            f"{args.dataset_dir}{args.dataset}/rwse_k{args.rwse_dim}.pt"
-        if args.rank == 0:
-            print(f"[pe] Loading RWSE from {rwse_path}")
-        rwse = torch.load(rwse_path, weights_only=True)  # [N, rwse_dim]
-        assert rwse.shape[0] == feature.shape[0], \
-            f"RWSE node count {rwse.shape[0]} != feature node count {feature.shape[0]}"
-        feature = torch.cat([feature, rwse.float()], dim=1)
-        if args.rank == 0:
-            print(f"[pe] Feature dim expanded: +{rwse.shape[1]} (RWSE) -> {feature.shape[1]}")
-
-    if 'lap' in pe_modes:
-        lap_path = getattr(args, 'lap_file', '') or \
-            f"{args.dataset_dir}{args.dataset}/lap_k{args.lap_dim}.pt"
-        if args.rank == 0:
-            print(f"[pe] Loading LapPE from {lap_path}")
-        lap = torch.load(lap_path, weights_only=True)  # [N, lap_dim]
-        assert lap.shape[0] == feature.shape[0], \
-            f"LapPE node count {lap.shape[0]} != feature node count {feature.shape[0]}"
-        feature = torch.cat([feature, lap.float()], dim=1)
-        if args.rank == 0:
-            print(f"[pe] Feature dim expanded: +{lap.shape[1]} (LapPE) -> {feature.shape[1]}")
-
     return feature, y, edge_index_global, N, split_idx
 
 
-def _load_metis_partition(args):
-    """加载预计算的 METIS 分区文件，返回 [num_blocks, seq_len] 的节点 id 数组。"""
-    part_path = getattr(args, 'metis_partition_file', '') or \
-        f"{args.dataset_dir}{args.dataset}/part_seq_{args.seq_len}.pt"
-    if not os.path.exists(part_path):
-        raise FileNotFoundError(
-            f"[metis] Partition file not found: {part_path}\n"
-            f"Run: python utils/precompute_partitions.py --dataset {args.dataset} "
-            f"--dataset_dir {args.dataset_dir} --seq_len {args.seq_len}"
-        )
-    part_seq = torch.load(part_path, map_location='cpu')  # [num_blocks * seq_len]
-    assert part_seq.numel() % args.seq_len == 0, \
-        f"[metis] part_seq length {part_seq.numel()} not divisible by seq_len {args.seq_len}"
-    blocks = part_seq.view(-1, args.seq_len)  # [num_blocks, seq_len]
-    if args.rank == 0:
-        print(f"[metis] Loaded partition: {blocks.shape[0]} blocks x {args.seq_len} nodes from {part_path}")
-    return blocks  # LongTensor, -1 indicates padding
-
-
-def _prepare_sequence_training_state(args, split_idx, device, metis_blocks=None):
+def _prepare_sequence_training_state(args, split_idx, device):
     seq_parallel_world_size = get_sequence_parallel_world_size() if sequence_parallel_is_initialized() else 1
     profile_single_machine = (not dist.is_initialized()) or (seq_parallel_world_size <= 1)
     profile_single_machine = False
@@ -139,7 +97,6 @@ def _prepare_sequence_training_state(args, split_idx, device, metis_blocks=None)
 
     train_idx = split_idx["train"]
 
-    # 对于 METIS 模式，不需要广播 flatten_train_idx，但仍需要广播 train_idx set 用于 mask
     if args.rank == 0:
         flatten_train_idx = train_idx.to(device)
     else:
@@ -234,85 +191,82 @@ def _print_runtime_profile(runtime, iter_t_list, epoch):
         print(f"  - {k:10s}: {t:.3f}s ({100.0 * t / total_profile_t:.1f}%), {1000.0 * t / iters:.2f} ms/iter")
 
 
-def _load_default_split(dataset_name: str, root_dir: str, wait_for_rank0: bool = False):
-    import os
-    # 1. 如果已经有预先保存好的划分，直接加载
-    split_path = os.path.join(root_dir, dataset_name, 'split_idx.pt')
-    if os.path.exists(split_path):
-        if wait_for_rank0 and dist.is_initialized() and dist.get_rank() != 0:
-            dist.barrier()
-        split_idx = torch.load(split_path, map_location='cpu', weights_only=True)
-        if wait_for_rank0 and dist.is_initialized() and dist.get_rank() == 0:
-            dist.barrier()
-        return split_idx
+def _format_hop_stats_dirname(args) -> str:
+    dirname = (
+        f"attn{getattr(args, 'full_attn_hop_mass', 0.95):g}"
+        f"_maxhop{int(getattr(args, 'full_attn_hop_max_hop', 64))}"
+        f"_seq{int(getattr(args, 'seq_len', 0))}"
+    )
+    tag = str(getattr(args, "full_attn_hop_stats_tag", "")).strip()
+    if tag:
+        dirname = f"{dirname}_{tag}"
+    return dirname
 
-    name = dataset_name
-    
-    # 2. 如果是 ogbn 数据集，使用 ogb 官方包
-    if name.startswith("ogbn-"):
-        try:
-            from ogb.nodeproppred import NodePropPredDataset
-        except Exception:
-            return None
-        if wait_for_rank0 and dist.is_initialized() and dist.get_rank() != 0:
-            dist.barrier()
-        dataset = NodePropPredDataset(name=name, root=root_dir)
-        split_idx = dataset.get_idx_split()
-        out = {}
-        for key, val in split_idx.items():
-            if isinstance(val, torch.Tensor):
-                out[key] = val.to(torch.long)
-            else:
-                out[key] = torch.tensor(val, dtype=torch.long)
-        if wait_for_rank0 and dist.is_initialized() and dist.get_rank() == 0:
-            dist.barrier()
+
+def _serialize_hop_mass_stats(stats):
+    out = {}
+    if stats is None:
         return out
-
-    # 3. 尝试从 PyTorch Geometric 加载其它数据集的默认划分
-    if wait_for_rank0 and dist.is_initialized() and dist.get_rank() != 0:
-        dist.barrier()
-        
-    out = None
-    try:
-        data = None
-        if name in ['cora', 'citeseer', 'pubmed']:
-            from torch_geometric.datasets import Planetoid
-            dataset = Planetoid(root=root_dir, name=name)
-            data = dataset[0]
-        elif name in ["roman-empire", "amazon-ratings", "minesweeper", "tolokers", "questions"]:
-            from torch_geometric.datasets import HeterophilousGraphDataset
-            pyg_name = name.capitalize()
-            dataset = HeterophilousGraphDataset(root=root_dir, name=pyg_name)
-            data = dataset[0]
-            
-        if data is not None and hasattr(data, 'train_mask'):
-            def mask_to_idx(mask):
-                if mask.dim() == 2:
-                    mask = mask[:, 0]  # 对于多维 mask 默认取第一列
-                return torch.nonzero(mask, as_tuple=True)[0].to(torch.long)
-            
-            out = {
-                "train": mask_to_idx(data.train_mask),
-                "valid": mask_to_idx(data.val_mask),
-                "test": mask_to_idx(data.test_mask)
-            }
-    except Exception:
-        pass
-
-    if wait_for_rank0 and dist.is_initialized() and dist.get_rank() == 0:
-        dist.barrier()
-        
+    for i, stat in enumerate(stats):
+        if stat is None:
+            continue
+        hop_sums, hop_count, max_sum, max_count, max_hop = stat
+        if hop_count > 0:
+            hop_ratios = [float(h / hop_count) for h in hop_sums]
+        else:
+            hop_ratios = []
+        out[str(i)] = {
+            "mean_max_hop": float(max_sum / max(1, max_count)),
+            "max_hop": int(max_hop),
+            "hop_count": int(hop_count),
+            "hop_ratios": hop_ratios,
+        }
     return out
 
 
+def _write_hop_mass_stats(args, epoch: int, stats, train_acc: float, val_acc: float, test_acc: float) -> None:
+    if not stats:
+        return
+    stats_root = getattr(args, "full_attn_hop_stats_dir", "./plot/hop_stats")
+    model_dir = os.path.join(
+        stats_root,
+        str(args.model),
+        str(args.dataset),
+        _format_hop_stats_dirname(args),
+    )
+    os.makedirs(model_dir, exist_ok=True)
+    payload = {
+        "model": str(args.model),
+        "dataset": str(args.dataset),
+        "epoch": int(epoch),
+        "mass": float(getattr(args, "full_attn_hop_mass", 0.95)),
+        "max_queries": int(getattr(args, "full_attn_hop_max_queries", 64)),
+        "query_sampling": str(getattr(args, "full_attn_hop_query_sampling", "random")),
+        "max_batches": int(getattr(args, "full_attn_hop_max_batches", 1)),
+        "max_hop_limit": int(getattr(args, "full_attn_hop_max_hop", 64)),
+        "train_acc": float(train_acc),
+        "val_acc": float(val_acc),
+        "test_acc": float(test_acc),
+        "layers": _serialize_hop_mass_stats(stats),
+    }
+    epoch_path = os.path.join(model_dir, f"epoch_{epoch:04d}.json")
+    latest_path = os.path.join(model_dir, "latest.json")
+    with open(epoch_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+    with open(latest_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+    print(f"[hop_stats] wrote {epoch_path}")
+
+
+def _load_default_split(dataset_name: str, root_dir: str, wait_for_rank0: bool = False):
+    return load_default_split(
+        dataset_name,
+        root_dir,
+        dist_module=dist,
+        wait_for_rank0=wait_for_rank0,
+    )
 def run_step(args, model, device, feature, y, idx_batch_cpu, sub_split_seq_lens,
-             edge_index_global, N, attn_type, train_idx_tensor=None):
-    """
-    train_idx_tensor: LongTensor of training node ids (CPU). If provided, nodes
-    in idx_batch_cpu that are NOT in train_idx_tensor will have their label masked
-    to -100 so they are ignored in the loss computation. This is used for METIS
-    batching where each block may contain val/test nodes as context.
-    """
+             edge_index_global, N, attn_type):
     batch_mode = getattr(args, "batch_subgraph_mode", "induced")
     current_split_seq_lens = None if batch_mode == "seed_rw" else sub_split_seq_lens
     if batch_mode != "seed_rw" and idx_batch_cpu.shape[0] < args.seq_len:
@@ -320,10 +274,6 @@ def run_step(args, model, device, feature, y, idx_batch_cpu, sub_split_seq_lens,
             args, int(idx_batch_cpu.shape[0])
         )
         set_last_batch_global_token_indices(current_global_token_indices_last_batch)
-
-    seed_label_mask = None
-    if batch_mode == "seed_rw" and train_idx_tensor is not None:
-        seed_label_mask = torch.isin(idx_batch_cpu.cpu(), train_idx_tensor)
 
     x_i, y_i, edge_index_i, attn_bias = get_batch_blockize(
         args,
@@ -334,36 +284,8 @@ def run_step(args, model, device, feature, y, idx_batch_cpu, sub_split_seq_lens,
         edge_index_global,
         N,
         device=device,
-        seed_label_mask=seed_label_mask,
+        seed_label_mask=None,
     )
-
-    # --- METIS 模式下屏蔽非训练节点的 loss ---
-    if train_idx_tensor is not None and batch_mode != "seed_rw":
-        # 确定当前 rank 处理的节点子集
-        sp_world = get_sequence_parallel_world_size() if sequence_parallel_is_initialized() else 1
-        sp_rank  = get_sequence_parallel_rank()  if sequence_parallel_is_initialized() else 0
-        batch_n  = idx_batch_cpu.shape[0]
-
-        if batch_n < args.seq_len and current_split_seq_lens is not None:
-            # last-batch 路径：get_batch_blockize 内部已用 max(sub_split_seq_lens) 旹式 pad
-            sub_len = max(current_split_seq_lens)
-            # 构建与 get_batch_blockize 相同的 padded idx
-            padded_idx = torch.full((sub_len * sp_world,), -1, dtype=idx_batch_cpu.dtype)
-            padded_idx[:batch_n] = idx_batch_cpu
-            idx_for_rank = padded_idx[sp_rank * sub_len : (sp_rank + 1) * sub_len]
-        else:
-            sub_len = args.seq_len // sp_world
-            idx_for_rank = idx_batch_cpu[sp_rank * sub_len : (sp_rank + 1) * sub_len]
-
-        # 向量化 isin （-1 padding 节点全部屏蔽）
-        valid_mask = idx_for_rank >= 0
-        is_train   = torch.zeros(idx_for_rank.shape[0], dtype=torch.bool)
-        if valid_mask.any():
-            is_train[valid_mask] = torch.isin(
-                idx_for_rank[valid_mask], train_idx_tensor
-            )
-        y_i = y_i.clone()
-        y_i[~is_train] = -100   # F.nll_loss ignore_index
 
     x_i = x_i.to(device)
     y_i = y_i.to(device)
@@ -377,10 +299,316 @@ def run_step(args, model, device, feature, y, idx_batch_cpu, sub_split_seq_lens,
     return loss, out_i, y_i
 
 
+@torch.no_grad()
+def _collect_hop_mass_stats_main_node_sp(args, model, device, feature, y, sub_idx, edge_index_global, N):
+    """
+    Restore the original hop-stats semantics for main_node_sp.py:
+    use the batch induced subgraph itself for evaluation-time hop tracking
+    instead of the random-walk attention graph built by get_batch_blockize().
+    Shuffle the validation/query nodes globally before batching so the sampled
+    queries are not always drawn from the fixed prefix of the split when
+    max_batches is small.
+    """
+    model.eval()
+    if sub_idx.numel() > 1:
+        sub_idx = sub_idx[torch.randperm(sub_idx.size(0))]
+    num_batch = (sub_idx.size(0) + args.seq_len - 1) // args.seq_len
+
+    for i in range(num_batch):
+        idx_i = sub_idx[i * args.seq_len:(i + 1) * args.seq_len]
+        rest_split_sizes = None
+        if idx_i.shape[0] < args.seq_len:
+            rest_split_sizes, current_global_token_indices_last_batch = _get_current_batch_split_state(
+                args,
+                int(idx_i.shape[0]),
+            )
+            set_last_batch_global_token_indices(current_global_token_indices_last_batch)
+
+        x_i, y_i, edge_index_i, attn_bias = get_batch_blockize(
+            args,
+            feature,
+            y,
+            idx_i,
+            rest_split_sizes,
+            edge_index_global,
+            N,
+            device=device,
+            seed_label_mask=None,
+            force_induced_edges=True,
+            apply_graphormer_virtual_edges=False,
+        )
+
+        x_i = x_i.to(device)
+        y_i = y_i.to(device)
+        if isinstance(edge_index_i, list):
+            edge_index_i = [e.to(device) for e in edge_index_i]
+        else:
+            edge_index_i = edge_index_i.to(device)
+
+        _ = model(x_i, attn_bias, edge_index_i, attn_type=args.attn_type)
+
+    return model.get_hop_mass_stats_per_layer()
+
+
+def _prepare_induced_eval_batch(args, device, feature, y, idx_i, edge_index_global, N):
+    rest_split_sizes = None
+    if idx_i.shape[0] < args.seq_len:
+        rest_split_sizes, current_global_token_indices_last_batch = _get_current_batch_split_state(
+            args,
+            int(idx_i.shape[0]),
+        )
+        set_last_batch_global_token_indices(current_global_token_indices_last_batch)
+
+    x_i, y_i, edge_index_i, attn_bias = get_batch_blockize(
+        args,
+        feature,
+        y,
+        idx_i,
+        rest_split_sizes,
+        edge_index_global,
+        N,
+        device=device,
+        seed_label_mask=None,
+        force_induced_edges=True,
+        apply_graphormer_virtual_edges=False,
+    )
+
+    x_i = x_i.to(device)
+    y_i = y_i.to(device)
+    if isinstance(edge_index_i, list):
+        edge_index_i = [e.to(device) for e in edge_index_i]
+    else:
+        edge_index_i = edge_index_i.to(device)
+    return x_i, y_i, edge_index_i, attn_bias
+
+
+def _build_onehop_neighbors(edge_index, num_nodes: int):
+    neighbors = [set() for _ in range(max(0, int(num_nodes)))]
+    if edge_index is None:
+        return [tuple() for _ in neighbors]
+    if isinstance(edge_index, list):
+        edge_parts = [e for e in edge_index if e is not None and e.numel() > 0]
+        if not edge_parts:
+            return [tuple() for _ in neighbors]
+        edge_index = torch.cat(edge_parts, dim=1)
+    if edge_index.numel() == 0:
+        return [tuple() for _ in neighbors]
+
+    edge_cpu = edge_index.detach().cpu()
+    src = edge_cpu[0].long().tolist()
+    dst = edge_cpu[1].long().tolist()
+    for s, d in zip(src, dst):
+        if 0 <= s < num_nodes and 0 <= d < num_nodes:
+            neighbors[s].add(d)
+            neighbors[d].add(s)
+    return [tuple(sorted(v)) for v in neighbors]
+
+
+def _build_full_onehop_extra_bias(
+    attn_mean,
+    edge_index,
+    y_i,
+    num_global_tokens: int,
+    mode: str,
+    keep_k: int,
+    keep_ratio: float,
+    seed: int,
+):
+    if attn_mean is None:
+        return None
+    if attn_mean.dim() == 3:
+        attn_mean = attn_mean[0]
+    attn_mean = attn_mean.float().cpu()
+    q_len, k_len = attn_mean.shape
+    real_count = int((y_i.view(-1) != -100).sum().item())
+    extra_bias = torch.zeros((1, 1, q_len, k_len), dtype=torch.float32)
+    if real_count <= 0:
+        return extra_bias
+
+    keep_k = max(1, int(keep_k))
+    keep_ratio = float(keep_ratio)
+    real_key_start = int(num_global_tokens)
+    neg_inf = -1e9
+    neighbors = _build_onehop_neighbors(edge_index, real_count)
+
+    for q_local in range(real_count):
+        row = real_key_start + q_local
+        if row >= q_len:
+            break
+        extra_bias[0, 0, row, real_key_start:k_len] = neg_inf
+
+        chosen = []
+        onehop = list(neighbors[q_local])
+        if onehop:
+            keep_count = min(keep_k, len(onehop))
+            if keep_ratio > 0.0:
+                keep_count = min(len(onehop), max(1, int(math.ceil(len(onehop) * keep_ratio))))
+            if mode == "all":
+                chosen = onehop
+            elif mode == "topk":
+                scored = [
+                    (float(attn_mean[row, real_key_start + n].item()), n)
+                    for n in onehop
+                    if real_key_start + n < k_len
+                ]
+                scored.sort(key=lambda x: x[0], reverse=True)
+                chosen = [n for _, n in scored[:keep_count]]
+            elif mode == "randomk":
+                gen = torch.Generator(device="cpu")
+                gen.manual_seed(int(seed) + q_local * 1000003)
+                perm = torch.randperm(len(onehop), generator=gen)[:keep_count]
+                chosen = [onehop[i] for i in perm.tolist()]
+            else:
+                raise ValueError(f"Unsupported 1-hop ablation mode: {mode}")
+
+        extra_bias[0, 0, row, row] = 0.0
+        for n in chosen:
+            col = real_key_start + n
+            if 0 <= col < k_len:
+                extra_bias[0, 0, row, col] = 0.0
+
+    return extra_bias
+
+
+@torch.no_grad()
+def _evaluate_full_onehop_ablation_split(
+    args,
+    model,
+    device,
+    feature,
+    y,
+    sub_idx,
+    edge_index_global,
+    N,
+    split_name: str,
+    seed: int,
+):
+    if args.attn_type != "full":
+        return None
+    if not hasattr(model, "set_full_attention_capture_layers"):
+        return None
+    if not hasattr(model, "set_full_attention_extra_biases"):
+        return None
+    if sequence_parallel_is_initialized() and get_sequence_parallel_world_size() > 1:
+        return None
+
+    model.eval()
+    keep_k = max(1, int(getattr(args, "full_attn_onehop_keep_k", 4)))
+    keep_ratio = max(0.0, float(getattr(args, "full_attn_onehop_keep_ratio", 0.0)))
+    layer_mode = str(getattr(args, "full_attn_onehop_eval_layer_mode", "all")).lower()
+    num_global_tokens = int(getattr(model, "num_global_node", 0)) if args.model == "graphormer" else 0
+    num_batch = (sub_idx.size(0) + args.seq_len - 1) // args.seq_len
+    correct = {
+        "baseline": 0,
+        "all_1hop": 0,
+        "topk_1hop": 0,
+        "randomk_1hop": 0,
+    }
+    total = 0
+
+    try:
+        for batch_id in range(num_batch):
+            idx_i = sub_idx[batch_id * args.seq_len:(batch_id + 1) * args.seq_len]
+            x_i, y_i, edge_index_i, attn_bias = _prepare_induced_eval_batch(
+                args,
+                device,
+                feature,
+                y,
+                idx_i,
+                edge_index_global,
+                N,
+            )
+
+            model.set_full_attention_extra_biases(None, layer_mode=layer_mode)
+            model.set_full_attention_capture_layers(True, layer_mode=layer_mode)
+            out_base = model(x_i, attn_bias, edge_index_i, attn_type=args.attn_type)
+            attn_means = model.get_full_attention_means_per_layer(layer_mode=layer_mode)
+            model.set_full_attention_capture_layers(False, layer_mode=layer_mode)
+
+            y_flat = y_i.view(-1)
+            is_labeled = y_flat != -100
+            if not is_labeled.any():
+                continue
+            total += int(is_labeled.sum().item())
+            pred_base = out_base.argmax(1)
+            correct["baseline"] += int((pred_base[is_labeled] == y_flat[is_labeled]).sum().item())
+
+            for mode, key in (("all", "all_1hop"), ("topk", "topk_1hop"), ("randomk", "randomk_1hop")):
+                extra_biases = []
+                for layer_offset, attn_mean in enumerate(attn_means):
+                    extra_biases.append(
+                        _build_full_onehop_extra_bias(
+                            attn_mean,
+                            edge_index_i,
+                            y_i,
+                            num_global_tokens=num_global_tokens,
+                            mode=mode,
+                            keep_k=keep_k,
+                            keep_ratio=keep_ratio,
+                            seed=seed
+                            + batch_id * 1009
+                            + layer_offset * 10000019
+                            + (17 if mode == "topk" else 31 if mode == "randomk" else 0),
+                        )
+                    )
+                model.set_full_attention_extra_biases(extra_biases, layer_mode=layer_mode)
+                out_masked = model(x_i, attn_bias, edge_index_i, attn_type=args.attn_type)
+                pred_masked = out_masked.argmax(1)
+                correct[key] += int((pred_masked[is_labeled] == y_flat[is_labeled]).sum().item())
+            model.set_full_attention_extra_biases(None, layer_mode=layer_mode)
+    finally:
+        model.set_full_attention_capture_layers(False, layer_mode=layer_mode)
+        model.set_full_attention_extra_biases(None, layer_mode=layer_mode)
+
+    if total <= 0:
+        return None
+    return {name: float(val) / float(total) for name, val in correct.items()}
+
+
+def _run_full_onehop_ablation_eval(
+    args,
+    model,
+    device,
+    feature,
+    y,
+    split_idx,
+    edge_index_global,
+    N,
+    epoch: int,
+):
+    which = str(getattr(args, "full_attn_onehop_eval_splits", "valid")).lower()
+    split_items = []
+    if which in ("valid", "both"):
+        split_items.append(("valid", split_idx["valid"]))
+    if which in ("test", "both"):
+        split_items.append(("test", split_idx["test"]))
+
+    results = {}
+    for offset, (name, idx) in enumerate(split_items):
+        split_seed = int(args.seed + epoch * 10000 + offset * 1000000)
+        with fixed_random_seed(split_seed):
+            split_result = _evaluate_full_onehop_ablation_split(
+                args,
+                model,
+                device,
+                feature,
+                y,
+                idx,
+                edge_index_global,
+                N,
+                split_name=name,
+                seed=split_seed,
+            )
+        if split_result is not None:
+            results[name] = split_result
+    return results
+
+
 def main():
-    parser = argparse.ArgumentParser(description="TorchGT node-level training (SP).")
-    parser_add_main_args(parser)
-    args = parser.parse_args()
+    parser = argparse.ArgumentParser(description="TorchGT node-level batch training (SP).")
+    add_node_common_args(parser)
+    add_node_batch_sp_args(parser)
+    args = normalize_main_node_batch_sp_args(parser.parse_args())
 
     # Initialize distributed
     initialize_distributed(args)
@@ -392,24 +620,6 @@ def main():
 
     feature, y, edge_index_global, N, split_idx = _load_node_level_data(args, device)
     seed_batch_size = get_seed_batch_size(args)
-    batch_mode = getattr(args, "batch_subgraph_mode", "induced")
-
-    # --- METIS 预分区：自动检测分区文件，存在则启用，不存在则 fallback 随机 batching ---
-    _part_path = f"{args.dataset_dir}{args.dataset}/part_seq_{args.seq_len}.pt"
-    metis_blocks = None
-    train_idx_tensor = None
-    if batch_mode == "seed_rw":
-        if args.rank == 0:
-            print(f"[batch] Using seed_rw mode with seed_batch_size={seed_batch_size}; METIS block batching disabled.")
-    elif os.path.exists(_part_path):
-        metis_blocks = _load_metis_partition(args)  # [num_blocks, seq_len]
-        train_idx_tensor = split_idx['train'].cpu().to(torch.long)
-        if args.rank == 0:
-            print(f"[metis] Auto-detected partition file, using METIS batching. "
-                  f"#blocks={metis_blocks.shape[0]}, #train={train_idx_tensor.numel()}")
-    else:
-        if args.rank == 0:
-            print(f"[metis] No partition file found at {_part_path}, using random batching.")
 
     flatten_train_idx, sub_split_seq_lens, seq_parallel_world_size, profile_single_machine = (
         _prepare_sequence_training_state(args, split_idx, device)
@@ -443,12 +653,6 @@ def main():
     best_epoch = -1
     best_val = 0
     best_test = 0
-    adaptive_enabled = getattr(args, "adaptive_walk", False)
-    adaptive_stage = "stable"
-    adaptive_no_improve = 0
-    adaptive_cov_no_improve = 0
-    if adaptive_enabled:
-        adaptive_stage = "tune_L"
 
     for epoch in range(1, args.epochs + 1):
         t_epoch_start = time.time()
@@ -456,25 +660,10 @@ def main():
         if hasattr(model, "reset_head_mass_stats"):
             model.reset_head_mass_stats()
         idx_train_shuffle = flatten_train_idx[torch.randperm(flatten_train_idx.size(0))].to("cpu")
-
-        if metis_blocks is not None:
-            # METIS 模式：block-level shuffle，保留 block 内部节点顺序，过滤 -1 padding
-            block_order = torch.randperm(metis_blocks.shape[0])
-            raw_batches = [metis_blocks[i] for i in block_order]
-            batch_indices = [b[b >= 0] for b in raw_batches]
-        else:
-            # 随机 batching
-            batch_indices = torch.split(idx_train_shuffle, seed_batch_size)
+        batch_indices = torch.split(idx_train_shuffle, seed_batch_size)
 
         iter_t_list = []
         runtime = defaultdict(float) if profile_single_machine else None
-        iter_idx = 1
-        needed_L_sum = 0.0
-        needed_L_count = 0
-        cov_diff_sum = 0.0
-        cov_diff_count = 0
-        do_diff_check = adaptive_enabled and adaptive_stage == "tune_L" and args.rank == 0
-        do_cov_check = adaptive_enabled and adaptive_stage == "tune_R" and args.rank == 0
         for idx_batch_cpu in batch_indices:
             t_iter_start = time.time()
             t_zero = time.time() if profile_single_machine else None
@@ -494,7 +683,6 @@ def main():
                 edge_index_global,
                 N,
                 attn_type,
-                train_idx_tensor=train_idx_tensor,
             )
             if profile_single_machine:
                 runtime["run_step"] += time.time() - t_run
@@ -517,38 +705,6 @@ def main():
             if profile_single_machine:
                 runtime["optim_step"] += time.time() - t_step
             iter_t_list.append(time.time() - t_iter_start)
-            if do_diff_check and iter_idx <= args.adaptive_embed_batches:
-                needed_L = estimate_L_star(
-                    args,
-                    idx_batch_cpu,
-                    edge_index_global,
-                    N,
-                    seed=args.seed + epoch * 1000 + iter_idx,
-                    debug_print=(iter_idx == 1),
-                )
-                needed_L_sum += float(needed_L)
-                needed_L_count += 1
-            if do_cov_check and iter_idx <= args.adaptive_embed_batches:
-                base_R = int(args.head_hop_walks_per_node)
-                cov_R = coverage_for_R(
-                    args,
-                    idx_batch_cpu,
-                    edge_index_global,
-                    N,
-                    seed=args.seed + epoch * 2000 + iter_idx,
-                    walks_per_node=base_R,
-                )
-                cov_Rp1 = coverage_for_R(
-                    args,
-                    idx_batch_cpu,
-                    edge_index_global,
-                    N,
-                    seed=args.seed + epoch * 2000 + iter_idx,
-                    walks_per_node=base_R + 1,
-                )
-                cov_diff_sum += (cov_Rp1 - cov_R)
-                cov_diff_count += 1
-            iter_idx += 1
 
         loss_list.append(loss.item())
         lr_scheduler.step()
@@ -560,81 +716,72 @@ def main():
             if profile_single_machine:
                 _print_runtime_profile(runtime, iter_t_list, epoch)
         val_acc = None
-        avg_needed_L = None
-        avg_cov_diff = None
-        if adaptive_enabled and do_diff_check:
-            avg_needed_L = float(needed_L_sum / max(1, needed_L_count))
-        if adaptive_enabled and do_cov_check:
-            avg_cov_diff = float(cov_diff_sum / max(1, cov_diff_count))
 
-        if args.rank == 0 and adaptive_enabled:
-            if avg_needed_L is not None and adaptive_stage == "tune_L":
-                base_L = int(args.head_hop_walk_length)
-                if avg_needed_L <= base_L:
-                    adaptive_no_improve += 1
-                    print(f"[adaptive] keep L={base_L} (L* {avg_needed_L:.2f})")
-                else:
-                    next_L = max(base_L + 1, int(math.ceil(avg_needed_L)))
-                    args.head_hop_walk_length = next_L
-                    adaptive_no_improve = 0
-                    print(f"[adaptive] increase L to {args.head_hop_walk_length} (L* {avg_needed_L:.2f})")
-                if adaptive_no_improve >= args.adaptive_patience:
-                    adaptive_stage = "tune_R"
-                    adaptive_cov_no_improve = 0
-                    print(f"[adaptive] L fixed at {args.head_hop_walk_length}, start tuning R")
-
-        if args.rank == 0 and adaptive_enabled and adaptive_stage == "tune_R" and avg_cov_diff is not None:
-            if avg_cov_diff <= args.adaptive_cov_delta:
-                adaptive_cov_no_improve += 1
-                print(f"[adaptive] keep R={args.head_hop_walks_per_node} (cov diff {avg_cov_diff:.6f})")
-            else:
-                args.head_hop_walks_per_node += 1
-                adaptive_cov_no_improve = 0
-                print(f"[adaptive] increase R to {args.head_hop_walks_per_node} (cov diff {avg_cov_diff:.6f})")
-            if adaptive_cov_no_improve >= args.adaptive_patience:
-                adaptive_stage = "stable"
-                print(f"[adaptive] R fixed at {args.head_hop_walks_per_node} (cov diff {avg_cov_diff:.6f})")
-
-        if adaptive_enabled and dist.is_initialized():
-            if args.rank == 0:
-                stage_id = 0 if adaptive_stage == "tune_L" else 1 if adaptive_stage == "tune_R" else 2
-                state = torch.tensor(
-                    [args.head_hop_walk_length, args.head_hop_walks_per_node, stage_id],
-                    device=device,
-                    dtype=torch.long,
-                )
-            else:
-                state = torch.empty(3, device=device, dtype=torch.long)
-            dist.broadcast(state, 0)
-            args.head_hop_walk_length = int(state[0].item())
-            args.head_hop_walks_per_node = int(state[1].item())
-            stage_id = int(state[2].item())
-            adaptive_stage = "tune_L" if stage_id == 0 else "tune_R" if stage_id == 1 else "stable"
-
-        if epoch % 5 == 0:
+        if epoch % args.eval_every == 0:
             stats = None
+            onehop_eval_results = None
             t4 = time.time()
             with fixed_random_seed(args.seed):
                 train_acc = sparse_eval_gpu(args, model, feature, y, split_idx["train"], None, edge_index_global, device)
             if val_acc is None:
                 with fixed_random_seed(args.seed):
                     val_acc = sparse_eval_gpu(args, model, feature, y, split_idx["valid"], None, edge_index_global, device)
-            stats_needed = args.full_attn_hop_stats and hasattr(model, "enable_hop_mass_tracking")
+            stats_needed = (
+                args.full_attn_hop_stats
+                and args.attn_type == "full"
+                and hasattr(model, "enable_hop_mass_tracking")
+            )
             if stats_needed:
                 model.reset_hop_mass_stats()
                 model.enable_hop_mass_tracking(
                     mass=args.full_attn_hop_mass,
                     max_queries=args.full_attn_hop_max_queries,
+                    query_sampling=args.full_attn_hop_query_sampling,
                     max_batches=args.full_attn_hop_max_batches,
                     max_hop=args.full_attn_hop_max_hop,
                 )
-                with fixed_random_seed(args.seed):
-                    _ = sparse_eval_gpu(args, model, feature, y, split_idx["valid"], None, edge_index_global, device)
-                stats = model.get_hop_mass_stats_per_layer()
+                with fixed_random_seed(args.seed + epoch):
+                    stats = _collect_hop_mass_stats_main_node_sp(
+                        args,
+                        model,
+                        device,
+                        feature,
+                        y,
+                        split_idx["valid"],
+                        edge_index_global,
+                        N,
+                    )
                 model.disable_hop_mass_tracking()
+            elif args.full_attn_hop_stats and args.rank == 0 and args.attn_type != "full":
+                print(
+                    f"[hop_stats] skipped because attn_type={args.attn_type}; "
+                    "hop-mass stats are collected only in full attention mode."
+                )
 
             with fixed_random_seed(args.seed):
                 test_acc = sparse_eval_gpu(args, model, feature, y, split_idx["test"], None, edge_index_global, device)
+            if args.full_attn_onehop_eval:
+                if args.attn_type != "full":
+                    if args.rank == 0:
+                        print("[onehop_eval] skipped because attn_type is not full.")
+                elif sequence_parallel_is_initialized() and get_sequence_parallel_world_size() > 1:
+                    if args.rank == 0:
+                        print("[onehop_eval] skipped because sequence parallel eval is not supported yet.")
+                elif not hasattr(model, "set_full_attention_capture_layers"):
+                    if args.rank == 0:
+                        print("[onehop_eval] skipped because model does not expose full-attention capture hooks.")
+                else:
+                    onehop_eval_results = _run_full_onehop_ablation_eval(
+                        args,
+                        model,
+                        device,
+                        feature,
+                        y,
+                        split_idx,
+                        edge_index_global,
+                        N,
+                        epoch,
+                    )
             t5 = time.time()
             if args.rank == 0:
                 epoch_wall_so_far = time.time() - t_epoch_start
@@ -659,6 +806,26 @@ def main():
                             )
                         else:
                             print(f"  layer {i}: mean_max_hop={mean_max_hop:.3f}, max_hop={max_hop}, hop_ratios=NA")
+                    _write_hop_mass_stats(args, epoch, stats, train_acc, val_acc, test_acc)
+                if onehop_eval_results:
+                    keep_k = int(getattr(args, "full_attn_onehop_keep_k", 4))
+                    keep_ratio = float(getattr(args, "full_attn_onehop_keep_ratio", 0.0))
+                    layer_mode = str(getattr(args, "full_attn_onehop_eval_layer_mode", "all")).lower()
+                    if keep_ratio > 0.0:
+                        keep_desc = f"keep_ratio={keep_ratio:g}"
+                    else:
+                        keep_desc = f"keep_k={keep_k}"
+                    print(f"Full-attention 1-hop ablation ({keep_desc}, layer_mode={layer_mode}):")
+                    for split_name, split_metrics in onehop_eval_results.items():
+                        print(
+                            "  {}: baseline={:.2%}, all_1hop={:.2%}, topk_1hop={:.2%}, randomk_1hop={:.2%}".format(
+                                split_name,
+                                split_metrics["baseline"],
+                                split_metrics["all_1hop"],
+                                split_metrics["topk_1hop"],
+                                split_metrics["randomk_1hop"],
+                            )
+                        )
                 print("------------------------------------------------------------------------------------")
 
                 if val_acc > best_val:

@@ -59,6 +59,9 @@ class CoreAttention(nn.Module):
         self._head_mass_count = torch.zeros(
             self.num_attention_heads_per_partition, dtype=torch.float32
         )
+        self.capture_full_attn = False
+        self.last_full_attn_mean = None
+        self.full_attention_extra_bias = None
 
     def get_head_mass_stats(self):
         if self._head_mass_sum is None:
@@ -70,18 +73,31 @@ class CoreAttention(nn.Module):
         self,
         mass: float = 0.95,
         max_queries: int = 64,
+        query_sampling: str = "random",
         max_batches: int = 1,
         max_hop: int = 15,
     ) -> None:
         self.track_hop_mass = True
         self.hop_mass_target = float(mass)
         self.hop_mass_max_queries = int(max_queries)
+        self.hop_mass_query_sampling = str(query_sampling)
         self.hop_mass_max_batches = int(max_batches)
         self.hop_mass_max_hop = int(max_hop)
         self.reset_hop_mass_stats()
 
     def disable_hop_mass_tracking(self) -> None:
         self.track_hop_mass = False
+
+    def set_full_attention_capture(self, enabled: bool = True) -> None:
+        self.capture_full_attn = bool(enabled)
+        if not self.capture_full_attn:
+            self.last_full_attn_mean = None
+
+    def get_last_full_attention_mean(self):
+        return self.last_full_attn_mean
+
+    def set_full_attention_extra_bias(self, extra_bias) -> None:
+        self.full_attention_extra_bias = extra_bias
 
     def reset_hop_mass_stats(self) -> None:
         self.hop_mass_sum = []
@@ -121,11 +137,16 @@ class CoreAttention(nn.Module):
         if attn_bias is not None:
             # attn_bias = attn_bias.repeat(1, self.num_heads, 1, 1)
             x = x + attn_bias
+        extra_bias = getattr(self, "full_attention_extra_bias", None)
+        if extra_bias is not None:
+            x = x + extra_bias.to(device=x.device, dtype=x.dtype)
         if mask is not None:
             mask = mask.unsqueeze(1)
             x = x.masked_fill(mask, 0)
 
         x = torch.softmax(x, dim=3)
+        if getattr(self, "capture_full_attn", False):
+            self.last_full_attn_mean = x.mean(dim=1).detach().cpu()
         if getattr(self, "track_hop_mass", False):
             self._accumulate_hop_mass(x, edge_index)
         x = self.att_dropout(x)
@@ -219,9 +240,6 @@ class CoreAttention(nn.Module):
         # -> [total_s, np, 1]
         Z = score.new_zeros(v.size(0), num_heads, 1)
         scatter(score, edge_index[1], dim=0, out=Z, reduce='add')
-
-        if getattr(self, "track_hop_mass", False) and edge_hops is not None:
-            self._accumulate_sparse_hop_mass(edge_index, edge_hops, score, Z)
 
         x = wV / (Z + 1e-6)
         return x
@@ -327,12 +345,20 @@ class CoreAttention(nn.Module):
 
         probs = attn_probs.mean(dim=1).detach().cpu()
         start_q = 1 if q_len > 1 else 0
-        max_q = min(q_len, start_q + max(1, self.hop_mass_max_queries))
+        if start_q >= q_len:
+            return
+        num_candidates = q_len - start_q
+        sample_count = min(num_candidates, max(1, self.hop_mass_max_queries))
+        query_sampling = getattr(self, "hop_mass_query_sampling", "random")
+        if query_sampling == "random":
+            query_indices = torch.randperm(num_candidates)[:sample_count].add_(start_q).tolist()
+        else:
+            query_indices = list(range(start_q, start_q + sample_count))
         max_hop = int(self.hop_mass_max_hop)
         mass_target = max(0.0, min(self.hop_mass_target, 1.0))
 
         for b in range(bsz):
-            for q in range(start_q, max_q):
+            for q in query_indices:
                 p = probs[b, q, :].float()
                 if k_len > 1:
                     p[0] = 0.0
@@ -475,10 +501,26 @@ class MultiHeadAttention(nn.Module):
             return get_fn()
         return None
 
-    def enable_hop_mass_tracking(self, mass=0.95, max_queries=64, max_batches=1, max_hop=15):
+    def enable_hop_mass_tracking(self, mass=0.95, max_queries=64, query_sampling="random", max_batches=1, max_hop=15):
         enable_fn = getattr(self._core_attn(), "enable_hop_mass_tracking", None)
         if enable_fn is not None:
-            enable_fn(mass, max_queries, max_batches, max_hop)
+            enable_fn(mass, max_queries, query_sampling, max_batches, max_hop)
+
+    def set_full_attention_capture(self, enabled: bool = True):
+        set_fn = getattr(self._core_attn(), "set_full_attention_capture", None)
+        if set_fn is not None:
+            set_fn(enabled)
+
+    def get_last_full_attention_mean(self):
+        get_fn = getattr(self._core_attn(), "get_last_full_attention_mean", None)
+        if get_fn is not None:
+            return get_fn()
+        return None
+
+    def set_full_attention_extra_bias(self, extra_bias) -> None:
+        set_fn = getattr(self._core_attn(), "set_full_attention_extra_bias", None)
+        if set_fn is not None:
+            set_fn(extra_bias)
 
     def disable_hop_mass_tracking(self):
         disable_fn = getattr(self._core_attn(), "disable_hop_mass_tracking", None)
@@ -641,10 +683,61 @@ class GT(nn.Module):
             return None
         return sum(stats) / len(stats)
 
-    def enable_hop_mass_tracking(self, mass=0.95, max_queries=64, max_batches=1, max_hop=15):
+    def enable_hop_mass_tracking(self, mass=0.95, max_queries=64, query_sampling="random", max_batches=1, max_hop=15):
         for layer in self.layers:
             if hasattr(layer, "self_attention"):
-                layer.self_attention.enable_hop_mass_tracking(mass, max_queries, max_batches, max_hop)
+                layer.self_attention.enable_hop_mass_tracking(mass, max_queries, query_sampling, max_batches, max_hop)
+
+    def _selected_full_attention_layer_indices(self, layer_mode: str = "all"):
+        if not self.layers:
+            return []
+        mode = str(layer_mode).lower()
+        if mode == "last":
+            return [len(self.layers) - 1]
+        if mode == "all":
+            return list(range(len(self.layers)))
+        raise ValueError(f"Unsupported full-attention layer mode: {layer_mode}")
+
+    def set_full_attention_capture_layers(self, enabled: bool = True, layer_mode: str = "all") -> None:
+        enabled_indices = set(self._selected_full_attention_layer_indices(layer_mode)) if enabled else set()
+        for i, layer in enumerate(self.layers):
+            if hasattr(layer, "self_attention"):
+                layer.self_attention.set_full_attention_capture(i in enabled_indices)
+
+    def get_full_attention_means_per_layer(self, layer_mode: str = "all"):
+        attn_means = []
+        for i in self._selected_full_attention_layer_indices(layer_mode):
+            layer = self.layers[i]
+            if hasattr(layer, "self_attention"):
+                attn_means.append(layer.self_attention.get_last_full_attention_mean())
+            else:
+                attn_means.append(None)
+        return attn_means
+
+    def set_full_attention_extra_biases(self, extra_biases, layer_mode: str = "all") -> None:
+        indices = self._selected_full_attention_layer_indices(layer_mode)
+        if extra_biases is None:
+            bias_by_index = {}
+        else:
+            if len(extra_biases) != len(indices):
+                raise ValueError(
+                    f"Expected {len(indices)} full-attention extra bias tensors for layer_mode={layer_mode}, "
+                    f"got {len(extra_biases)}."
+                )
+            bias_by_index = {layer_idx: extra_biases[pos] for pos, layer_idx in enumerate(indices)}
+        for i, layer in enumerate(self.layers):
+            if hasattr(layer, "self_attention"):
+                layer.self_attention.set_full_attention_extra_bias(bias_by_index.get(i, None))
+
+    def set_last_layer_full_attention_capture(self, enabled: bool = True) -> None:
+        self.set_full_attention_capture_layers(enabled, layer_mode="last")
+
+    def get_last_layer_full_attention_mean(self):
+        attn_means = self.get_full_attention_means_per_layer(layer_mode="last")
+        return attn_means[0] if attn_means else None
+
+    def set_last_layer_full_attention_extra_bias(self, extra_bias) -> None:
+        self.set_full_attention_extra_biases([extra_bias], layer_mode="last")
 
     def disable_hop_mass_tracking(self):
         for layer in self.layers:

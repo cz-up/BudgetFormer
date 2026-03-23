@@ -942,7 +942,19 @@ def build_head_subgraph_provider(args) -> HeadSubgraphProvider:
         return HopMappedHeadSubgraphProvider(hop_sequence, num_groups)
     return SharedHeadSubgraphProvider()
 
-def get_batch_blockize(args, x, y, idx_batch, rest_split_sizes, edge_index, N, device=None, seed_label_mask=None):
+def get_batch_blockize(
+    args,
+    x,
+    y,
+    idx_batch,
+    rest_split_sizes,
+    edge_index,
+    N,
+    device=None,
+    seed_label_mask=None,
+    force_induced_edges: bool = False,
+    apply_graphormer_virtual_edges: bool = True,
+):
     """
     Generate a local subsequence in sequence parallel and slice the corresponding edge_index.
     """
@@ -955,7 +967,11 @@ def get_batch_blockize(args, x, y, idx_batch, rest_split_sizes, edge_index, N, d
     if device is not None:
         dev = torch.device(device) if not isinstance(device, torch.device) else device
 
-    if batch_mode == "seed_rw":
+    if force_induced_edges:
+        x_i = x[idx_batch]
+        y_i = y[idx_batch]
+        edge_index_i_raw = gen_sub_edge_index(edge_index, idx_batch, N)
+    elif batch_mode == "seed_rw":
         if seq_parallel_world_size > 1:
             src_rank = get_sequence_parallel_src_rank()
             group = get_sequence_parallel_group()
@@ -1043,7 +1059,9 @@ def get_batch_blockize(args, x, y, idx_batch, rest_split_sizes, edge_index, N, d
         )  # [n_real, n_real, d]
 
     attn_bias = None
-    if batch_mode == "seed_rw":
+    if force_induced_edges:
+        edge_index_i_heads = edge_index_i_raw
+    elif batch_mode == "seed_rw":
         edge_index_i_heads = edge_index_i_raw
     else:
         rw_base = edge_index_i_raw
@@ -1072,7 +1090,7 @@ def get_batch_blockize(args, x, y, idx_batch, rest_split_sizes, edge_index, N, d
                 walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
             )
 
-    if args.model == "graphormer":
+    if args.model == "graphormer" and apply_graphormer_virtual_edges:
         edge_index_i_heads = _apply_to_edge_index(
             edge_index_i_heads,
             lambda e: fix_edge_index(e, x_i.shape[0]),
@@ -1097,9 +1115,14 @@ def get_batch_blockize(args, x, y, idx_batch, rest_split_sizes, edge_index, N, d
             edge_index_i_heads = torch.empty((2, int(size_broad.item())), device=edge_index_i_heads.device, dtype=edge_index_i_heads.dtype)
         dist.broadcast(edge_index_i_heads, src_rank, group=group)
 
-    if batch_mode == "seed_rw" or idx_batch.shape[0] < seq_length:
-        split_sizes = dynamic_split_sizes if batch_mode == "seed_rw" else rest_split_sizes
-        assert split_sizes is not None, 'Rest split_sizes should not be None'
+    if force_induced_edges:
+        split_sizes = rest_split_sizes if idx_batch.shape[0] < seq_length else None
+    elif batch_mode == "seed_rw":
+        split_sizes = dynamic_split_sizes
+    else:
+        split_sizes = rest_split_sizes if idx_batch.shape[0] < seq_length else None
+
+    if split_sizes is not None:
         seq_length = max(split_sizes) * seq_parallel_world_size
         x_i = pad_2d(x_i, seq_length)
         y_i = pad_y(y_i, seq_length)
@@ -1108,7 +1131,7 @@ def get_batch_blockize(args, x, y, idx_batch, rest_split_sizes, edge_index, N, d
         x_i_list = [t for t in torch.split(x_i, afterpad_split_sizes, dim=0)]
         y_i_list = [t for t in torch.split(y_i, afterpad_split_sizes, dim=0)]
 
-        if args.model == "graphormer":
+        if args.model == "graphormer" and apply_graphormer_virtual_edges:
             edge_index_i_heads = _apply_to_edge_index(
                 edge_index_i_heads,
                 lambda e: adjust_edge_index_nomerge(e, max(split_sizes)),
@@ -1143,7 +1166,7 @@ def get_batch_blockize(args, x, y, idx_batch, rest_split_sizes, edge_index, N, d
 
         x_i = x_i[sub_seq_start:sub_seq_end, :]
         y_i = y_i[sub_seq_start:sub_seq_end]
-        if args.model == "graphormer":
+        if args.model == "graphormer" and apply_graphormer_virtual_edges:
             edge_index_i_heads = _apply_to_edge_index(
                 edge_index_i_heads,
                 lambda e: adjust_edge_index_nomerge(e, sub_seq_length),

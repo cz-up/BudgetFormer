@@ -134,10 +134,22 @@ def add_node_common_args(parser, defaults=None):
         help="advanced override for minimum probe-loss improvement per added edge required to keep expanding the budget",
     )
     parser.add_argument(
+        "--adaptive_edge_budget_eval_repeats",
+        type=int,
+        default=defaults.get("adaptive_edge_budget_eval_repeats", 0),
+        help="advanced override; <=0 averages probe-loss comparisons across a small fixed set of edge seeds",
+    )
+    parser.add_argument(
         "--adaptive_edge_budget_patience",
         type=int,
         default=defaults.get("adaptive_edge_budget_patience", 0),
         help="advanced override; <=0 uses the default stop patience",
+    )
+    parser.add_argument(
+        "--adaptive_edge_budget_lock_edge_set",
+        type=int,
+        default=defaults.get("adaptive_edge_budget_lock_edge_set", 1),
+        help="whether to cache the final sparse edge set after adaptive budget selection; 0 keeps resampling edges each epoch with the chosen budgets",
     )
 
     parser.add_argument("--rank", type=int, default=defaults.get("rank"))
@@ -194,8 +206,59 @@ def add_node_batch_sp_args(parser, defaults=None):
     parser.add_argument("--full_attn_hop_stats", action="store_true", default=False, help="enable full attention hop-mass stats in val")
     parser.add_argument("--full_attn_hop_mass", type=float, default=0.95, help="target hop mass ratio (e.g., 0.95)")
     parser.add_argument("--full_attn_hop_max_queries", type=int, default=defaults.get("full_attn_hop_max_queries", 64), help="max queries per batch for hop-mass stats")
+    parser.add_argument(
+        "--full_attn_hop_query_sampling",
+        type=str,
+        default=defaults.get("full_attn_hop_query_sampling", "random"),
+        choices=["random", "prefix"],
+        help="query selection for full-attention hop-mass stats: random samples without replacement or the old prefix-based order",
+    )
     parser.add_argument("--full_attn_hop_max_batches", type=int, default=defaults.get("full_attn_hop_max_batches", 1), help="max batches per layer to collect hop-mass stats")
     parser.add_argument("--full_attn_hop_max_hop", type=int, default=defaults.get("full_attn_hop_max_hop", 64), help="max hop to explore when collecting hop-mass stats (<=0 for no limit)")
+    parser.add_argument(
+        "--full_attn_hop_stats_dir",
+        type=str,
+        default=defaults.get("full_attn_hop_stats_dir", "./plot/hop_stats"),
+        help="output root directory for per-epoch full-attention hop-mass statistics",
+    )
+    parser.add_argument(
+        "--full_attn_hop_stats_tag",
+        type=str,
+        default=defaults.get("full_attn_hop_stats_tag", ""),
+        help="optional suffix appended to the hop-mass stats directory name",
+    )
+    parser.add_argument(
+        "--full_attn_onehop_eval",
+        action="store_true",
+        default=defaults.get("full_attn_onehop_eval", False),
+        help="run eval-only 1-hop ablation experiments in full attention mode",
+    )
+    parser.add_argument(
+        "--full_attn_onehop_keep_k",
+        type=int,
+        default=defaults.get("full_attn_onehop_keep_k", 4),
+        help="keep top/random K one-hop neighbors per query in the eval-only ablation experiment",
+    )
+    parser.add_argument(
+        "--full_attn_onehop_keep_ratio",
+        type=float,
+        default=defaults.get("full_attn_onehop_keep_ratio", 0.0),
+        help="if > 0, keep this fraction of one-hop neighbors per query (top-attention vs random control) instead of a fixed K",
+    )
+    parser.add_argument(
+        "--full_attn_onehop_eval_splits",
+        type=str,
+        default=defaults.get("full_attn_onehop_eval_splits", "valid"),
+        choices=["valid", "test", "both"],
+        help="which splits to evaluate in the full-attention 1-hop ablation experiment",
+    )
+    parser.add_argument(
+        "--full_attn_onehop_eval_layer_mode",
+        type=str,
+        default=defaults.get("full_attn_onehop_eval_layer_mode", "all"),
+        choices=["last", "all"],
+        help="apply the eval-only 1-hop ablation to the last layer only or to all full-attention layers",
+    )
     parser.add_argument("--adaptive_cov_delta", type=float, default=defaults.get("adaptive_cov_delta", 0.03), help="min coverage improvement to reset patience")
 
     parser.add_argument(
