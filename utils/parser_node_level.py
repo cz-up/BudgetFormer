@@ -134,24 +134,11 @@ def add_node_common_args(parser, defaults=None):
         help="advanced override for minimum probe-loss improvement per added edge required to keep expanding the budget",
     )
     parser.add_argument(
-        "--adaptive_edge_budget_eval_repeats",
-        type=int,
-        default=defaults.get("adaptive_edge_budget_eval_repeats", 0),
-        help="advanced override; <=0 averages probe-loss comparisons across a small fixed set of edge seeds",
-    )
-    parser.add_argument(
         "--adaptive_edge_budget_patience",
         type=int,
         default=defaults.get("adaptive_edge_budget_patience", 0),
         help="advanced override; <=0 uses the default stop patience",
     )
-    parser.add_argument(
-        "--adaptive_edge_budget_lock_edge_set",
-        type=int,
-        default=defaults.get("adaptive_edge_budget_lock_edge_set", 1),
-        help="whether to cache the final sparse edge set after adaptive budget selection; 0 keeps resampling edges each epoch with the chosen budgets",
-    )
-
     parser.add_argument("--rank", type=int, default=defaults.get("rank"))
     parser.add_argument("--local-rank", "--local_rank", type=int, default=defaults.get("local_rank"))
     parser.add_argument("--world-size", type=int, default=defaults.get("world_size"))
