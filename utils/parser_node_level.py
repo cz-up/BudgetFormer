@@ -125,7 +125,7 @@ def add_node_common_args(parser, defaults=None):
         "--adaptive_edge_budget_warmup_epochs",
         type=int,
         default=defaults.get("adaptive_edge_budget_warmup_epochs", 0),
-        help="advanced override; <=0 uses an automatic warmup length",
+        help="advanced override; >0 limits online budget updates to the first N epochs, <=0 removes that cap",
     )
     parser.add_argument(
         "--adaptive_edge_budget_gain_threshold",
@@ -138,6 +138,30 @@ def add_node_common_args(parser, defaults=None):
         type=int,
         default=defaults.get("adaptive_edge_budget_patience", 0),
         help="advanced override; <=0 uses the default stop patience",
+    )
+    parser.add_argument(
+        "--adaptive_edge_budget_bootstrap_search_epochs",
+        type=int,
+        default=defaults.get("adaptive_edge_budget_bootstrap_search_epochs", 0),
+        help="advanced override; 0 uses a short automatic pre-training search to select the initial (real, rw) budget, <0 disables it",
+    )
+    parser.add_argument(
+        "--adaptive_edge_budget_bootstrap_hold_epochs",
+        type=int,
+        default=defaults.get("adaptive_edge_budget_bootstrap_hold_epochs", 0),
+        help="advanced override; 0 keeps the selected bootstrap budget fixed for the automatic default number of early epochs, <0 disables the hold phase",
+    )
+    parser.add_argument(
+        "--adaptive_edge_budget_bootstrap_candidate_limit",
+        type=int,
+        default=defaults.get("adaptive_edge_budget_bootstrap_candidate_limit", 0),
+        help="advanced override; 0 uses the default number of auto-generated bootstrap budget candidates, <0 keeps the full auto-generated set",
+    )
+    parser.add_argument(
+        "--adaptive_edge_budget_static_seed_epochs",
+        type=int,
+        default=defaults.get("adaptive_edge_budget_static_seed_epochs", 0),
+        help="advanced override; 0 keeps early-epoch edge sampling deterministic for the automatic default number of epochs, <0 disables fixed early-epoch sampling",
     )
     parser.add_argument("--rank", type=int, default=defaults.get("rank"))
     parser.add_argument("--local-rank", "--local_rank", type=int, default=defaults.get("local_rank"))

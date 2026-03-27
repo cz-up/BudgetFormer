@@ -6,6 +6,7 @@ import resource
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from typing import Optional
 
 import numpy as np
 import torch
@@ -23,6 +24,7 @@ from gt_sp.utils import (
 )
 from models.graphormer_dist_node_level import Graphormer
 from models.gt_dist_node_level import GT
+from utils.lr import PolynomialDecayLR
 from utils.split_utils import load_default_split
 
 
@@ -172,14 +174,17 @@ def _build_model(args, feature, y, device):
 @dataclass(frozen=True)
 class _AdaptiveEdgeBudgetConfig:
     enabled: bool
-    random_edge_blocks: bool
     probe_size: int
     block_size: int
-    warmup_epochs: int
+    warmup_epochs: Optional[int]
     patience: int
     gain_threshold: float
     max_real_edges_per_query: int
     max_rw_edges_per_query: int
+    bootstrap_search_epochs: int
+    bootstrap_hold_epochs: int
+    bootstrap_candidate_limit: int
+    static_seed_epochs: int
 
 
 def _pin_cpu_tensor(tensor):
@@ -192,8 +197,8 @@ def _pin_cpu_tensor(tensor):
 
 
 def _random_block_sampling_enabled(args, adaptive_edge_budget_cfg=None) -> bool:
-    if adaptive_edge_budget_cfg is not None:
-        return bool(adaptive_edge_budget_cfg.random_edge_blocks)
+    if adaptive_edge_budget_cfg is not None and adaptive_edge_budget_cfg.enabled:
+        return True
     return bool(getattr(args, "random_edge_blocks", False))
 
 
@@ -237,41 +242,73 @@ def _use_rw_edges(args, edge_budget_state=None, adaptive_edge_budget_cfg=None) -
     return True
 
 
-def _resolve_adaptive_edge_budget_config(args, split_idx) -> _AdaptiveEdgeBudgetConfig:
+def _resolve_adaptive_edge_budget_config(args, valid_size: int) -> _AdaptiveEdgeBudgetConfig:
     enabled = _adaptive_edge_budget_enabled(args)
-    random_edge_blocks = bool(getattr(args, "random_edge_blocks", False) or enabled)
 
     probe_size = int(getattr(args, "adaptive_edge_budget_probe_size", 0))
     if enabled and probe_size <= 0:
-        valid_idx = split_idx.get("valid")
-        valid_n = int(valid_idx.numel()) if valid_idx is not None else 0
+        valid_n = max(0, int(valid_size))
         probe_size = min(512, valid_n) if valid_n > 0 else 0
     else:
         probe_size = max(0, probe_size)
 
     block_size = int(getattr(args, "adaptive_edge_budget_block_size", 0))
     if block_size <= 0:
-        block_size = 1
+        block_size = 2
 
-    warmup_epochs = int(getattr(args, "adaptive_edge_budget_warmup_epochs", 0))
-    if warmup_epochs <= 0:
-        warmup_epochs = max(1_000_000, int(args.epochs))
+    warmup_epochs_arg = int(getattr(args, "adaptive_edge_budget_warmup_epochs", 0))
+    warmup_epochs = None if warmup_epochs_arg <= 0 else warmup_epochs_arg
 
     patience = int(getattr(args, "adaptive_edge_budget_patience", 0))
     if patience <= 0:
         patience = 3
     patience = max(3, patience)
 
+    bootstrap_search_epochs = int(getattr(args, "adaptive_edge_budget_bootstrap_search_epochs", 0))
+    if enabled:
+        if bootstrap_search_epochs == 0:
+            bootstrap_search_epochs = 3
+        elif bootstrap_search_epochs < 0:
+            bootstrap_search_epochs = 0
+    bootstrap_search_epochs = max(0, bootstrap_search_epochs)
+
+    bootstrap_hold_epochs = int(getattr(args, "adaptive_edge_budget_bootstrap_hold_epochs", 0))
+    if enabled:
+        if bootstrap_hold_epochs == 0:
+            bootstrap_hold_epochs = bootstrap_search_epochs
+        elif bootstrap_hold_epochs < 0:
+            bootstrap_hold_epochs = 0
+    bootstrap_hold_epochs = max(0, bootstrap_hold_epochs)
+
+    bootstrap_candidate_limit = int(getattr(args, "adaptive_edge_budget_bootstrap_candidate_limit", 0))
+    if enabled:
+        if bootstrap_candidate_limit == 0:
+            bootstrap_candidate_limit = 8
+        elif bootstrap_candidate_limit < 0:
+            bootstrap_candidate_limit = 0
+    bootstrap_candidate_limit = max(0, bootstrap_candidate_limit)
+
+    static_seed_epochs = int(getattr(args, "adaptive_edge_budget_static_seed_epochs", 0))
+    if enabled:
+        if static_seed_epochs == 0:
+            static_seed_epochs = bootstrap_hold_epochs
+        elif static_seed_epochs < 0:
+            static_seed_epochs = 0
+    static_seed_epochs = max(0, static_seed_epochs)
+
     return _AdaptiveEdgeBudgetConfig(
         enabled=enabled,
-        random_edge_blocks=random_edge_blocks,
         probe_size=probe_size,
         block_size=max(1, block_size),
-        warmup_epochs=max(0, warmup_epochs),
+        warmup_epochs=warmup_epochs,
         patience=patience,
         gain_threshold=float(getattr(args, "adaptive_edge_budget_gain_threshold", 0.0)),
         max_real_edges_per_query=max(0, int(getattr(args, "real_edges_per_query", 0))),
         max_rw_edges_per_query=max(0, int(getattr(args, "rw_edges_per_query", 0))),
+        bootstrap_search_epochs=bootstrap_search_epochs,
+        bootstrap_hold_epochs=bootstrap_hold_epochs,
+        bootstrap_candidate_limit=bootstrap_candidate_limit,
+        static_seed_epochs=static_seed_epochs,
     )
 
 
@@ -574,9 +611,10 @@ class _AdaptiveEdgeBudgetController:
         self.block_size = int(config.block_size)
         self.max_real = int(config.max_real_edges_per_query)
         self.max_rw = int(config.max_rw_edges_per_query)
-        self.warmup_epochs = int(config.warmup_epochs)
+        self.warmup_epochs = None if config.warmup_epochs is None else int(config.warmup_epochs)
         self.gain_threshold = float(config.gain_threshold)
         self.patience = int(config.patience)
+        self.bootstrap_hold_epochs = int(config.bootstrap_hold_epochs)
         self.bad_rounds = 0
         self.seen_positive_gain = False
         self.frozen = not self.enabled
@@ -585,10 +623,8 @@ class _AdaptiveEdgeBudgetController:
             self.rw_budget = self.max_rw
             return
 
-        self.real_budget = 2 if self.max_real > 0 else 0
-        self.rw_budget = 2 if self.max_rw > 0 else 0
-        if self.warmup_epochs <= 0:
-            self.frozen = True
+        self.real_budget = 1 if self.max_real > 0 else 0
+        self.rw_budget = 1 if self.max_rw > 0 else 0
 
     def current_state(self):
         return {
@@ -610,6 +646,12 @@ class _AdaptiveEdgeBudgetController:
             }
         return out
 
+    def set_state(self, state) -> None:
+        if state is None:
+            return
+        self.real_budget = int(state.get("real_edges_per_query", self.real_budget))
+        self.rw_budget = int(state.get("rw_edges_per_query", self.rw_budget))
+
     def update(self, choice, best_gain, next_state=None):
         if best_gain > 0.0:
             self.seen_positive_gain = True
@@ -624,6 +666,143 @@ class _AdaptiveEdgeBudgetController:
             self.bad_rounds += 1
             if self.bad_rounds >= self.patience:
                 self.frozen = True
+
+
+def _round_budget_to_block(value: int, block_size: int) -> int:
+    if value <= 0:
+        return 0
+    block_size = max(1, int(block_size))
+    return max(block_size, ((int(value) + block_size - 1) // block_size) * block_size)
+
+
+def _floor_budget_to_block(value: int, block_size: int) -> int:
+    if value <= 0:
+        return 0
+    block_size = max(1, int(block_size))
+    return max(block_size, (int(value) // block_size) * block_size)
+
+
+def _auto_initial_budget_candidates(edge_index_global, num_nodes: int, config: _AdaptiveEdgeBudgetConfig):
+    if config.max_real_edges_per_query <= 0 and config.max_rw_edges_per_query <= 0:
+        return []
+
+    block_size = max(1, int(config.block_size))
+    max_real = max(0, int(config.max_real_edges_per_query))
+    max_rw = max(0, int(config.max_rw_edges_per_query))
+    max_total = max_real + max_rw
+    if max_total <= 0:
+        return []
+
+    edge_dst = edge_index_global[1].to(torch.long).cpu()
+    if edge_dst.numel() == 0:
+        avg_degree = 0.0
+        degree_quantiles = [0.0, 0.0, 0.0]
+    else:
+        degrees = torch.bincount(edge_dst, minlength=num_nodes).to(torch.float32)
+        avg_degree = float(degrees.mean().item())
+        degree_quantiles = torch.quantile(
+            degrees,
+            torch.tensor([0.5, 0.75, 0.9], dtype=torch.float32),
+        ).tolist()
+
+    total_values = {
+        block_size,
+        2 * block_size,
+        4 * block_size,
+        int(round(avg_degree)),
+        int(round(degree_quantiles[0])),
+        int(round(degree_quantiles[1])),
+        int(round(degree_quantiles[2])),
+    }
+    total_candidates = sorted(
+        {
+            min(max_total, _round_budget_to_block(value, block_size))
+            for value in total_values
+            if value > 0
+        }
+    )
+    if not total_candidates:
+        total_candidates = [min(max_total, block_size)]
+
+    ratio_candidates = [0.0, 0.2, 1.0 / 3.0, 0.5]
+    candidates = []
+    if max_real > 0:
+        candidates.append(
+            {
+                "real_edges_per_query": min(max_real, block_size),
+                "rw_edges_per_query": 0,
+            }
+        )
+    if max_real > 0 and max_rw > 0:
+        candidates.extend(
+            [
+                {
+                    "real_edges_per_query": min(max_real, block_size),
+                    "rw_edges_per_query": min(max_rw, block_size),
+                },
+                {
+                    "real_edges_per_query": min(max_real, 2 * block_size),
+                    "rw_edges_per_query": min(max_rw, block_size),
+                },
+                {
+                    "real_edges_per_query": min(max_real, 2 * block_size),
+                    "rw_edges_per_query": min(max_rw, 2 * block_size),
+                },
+            ]
+        )
+
+    for total_budget in total_candidates:
+        for rw_ratio in ratio_candidates:
+            rw_budget = min(max_rw, _floor_budget_to_block(int(round(total_budget * rw_ratio)), block_size))
+            real_budget = min(max_real, max(total_budget - rw_budget, 0))
+            real_budget = _floor_budget_to_block(real_budget, block_size)
+            if max_real > 0 and real_budget <= 0:
+                continue
+            if max_rw > 0 and rw_budget > real_budget > 0:
+                continue
+            state = {
+                "real_edges_per_query": int(real_budget),
+                "rw_edges_per_query": int(rw_budget),
+            }
+            if state["real_edges_per_query"] <= 0 and state["rw_edges_per_query"] <= 0:
+                continue
+            candidates.append(state)
+
+    deduped = []
+    seen = set()
+    for state in candidates:
+        key = (int(state["real_edges_per_query"]), int(state["rw_edges_per_query"]))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(state)
+
+    deduped.sort(
+        key=lambda state: (
+            state["real_edges_per_query"] + state["rw_edges_per_query"],
+            state["rw_edges_per_query"],
+            state["real_edges_per_query"],
+        )
+    )
+    limit = int(config.bootstrap_candidate_limit)
+    if limit > 0 and len(deduped) > limit:
+        selected = []
+        selected_keys = set()
+        for index in np.linspace(0, len(deduped) - 1, num=limit):
+            state = deduped[int(round(float(index)))]
+            key = (state["real_edges_per_query"], state["rw_edges_per_query"])
+            if key not in selected_keys:
+                selected.append(state)
+                selected_keys.add(key)
+        deduped = selected
+    return deduped
+
+
+def _clone_model_state_to_cpu(model):
+    return {
+        name: tensor.detach().cpu().clone()
+        for name, tensor in model.state_dict().items()
+    }
 
 
 def _select_probe_nodes(split_idx, probe_size: int, seed: int):
@@ -686,6 +865,255 @@ def _probe_loss_sp(args, model, x_local, local_y, local_probe_idx, edge_index_pr
     return mean_loss
 
 
+def _build_optimizer_bundle(args, model, device, amp_dtype):
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.peak_lr,
+        weight_decay=args.weight_decay,
+    )
+    lr_scheduler = PolynomialDecayLR(
+        optimizer,
+        warmup=args.warmup_updates,
+        tot=args.epochs,
+        lr=args.peak_lr,
+        end_lr=args.end_lr,
+        power=1.0,
+    )
+    scaler = torch.cuda.amp.GradScaler(
+        enabled=(amp_dtype == torch.float16 and device.startswith("cuda"))
+    )
+    return optimizer, lr_scheduler, scaler
+
+
+def _train_one_epoch_with_budget(
+    args,
+    adaptive_edge_budget_cfg,
+    model,
+    optimizer,
+    lr_scheduler,
+    scaler,
+    x_local,
+    local_y,
+    local_train_idx,
+    edge_index_global,
+    num_nodes,
+    device,
+    rw_device,
+    sp_group,
+    sp_src_rank,
+    sp_rank,
+    local_nodes,
+    amp_dtype,
+    sp_world_size,
+    budget_state,
+    edge_seed,
+):
+    model.train()
+    optimizer.zero_grad(set_to_none=True)
+
+    edge_index = _build_attention_edges(
+        args,
+        edge_index_global,
+        num_nodes,
+        device,
+        rw_device,
+        sp_group,
+        sp_src_rank,
+        sp_rank,
+        local_nodes,
+        edge_seed=edge_seed,
+        edge_budget_state=budget_state,
+        adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
+    )
+
+    with _autocast_context(device, amp_dtype):
+        out_local = model(x_local, None, edge_index, attn_type=args.attn_type)
+        out_rows = int(out_local.size(0))
+        local_y_eff = local_y[:out_rows]
+        valid_train_mask = (local_train_idx >= 0) & (local_train_idx < out_rows)
+        local_train_idx_eff = local_train_idx[valid_train_mask]
+        if local_train_idx_eff.numel() > 0:
+            loss = F.nll_loss(
+                out_local.index_select(0, local_train_idx_eff),
+                local_y_eff.index_select(0, local_train_idx_eff).long(),
+            )
+        else:
+            loss = out_local.sum() * 0.0
+
+    if scaler.is_enabled():
+        scaler.scale(loss).backward()
+    else:
+        loss.backward()
+
+    if sp_world_size > 1:
+        for param in model.parameters():
+            if param.grad is not None:
+                dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, group=sp_group)
+                param.grad.div_(sp_world_size)
+
+    if scaler.is_enabled():
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        optimizer.step()
+    lr_scheduler.step()
+
+    del edge_index, out_local, loss, local_y_eff, valid_train_mask, local_train_idx_eff
+    _cuda_empty_cache(args)
+
+
+def _bootstrap_initial_edge_budget(
+    args,
+    adaptive_edge_budget_cfg,
+    controller,
+    model,
+    x_local,
+    local_y,
+    local_train_idx,
+    probe_idx_global,
+    local_probe_idx,
+    edge_index_global,
+    num_nodes,
+    device,
+    rw_device,
+    sp_group,
+    sp_src_rank,
+    sp_rank,
+    local_nodes,
+    amp_dtype,
+    sp_world_size,
+):
+    if not controller.enabled:
+        return None
+    if adaptive_edge_budget_cfg.bootstrap_search_epochs <= 0:
+        return None
+    if probe_idx_global is None or local_probe_idx is None or probe_idx_global.numel() == 0:
+        return None
+
+    candidate_states = _auto_initial_budget_candidates(edge_index_global, num_nodes, adaptive_edge_budget_cfg)
+    if not candidate_states:
+        return None
+
+    initial_model_state = _clone_model_state_to_cpu(model)
+    probe_edge_pools = None
+    probe_seed = int(getattr(args, "seed", 0))
+    if sp_rank == sp_src_rank:
+        probe_edge_pools = _build_probe_edge_pools(
+            args,
+            edge_index_global,
+            num_nodes,
+            rw_device,
+            probe_idx_global,
+            edge_seed=probe_seed,
+            adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
+        )
+
+    best_state = None
+    best_loss = float("inf")
+    best_edge_count = None
+    candidate_summaries = []
+
+    for candidate_state in candidate_states:
+        _set_seed(int(getattr(args, "seed", 0)))
+        model.load_state_dict(initial_model_state, strict=True)
+        optimizer, lr_scheduler, scaler = _build_optimizer_bundle(args, model, device, amp_dtype)
+
+        for _ in range(adaptive_edge_budget_cfg.bootstrap_search_epochs):
+            _train_one_epoch_with_budget(
+                args,
+                adaptive_edge_budget_cfg,
+                model,
+                optimizer,
+                lr_scheduler,
+                scaler,
+                x_local,
+                local_y,
+                local_train_idx,
+                edge_index_global,
+                num_nodes,
+                device,
+                rw_device,
+                sp_group,
+                sp_src_rank,
+                sp_rank,
+                local_nodes,
+                amp_dtype,
+                sp_world_size,
+                candidate_state,
+                probe_seed,
+            )
+
+        probe_edges = _build_probe_attention_edges(
+            args,
+            edge_index_global,
+            num_nodes,
+            device,
+            rw_device,
+            sp_group,
+            sp_src_rank,
+            sp_rank,
+            local_nodes,
+            probe_idx_global,
+            edge_seed=probe_seed,
+            edge_budget_state=candidate_state,
+            adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
+            edge_pools=probe_edge_pools,
+        )
+        candidate_loss = _probe_loss_sp(
+            args,
+            model,
+            x_local,
+            local_y,
+            local_probe_idx,
+            probe_edges,
+            device,
+            amp_dtype,
+            sp_group,
+            sp_world_size,
+        )
+        candidate_edge_count = _edge_count(probe_edges)
+        del probe_edges, optimizer, lr_scheduler, scaler
+        candidate_summaries.append((candidate_state, candidate_loss, candidate_edge_count))
+
+        candidate_total = (
+            int(candidate_state["real_edges_per_query"]) + int(candidate_state["rw_edges_per_query"])
+        )
+        best_total = (
+            int(best_state["real_edges_per_query"]) + int(best_state["rw_edges_per_query"])
+            if best_state is not None
+            else None
+        )
+        if (
+            candidate_loss < best_loss
+            or (
+                abs(candidate_loss - best_loss) <= 1e-8
+                and (best_total is None or candidate_total < best_total)
+            )
+        ):
+            best_state = dict(candidate_state)
+            best_loss = float(candidate_loss)
+            best_edge_count = int(candidate_edge_count)
+
+    model.load_state_dict(initial_model_state, strict=True)
+    _set_seed(int(getattr(args, "seed", 0)))
+
+    if args.rank == 0:
+        formatted_candidates = ", ".join(
+            [
+                f"({state['real_edges_per_query']},{state['rw_edges_per_query']})@{loss:.4f}"
+                for state, loss, _ in candidate_summaries
+            ]
+        )
+        print(
+            "  ↳ BootstrapBudgetSearch "
+            f"epochs={adaptive_edge_budget_cfg.bootstrap_search_epochs} "
+            f"candidates=[{formatted_candidates}] "
+            f"chosen=({best_state['real_edges_per_query']},{best_state['rw_edges_per_query']}) "
+            f"probe_loss={best_loss:.4f} probe_edges={best_edge_count}"
+        )
+    return best_state
+
+
 def _maybe_update_edge_budget(
     args,
     adaptive_edge_budget_cfg,
@@ -707,7 +1135,12 @@ def _maybe_update_edge_budget(
     amp_dtype,
     sp_world_size,
 ):
-    if (not controller.enabled) or controller.frozen or epoch > controller.warmup_epochs:
+    if (
+        (not controller.enabled)
+        or controller.frozen
+        or epoch <= controller.bootstrap_hold_epochs
+        or (controller.warmup_epochs is not None and epoch > controller.warmup_epochs)
+    ):
         return
     if local_probe_idx is None or probe_idx_global is None or probe_idx_global.numel() == 0:
         controller.frozen = True

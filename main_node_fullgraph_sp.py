@@ -36,7 +36,9 @@ from utils.fullgraph_sp_support import (
     _autocast_context,
     _build_attention_edges,
     _build_model,
+    _build_optimizer_bundle,
     _build_prefetched_cpu_edges,
+    _bootstrap_initial_edge_budget,
     _broadcast_prefetched_edges,
     _cuda_empty_cache,
     _eval_sp,
@@ -54,7 +56,6 @@ from utils.fullgraph_sp_support import (
     _use_real_edges,
     _use_rw_edges,
 )
-from utils.lr import PolynomialDecayLR
 from utils.parser_node_level import (
     add_node_common_args,
     add_node_fullgraph_sp_args,
@@ -103,7 +104,9 @@ def main():
 
     feature, y, edge_index_global, num_nodes, split_idx = _load_data(args)
     feature = feature.float()
-    adaptive_edge_budget_cfg = _resolve_adaptive_edge_budget_config(args, split_idx)
+    valid_idx = split_idx.get("valid")
+    valid_size = int(valid_idx.numel()) if valid_idx is not None else 0
+    adaptive_edge_budget_cfg = _resolve_adaptive_edge_budget_config(args, valid_size)
 
     pad_num_nodes = ((num_nodes + sp_world_size - 1) // sp_world_size) * sp_world_size
     if pad_num_nodes > num_nodes:
@@ -144,6 +147,34 @@ def main():
                 dtype=torch.long,
             )
 
+    model = _build_model(args, feature, y, device)
+    sync_params_and_buffers(model)
+
+    x_local = feature[rank_start:rank_end].to(device)
+    if edge_budget_controller.enabled:
+        initial_budget_state = _bootstrap_initial_edge_budget(
+            args,
+            adaptive_edge_budget_cfg,
+            edge_budget_controller,
+            model,
+            x_local,
+            local_y,
+            local_train_idx,
+            probe_idx_global,
+            local_probe_idx,
+            edge_index_global,
+            num_nodes,
+            device,
+            rw_device,
+            sp_group,
+            sp_src_rank,
+            sp_rank,
+            local_num_nodes,
+            amp_dtype,
+            sp_world_size,
+        )
+        edge_budget_controller.set_state(initial_budget_state)
+
     random_blocks_dynamic = (
         _random_block_sampling_enabled(args, adaptive_edge_budget_cfg)
         and (
@@ -183,7 +214,7 @@ def main():
         print(f"  CPU edge streaming: {int(bool(getattr(args, 'stream_edges_from_cpu', False)))}")
         print(f"  Sparse query chunk size: {getattr(args, 'sparse_query_chunk_size', 0)}")
         print(
-            f"  Random edge blocks: {int(adaptive_edge_budget_cfg.random_edge_blocks)} "
+            f"  Random edge blocks: {int(_random_block_sampling_enabled(args, adaptive_edge_budget_cfg))} "
             f"(real={adaptive_edge_budget_cfg.max_real_edges_per_query} "
             f"rw={adaptive_edge_budget_cfg.max_rw_edges_per_query})"
         )
@@ -191,36 +222,24 @@ def main():
             f"  Adaptive edge budget: {int(edge_budget_controller.enabled)} "
             f"(probe={adaptive_edge_budget_cfg.probe_size} "
             f"block={adaptive_edge_budget_cfg.block_size} "
-            f"warmup={adaptive_edge_budget_cfg.warmup_epochs} "
-            f"patience={adaptive_edge_budget_cfg.patience})"
+            f"warmup={adaptive_edge_budget_cfg.warmup_epochs if adaptive_edge_budget_cfg.warmup_epochs is not None else 'none'} "
+            f"patience={adaptive_edge_budget_cfg.patience} "
+            f"bootstrap_search={adaptive_edge_budget_cfg.bootstrap_search_epochs} "
+            f"bootstrap_hold={adaptive_edge_budget_cfg.bootstrap_hold_epochs} "
+            f"static_seed={adaptive_edge_budget_cfg.static_seed_epochs})"
         )
         print(f"{'=' * 72}\n")
-
-    model = _build_model(args, feature, y, device)
-    sync_params_and_buffers(model)
-    scaler = torch.cuda.amp.GradScaler(enabled=(amp_dtype == torch.float16 and device.startswith("cuda")))
 
     if args.rank == 0:
         print(f"Model params: {sum(param.numel() for param in model.parameters()):,}")
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=args.peak_lr, weight_decay=args.weight_decay
-    )
-    lr_scheduler = PolynomialDecayLR(
-        optimizer,
-        warmup=args.warmup_updates,
-        tot=args.epochs,
-        lr=args.peak_lr,
-        end_lr=args.end_lr,
-        power=1.0,
-    )
+    optimizer, lr_scheduler, scaler = _build_optimizer_bundle(args, model, device, amp_dtype)
 
     best_val = 0.0
     best_test = 0.0
     best_epoch = -1
     loss_ema = None
 
-    x_local = feature[rank_start:rank_end].to(device)
     cached_edge_index = None
     if not dynamic_edges:
         cached_edge_index = _build_attention_edges(
@@ -253,7 +272,13 @@ def main():
                 or prefetch_cpu_rw
                 or random_blocks_dynamic
             )
-            edge_seed = args.seed + epoch if use_epoch_seed else None
+            if use_epoch_seed:
+                if epoch <= adaptive_edge_budget_cfg.static_seed_epochs:
+                    edge_seed = args.seed
+                else:
+                    edge_seed = args.seed + epoch
+            else:
+                edge_seed = None
             if edge_prefetcher.enabled:
                 prefetched_cpu = edge_prefetcher.pop(epoch)
             if prefetched_cpu is not None:
