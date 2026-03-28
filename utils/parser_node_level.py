@@ -163,6 +163,15 @@ def add_node_common_args(parser, defaults=None):
         default=defaults.get("adaptive_edge_budget_static_seed_epochs", 0),
         help="advanced override; 0 keeps early-epoch edge sampling deterministic for the automatic default number of epochs, <0 disables fixed early-epoch sampling",
     )
+    parser.add_argument(
+        "--walk_length_candidates",
+        type=str,
+        default=defaults.get("walk_length_candidates", ""),
+        help=(
+            "comma-separated walk lengths to jointly search during bootstrap budget selection, "
+            "e.g. '4,6,8'; empty or 'none' disables walk-length search and uses --head_hop_walk_length"
+        ),
+    )
     parser.add_argument("--rank", type=int, default=defaults.get("rank"))
     parser.add_argument("--local-rank", "--local_rank", type=int, default=defaults.get("local_rank"))
     parser.add_argument("--world-size", type=int, default=defaults.get("world_size"))
