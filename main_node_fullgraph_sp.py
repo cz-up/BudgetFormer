@@ -180,11 +180,11 @@ def main():
         and (
             (
                 _use_real_edges(args, adaptive_edge_budget_cfg)
-                and max(adaptive_edge_budget_cfg.max_real_edges_per_query, edge_budget_controller.real_budget) > 0
+                and max(adaptive_edge_budget_cfg.max_total_edges_per_query, edge_budget_controller.real_budget) > 0
             )
             or (
                 int(getattr(args, "head_hop_walks_per_node", 0)) > 0
-                and max(adaptive_edge_budget_cfg.max_rw_edges_per_query, edge_budget_controller.rw_budget) > 0
+                and max(adaptive_edge_budget_cfg.max_total_edges_per_query, edge_budget_controller.rw_budget) > 0
             )
         )
     )
@@ -215,8 +215,7 @@ def main():
         print(f"  Sparse query chunk size: {getattr(args, 'sparse_query_chunk_size', 0)}")
         print(
             f"  Random edge blocks: {int(_random_block_sampling_enabled(args, adaptive_edge_budget_cfg))} "
-            f"(real={adaptive_edge_budget_cfg.max_real_edges_per_query} "
-            f"rw={adaptive_edge_budget_cfg.max_rw_edges_per_query})"
+            f"(max_total={adaptive_edge_budget_cfg.max_total_edges_per_query})"
         )
         print(
             f"  Adaptive edge budget: {int(edge_budget_controller.enabled)} "

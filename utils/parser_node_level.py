@@ -92,16 +92,10 @@ def add_node_common_args(parser, defaults=None):
         help="for full-graph sparse attention, randomly sample per-query real/RW edge blocks before merging; enabled automatically with --adaptive_edge_budget",
     )
     parser.add_argument(
-        "--real_edges_per_query",
+        "--max_total_edges_per_query",
         type=int,
-        default=defaults.get("real_edges_per_query", 0),
-        help="when --random_edge_blocks is enabled, keep at most this many real edges per query (<=0 disables)",
-    )
-    parser.add_argument(
-        "--rw_edges_per_query",
-        type=int,
-        default=defaults.get("rw_edges_per_query", 0),
-        help="when --random_edge_blocks is enabled, keep at most this many RW edges per query (<=0 disables)",
+        default=defaults.get("max_total_edges_per_query", 0),
+        help="when --random_edge_blocks is enabled, keep at most this many total edges per query (<=0 disables). Automatically split if adaptive budget is disabled.",
     )
     parser.add_argument(
         "--adaptive_edge_budget",
@@ -124,8 +118,8 @@ def add_node_common_args(parser, defaults=None):
     parser.add_argument(
         "--adaptive_edge_budget_warmup_epochs",
         type=int,
-        default=defaults.get("adaptive_edge_budget_warmup_epochs", 0),
-        help="advanced override; >0 limits online budget updates to the first N epochs, <=0 removes that cap",
+        default=defaults.get("adaptive_edge_budget_warmup_epochs", -1),
+        help="advanced override; >0 limits online budget updates to the first N epochs, 0 freezes immediately after bootstrap, <0 removes cap",
     )
     parser.add_argument(
         "--adaptive_edge_budget_gain_threshold",
@@ -298,7 +292,7 @@ def add_node_fullgraph_sp_args(parser, defaults=None):
         "--include_real_edges",
         type=int,
         default=defaults.get("include_real_edges", 0),
-        help="legacy full-graph flag for including all real edges; with --random_edge_blocks and --real_edges_per_query > 0, real-edge blocks are enabled automatically",
+        help="legacy full-graph flag for including all real edges; with --random_edge_blocks and --max_total_edges_per_query > 0, real-edge blocks are enabled automatically",
     )
     parser.add_argument("--include_self_loops", type=int, default=defaults.get("include_self_loops", 0))
     parser.add_argument(

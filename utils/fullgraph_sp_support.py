@@ -179,8 +179,7 @@ class _AdaptiveEdgeBudgetConfig:
     warmup_epochs: Optional[int]
     patience: int
     gain_threshold: float
-    max_real_edges_per_query: int
-    max_rw_edges_per_query: int
+    max_total_edges_per_query: int
     bootstrap_search_epochs: int
     bootstrap_hold_epochs: int
     bootstrap_candidate_limit: int
@@ -211,16 +210,24 @@ def _get_real_edge_budget(args, edge_budget_state=None, adaptive_edge_budget_cfg
     if edge_budget_state is not None and "real_edges_per_query" in edge_budget_state:
         return int(edge_budget_state["real_edges_per_query"])
     if adaptive_edge_budget_cfg is not None:
-        return int(adaptive_edge_budget_cfg.max_real_edges_per_query)
-    return int(getattr(args, "real_edges_per_query", 0))
+        max_tot = int(adaptive_edge_budget_cfg.max_total_edges_per_query)
+    else:
+        max_tot = int(getattr(args, "max_total_edges_per_query", 0))
+    if int(getattr(args, "head_hop_walks_per_node", 0)) <= 0:
+        return max_tot
+    return (max_tot + 1) // 2
 
 
 def _get_rw_edge_budget(args, edge_budget_state=None, adaptive_edge_budget_cfg=None) -> int:
     if edge_budget_state is not None and "rw_edges_per_query" in edge_budget_state:
         return int(edge_budget_state["rw_edges_per_query"])
+    if int(getattr(args, "head_hop_walks_per_node", 0)) <= 0:
+        return 0
     if adaptive_edge_budget_cfg is not None:
-        return int(adaptive_edge_budget_cfg.max_rw_edges_per_query)
-    return int(getattr(args, "rw_edges_per_query", 0))
+        max_tot = int(adaptive_edge_budget_cfg.max_total_edges_per_query)
+    else:
+        max_tot = int(getattr(args, "max_total_edges_per_query", 0))
+    return max_tot // 2
 
 
 def _use_real_edges(args, adaptive_edge_budget_cfg=None) -> bool:
@@ -258,7 +265,7 @@ def _resolve_adaptive_edge_budget_config(args, valid_size: int) -> _AdaptiveEdge
         block_size = 2
 
     warmup_epochs_arg = int(getattr(args, "adaptive_edge_budget_warmup_epochs", 0))
-    warmup_epochs = None if warmup_epochs_arg <= 0 else warmup_epochs_arg
+    warmup_epochs = None if warmup_epochs_arg < 0 else warmup_epochs_arg
 
     patience = int(getattr(args, "adaptive_edge_budget_patience", 0))
     if patience <= 0:
@@ -318,8 +325,7 @@ def _resolve_adaptive_edge_budget_config(args, valid_size: int) -> _AdaptiveEdge
         warmup_epochs=warmup_epochs,
         patience=patience,
         gain_threshold=float(getattr(args, "adaptive_edge_budget_gain_threshold", 0.0)),
-        max_real_edges_per_query=max(0, int(getattr(args, "real_edges_per_query", 0))),
-        max_rw_edges_per_query=max(0, int(getattr(args, "rw_edges_per_query", 0))),
+        max_total_edges_per_query=max(0, int(getattr(args, "max_total_edges_per_query", 0))),
         bootstrap_search_epochs=bootstrap_search_epochs,
         bootstrap_hold_epochs=bootstrap_hold_epochs,
         bootstrap_candidate_limit=bootstrap_candidate_limit,
@@ -631,8 +637,7 @@ class _AdaptiveEdgeBudgetController:
     def __init__(self, config: _AdaptiveEdgeBudgetConfig) -> None:
         self.enabled = config.enabled
         self.block_size = int(config.block_size)
-        self.max_real = int(config.max_real_edges_per_query)
-        self.max_rw = int(config.max_rw_edges_per_query)
+        self.max_total = int(config.max_total_edges_per_query)
         self.warmup_epochs = None if config.warmup_epochs is None else int(config.warmup_epochs)
         self.gain_threshold = float(config.gain_threshold)
         self.patience = int(config.patience)
@@ -641,12 +646,12 @@ class _AdaptiveEdgeBudgetController:
         self.seen_positive_gain = False
         self.frozen = not self.enabled
         if not self.enabled:
-            self.real_budget = self.max_real
-            self.rw_budget = self.max_rw
+            self.real_budget = self.max_total
+            self.rw_budget = 0
             return
 
-        self.real_budget = 1 if self.max_real > 0 else 0
-        self.rw_budget = 1 if self.max_rw > 0 else 0
+        self.real_budget = 1 if self.max_total > 0 else 0
+        self.rw_budget = 1 if self.max_total > 0 else 0
 
     def current_state(self):
         return {
@@ -656,15 +661,14 @@ class _AdaptiveEdgeBudgetController:
 
     def candidate_states(self):
         out = {}
-        if self.real_budget < self.max_real:
-            out["real"] = {
-                "real_edges_per_query": min(self.max_real, self.real_budget + self.block_size),
+        if self.real_budget + self.rw_budget + self.block_size <= self.max_total:
+            out["real_up"] = {
+                "real_edges_per_query": self.real_budget + self.block_size,
                 "rw_edges_per_query": self.rw_budget,
             }
-        if self.rw_budget < self.max_rw:
-            out["rw"] = {
+            out["rw_up"] = {
                 "real_edges_per_query": self.real_budget,
-                "rw_edges_per_query": min(self.max_rw, self.rw_budget + self.block_size),
+                "rw_edges_per_query": self.rw_budget + self.block_size,
             }
         return out
 
@@ -705,15 +709,11 @@ def _floor_budget_to_block(value: int, block_size: int) -> int:
 
 
 def _auto_initial_budget_candidates(edge_index_global, num_nodes: int, config: _AdaptiveEdgeBudgetConfig):
-    if config.max_real_edges_per_query <= 0 and config.max_rw_edges_per_query <= 0:
+    max_total = int(config.max_total_edges_per_query)
+    if max_total <= 0:
         return []
 
     block_size = max(1, int(config.block_size))
-    max_real = max(0, int(config.max_real_edges_per_query))
-    max_rw = max(0, int(config.max_rw_edges_per_query))
-    max_total = max_real + max_rw
-    if max_total <= 0:
-        return []
 
     edge_dst = edge_index_global[1].to(torch.long).cpu()
     if edge_dst.numel() == 0:
@@ -748,76 +748,61 @@ def _auto_initial_budget_candidates(edge_index_global, num_nodes: int, config: _
 
     ratio_candidates = [0.0, 0.2, 1.0 / 3.0, 0.5]
     candidates = []
-    if max_real > 0:
-        candidates.append(
-            {
-                "real_edges_per_query": min(max_real, block_size),
-                "rw_edges_per_query": 0,
-            }
-        )
-    if max_real > 0 and max_rw > 0:
+
+    candidates.append(
+        {
+            "real_edges_per_query": min(max_total, block_size),
+            "rw_edges_per_query": 0,
+        }
+    )
+    if max_total >= 2 * block_size:
         candidates.extend(
             [
                 {
-                    "real_edges_per_query": min(max_real, block_size),
-                    "rw_edges_per_query": min(max_rw, block_size),
+                    "real_edges_per_query": block_size,
+                    "rw_edges_per_query": block_size,
                 },
                 {
-                    "real_edges_per_query": min(max_real, 2 * block_size),
-                    "rw_edges_per_query": min(max_rw, block_size),
-                },
-                {
-                    "real_edges_per_query": min(max_real, 2 * block_size),
-                    "rw_edges_per_query": min(max_rw, 2 * block_size),
+                    "real_edges_per_query": min(max_total, 2 * block_size),
+                    "rw_edges_per_query": block_size,
                 },
             ]
         )
 
     for total_budget in total_candidates:
         for rw_ratio in ratio_candidates:
-            rw_budget = min(max_rw, _floor_budget_to_block(int(round(total_budget * rw_ratio)), block_size))
-            real_budget = min(max_real, max(total_budget - rw_budget, 0))
+            rw_budget = _floor_budget_to_block(int(round(total_budget * rw_ratio)), block_size)
+            real_budget = max(total_budget - rw_budget, 0)
             real_budget = _floor_budget_to_block(real_budget, block_size)
-            if max_real > 0 and real_budget <= 0:
+            
+            if real_budget <= 0 and rw_budget <= 0:
                 continue
-            if max_rw > 0 and rw_budget > real_budget > 0:
-                continue
+                
             state = {
                 "real_edges_per_query": int(real_budget),
                 "rw_edges_per_query": int(rw_budget),
             }
-            if state["real_edges_per_query"] <= 0 and state["rw_edges_per_query"] <= 0:
-                continue
             candidates.append(state)
 
-    deduped = []
+    unique_candidates = []
     seen = set()
-    for state in candidates:
-        key = (int(state["real_edges_per_query"]), int(state["rw_edges_per_query"]))
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(state)
+    for c in candidates:
+        key = (int(c["real_edges_per_query"]), int(c["rw_edges_per_query"]))
+        if key not in seen:
+            seen.add(key)
+            unique_candidates.append(c)
 
-    deduped.sort(
+    unique_candidates.sort(
         key=lambda state: (
             state["real_edges_per_query"] + state["rw_edges_per_query"],
             state["rw_edges_per_query"],
-            state["real_edges_per_query"],
         )
     )
+
     limit = int(config.bootstrap_candidate_limit)
-    if limit > 0 and len(deduped) > limit:
-        selected = []
-        selected_keys = set()
-        for index in np.linspace(0, len(deduped) - 1, num=limit):
-            state = deduped[int(round(float(index)))]
-            key = (state["real_edges_per_query"], state["rw_edges_per_query"])
-            if key not in selected_keys:
-                selected.append(state)
-                selected_keys.add(key)
-        deduped = selected
-    return deduped
+    if limit > 0 and len(unique_candidates) > limit:
+        return unique_candidates[:limit]
+    return unique_candidates
 
 
 def _clone_model_state_to_cpu(model):
@@ -1028,9 +1013,6 @@ def _bootstrap_initial_edge_budget(
     initial_model_state = _clone_model_state_to_cpu(model)
     probe_seed = int(getattr(args, "seed", 0))
 
-    best_state = None
-    best_loss = float("inf")
-    best_edge_count = None
     candidate_summaries = []
 
     for walk_length in wl_candidates:
@@ -1116,26 +1098,20 @@ def _bootstrap_initial_edge_budget(
             full_candidate_state = dict(candidate_state)
             if walk_length is not None:
                 full_candidate_state["walk_length"] = walk_length
-            candidate_summaries.append((full_candidate_state, candidate_loss, candidate_edge_count))
+            candidate_summaries.append((full_candidate_state, float(candidate_loss), int(candidate_edge_count)))
 
-            candidate_total = (
-                int(candidate_state["real_edges_per_query"]) + int(candidate_state["rw_edges_per_query"])
-            )
-            best_total = (
-                int(best_state["real_edges_per_query"]) + int(best_state["rw_edges_per_query"])
-                if best_state is not None
-                else None
-            )
-            if (
-                candidate_loss < best_loss
-                or (
-                    abs(candidate_loss - best_loss) <= 1e-8
-                    and (best_total is None or candidate_total < best_total)
-                )
-            ):
-                best_state = full_candidate_state
-                best_loss = float(candidate_loss)
-                best_edge_count = int(candidate_edge_count)
+    # Select the candidate with the absolute lowest probe loss. 
+    # In case of ties (within 1e-6), prefer the configuration with fewer edges.
+    best_state = None
+    best_loss = float('inf')
+    best_edge_count = float('inf')
+    
+    for state, loss, edges in candidate_summaries:
+        if loss < best_loss - 1e-6 or (abs(loss - best_loss) <= 1e-6 and edges < best_edge_count):
+            best_state = state
+            best_loss = loss
+            best_edge_count = edges
+
 
     model.load_state_dict(initial_model_state, strict=True)
     _set_seed(int(getattr(args, "seed", 0)))
@@ -1188,6 +1164,7 @@ def _maybe_update_edge_budget(
         or (controller.warmup_epochs is not None and epoch > controller.warmup_epochs)
     ):
         return
+        
     if local_probe_idx is None or probe_idx_global is None or probe_idx_global.numel() == 0:
         controller.frozen = True
         return
@@ -1263,6 +1240,7 @@ def _maybe_update_edge_budget(
             best_state = cand_state
             best_loss = cand_loss
             best_count = cand_count
+            
         del cand_edges
 
     controller.update(best_kind if best_gain > controller.gain_threshold else None,
@@ -1271,7 +1249,7 @@ def _maybe_update_edge_budget(
     if args.rank == 0:
         print(
             f"  ↳ BudgetCtrl epoch={epoch} probe_loss={base_loss:.4f} "
-            f"edges={base_count} choice={best_kind} gain={best_gain:.6e} "
+            f"edges={base_count} choice={best_kind or 'frozen_base'} gain={best_gain:.6e} "
             f"next_real={controller.real_budget} next_rw={controller.rw_budget}"
             + (
                 f" cand_loss={best_loss:.4f} cand_edges={best_count}"
