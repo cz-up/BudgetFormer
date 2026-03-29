@@ -644,6 +644,10 @@ class _AdaptiveEdgeBudgetController:
         self.bootstrap_hold_epochs = int(config.bootstrap_hold_epochs)
         self.bad_rounds = 0
         self.seen_positive_gain = False
+        
+        self.auto_hold_released = False
+        self.baseline_acc = -1.0
+        
         self.frozen = not self.enabled
         if not self.enabled:
             self.real_budget = self.max_total
@@ -841,6 +845,7 @@ def _probe_loss_sp(args, model, x_local, local_y, local_probe_idx, edge_index_pr
     drop_states = _set_dropout_eval(model)
 
     loss_sum = torch.zeros(1, device=device, dtype=torch.float32)
+    acc_sum = torch.zeros(1, device=device, dtype=torch.float32)
     count = torch.zeros(1, device=device, dtype=torch.long)
     with torch.no_grad():
         with _autocast_context(device, amp_dtype):
@@ -851,15 +856,20 @@ def _probe_loss_sp(args, model, x_local, local_y, local_probe_idx, edge_index_pr
             probe_idx_eff = local_probe_idx[valid_probe]
             if probe_idx_eff.numel() > 0:
                 local_y_eff = local_y[:out_rows]
+                logits = out_local.index_select(0, probe_idx_eff)
+                targets = local_y_eff.index_select(0, probe_idx_eff).long()
                 loss_sum = F.nll_loss(
-                    out_local.index_select(0, probe_idx_eff),
-                    local_y_eff.index_select(0, probe_idx_eff).long(),
+                    logits,
+                    targets,
                     reduction="sum",
                 ).to(torch.float32).view(1)
+                preds = logits.argmax(dim=-1)
+                acc_sum = (preds == targets).sum().to(torch.float32).view(1)
                 count = torch.tensor([probe_idx_eff.numel()], device=device, dtype=torch.long)
 
     if sp_world_size > 1:
         dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM, group=sp_group)
+        dist.all_reduce(acc_sum, op=dist.ReduceOp.SUM, group=sp_group)
         dist.all_reduce(count, op=dist.ReduceOp.SUM, group=sp_group)
 
     _restore_dropout(drop_states)
@@ -867,9 +877,10 @@ def _probe_loss_sp(args, model, x_local, local_y, local_probe_idx, edge_index_pr
         model.eval()
 
     mean_loss = float(loss_sum.item() / max(int(count.item()), 1))
+    mean_acc = float(acc_sum.item() / max(int(count.item()), 1))
     del out_local
     _cuda_empty_cache(args)
-    return mean_loss
+    return mean_loss, mean_acc
 
 
 def _build_optimizer_bundle(args, model, device, amp_dtype):
@@ -971,7 +982,6 @@ def _train_one_epoch_with_budget(
     _cuda_empty_cache(args)
 
 
-
 def _bootstrap_initial_edge_budget(
     args,
     adaptive_edge_budget_cfg,
@@ -995,7 +1005,10 @@ def _bootstrap_initial_edge_budget(
 ):
     if not controller.enabled:
         return None
-    if adaptive_edge_budget_cfg.bootstrap_search_epochs <= 0:
+    if (
+        not adaptive_edge_budget_cfg.bootstrap_search_epochs
+        or adaptive_edge_budget_cfg.bootstrap_search_epochs <= 0
+    ):
         return None
     if probe_idx_global is None or local_probe_idx is None or probe_idx_global.numel() == 0:
         return None
@@ -1004,11 +1017,9 @@ def _bootstrap_initial_edge_budget(
     if not candidate_states:
         return None
 
-    # Determine which walk lengths to search.
-    # None in the list means "use args.head_hop_walk_length" (original behaviour).
     wl_candidates = list(adaptive_edge_budget_cfg.bootstrap_walk_length_candidates)
     if not wl_candidates:
-        wl_candidates = [None]  # single pass, no override
+        wl_candidates = [None]
 
     initial_model_state = _clone_model_state_to_cpu(model)
     probe_seed = int(getattr(args, "seed", 0))
@@ -1016,7 +1027,6 @@ def _bootstrap_initial_edge_budget(
     candidate_summaries = []
 
     for walk_length in wl_candidates:
-        # Each walk length needs its own probe_edge_pools because the rw pool depends on L.
         probe_edge_pools = None
         if sp_rank == sp_src_rank:
             probe_edge_pools = _build_probe_edge_pools(
@@ -1035,7 +1045,7 @@ def _bootstrap_initial_edge_budget(
             model.load_state_dict(initial_model_state, strict=True)
             optimizer, lr_scheduler, scaler = _build_optimizer_bundle(args, model, device, amp_dtype)
 
-            for _ in range(adaptive_edge_budget_cfg.bootstrap_search_epochs):
+            for _ in range(int(adaptive_edge_budget_cfg.bootstrap_search_epochs)):
                 _train_one_epoch_with_budget(
                     args,
                     adaptive_edge_budget_cfg,
@@ -1078,7 +1088,7 @@ def _bootstrap_initial_edge_budget(
                 edge_pools=probe_edge_pools,
                 walk_length_override=walk_length,
             )
-            candidate_loss = _probe_loss_sp(
+            candidate_loss, _ = _probe_loss_sp(
                 args,
                 model,
                 x_local,
@@ -1093,15 +1103,11 @@ def _bootstrap_initial_edge_budget(
             candidate_edge_count = _edge_count(probe_edges)
             del probe_edges, optimizer, lr_scheduler, scaler
 
-            # Build full state including walk_length for logging; controller.set_state only
-            # reads the budget keys so walk_length here is only informational.
             full_candidate_state = dict(candidate_state)
             if walk_length is not None:
                 full_candidate_state["walk_length"] = walk_length
             candidate_summaries.append((full_candidate_state, float(candidate_loss), int(candidate_edge_count)))
 
-    # Select the candidate with the absolute lowest probe loss. 
-    # In case of ties (within 1e-6), prefer the configuration with fewer edges.
     best_state = None
     best_loss = float('inf')
     best_edge_count = float('inf')
@@ -1112,6 +1118,20 @@ def _bootstrap_initial_edge_budget(
             best_loss = loss
             best_edge_count = edges
 
+    if len(candidate_summaries) > 1:
+        all_losses = [c[1] for c in candidate_summaries]
+        max_v = max(all_losses)
+        min_v = min(all_losses)
+        rel_var = (max_v - min_v) / max(min_v, 1e-6)
+        
+        if rel_var > 0.01:
+            controller.auto_hold_released = True
+            if args.rank == 0:
+                print(f"  ↳ Bootstrap sensitivity rel_var={rel_var:.4f} > 0.01. Unlocking BudgetCtrl immediately.")
+        else:
+            controller.auto_hold_released = False
+            if args.rank == 0:
+                print(f"  ↳ Bootstrap sensitivity rel_var={rel_var:.4f} <= 0.01. BudgetCtrl remains locked until accuracy breakout.")
 
     model.load_state_dict(initial_model_state, strict=True)
     _set_seed(int(getattr(args, "seed", 0)))
@@ -1133,7 +1153,6 @@ def _bootstrap_initial_edge_budget(
             f"probe_loss={best_loss:.4f} probe_edges={best_edge_count}"
         )
     return best_state
-
 
 
 def _maybe_update_edge_budget(
@@ -1160,7 +1179,6 @@ def _maybe_update_edge_budget(
     if (
         (not controller.enabled)
         or controller.frozen
-        or epoch <= controller.bootstrap_hold_epochs
         or (controller.warmup_epochs is not None and epoch > controller.warmup_epochs)
     ):
         return
@@ -1198,12 +1216,31 @@ def _maybe_update_edge_budget(
         adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
         edge_pools=probe_edge_pools,
     )
-    base_loss = _probe_loss_sp(
+    base_loss, base_acc = _probe_loss_sp(
         args, model, x_local, local_y, local_probe_idx, base_edges,
         device, amp_dtype, sp_group, sp_world_size,
     )
     base_count = _edge_count(base_edges)
     del base_edges
+
+    explicit_hold_epochs = int(getattr(args, "adaptive_edge_budget_bootstrap_hold_epochs", 0))
+    if explicit_hold_epochs > 0 and epoch <= explicit_hold_epochs:
+        return
+
+    # Check Accuracy Breakout Trigger
+    if not controller.auto_hold_released:
+        if controller.baseline_acc < 0.0:
+            controller.baseline_acc = base_acc
+            
+        # Accuracy breakout threshold: > +1% absolute accuracy
+        if base_acc > controller.baseline_acc + 0.1:
+            controller.auto_hold_released = True
+            if args.rank == 0:
+                print(f"  ↳ BudgetCtrl [AutoHoldReleased] acc broken out: {base_acc:.4f} > baseline={controller.baseline_acc:.4f}")
+        else:
+            if args.rank == 0:
+                print(f"  ↳ BudgetCtrl [AutoHold] epoch={epoch} acc={base_acc:.4f} (baseline={controller.baseline_acc:.4f}, awaiting +1% breakout)")
+            return
 
     best_kind = None
     best_gain = float("-inf")
@@ -1227,7 +1264,7 @@ def _maybe_update_edge_budget(
             adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
             edge_pools=probe_edge_pools,
         )
-        cand_loss = _probe_loss_sp(
+        cand_loss, cand_acc = _probe_loss_sp(
             args, model, x_local, local_y, local_probe_idx, cand_edges,
             device, amp_dtype, sp_group, sp_world_size,
         )
