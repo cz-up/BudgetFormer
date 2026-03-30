@@ -132,6 +132,8 @@ def main():
     local_y = y[rank_start:rank_end].to(device)
 
     edge_budget_controller = _AdaptiveEdgeBudgetController(adaptive_edge_budget_cfg)
+    total_bootstrap_time = 0.0
+    total_adjustment_time = 0.0
     probe_idx_global = None
     local_probe_idx = None
     if edge_budget_controller.enabled:
@@ -152,6 +154,7 @@ def main():
 
     x_local = feature[rank_start:rank_end].to(device)
     if edge_budget_controller.enabled:
+        t_bs_start = time.time()
         initial_budget_state = _bootstrap_initial_edge_budget(
             args,
             adaptive_edge_budget_cfg,
@@ -173,6 +176,7 @@ def main():
             amp_dtype,
             sp_world_size,
         )
+        total_bootstrap_time += (time.time() - t_bs_start)
         edge_budget_controller.set_state(initial_budget_state)
 
     random_blocks_dynamic = (
@@ -257,6 +261,7 @@ def main():
 
     for epoch in range(1, args.epochs + 1):
         t_epoch = time.time()
+        was_released = edge_budget_controller.auto_hold_released
         model.train()
         optimizer.zero_grad(set_to_none=True)
 
@@ -441,11 +446,20 @@ def main():
         if sp_world_size > 1:
             dist.barrier(group=sp_group)
 
+        epoch_time_total = time.time() - t_epoch
+        if edge_budget_controller.enabled:
+            if was_released:
+                total_adjustment_time += epoch_time_total
+            else:
+                total_bootstrap_time += epoch_time_total
+
     edge_prefetcher.close()
 
     if args.rank == 0:
         print(f"\n{'=' * 72}")
         print(f"Done.  Best epoch={best_epoch}  Val={best_val:.2%}  Test={best_test:.2%}")
+        if edge_budget_controller.enabled:
+            print(f"Timing: bootstrap={total_bootstrap_time:.2f}s  adjustment={total_adjustment_time:.2f}s")
         print(f"{'=' * 72}")
 
     if torch.cuda.is_available():
