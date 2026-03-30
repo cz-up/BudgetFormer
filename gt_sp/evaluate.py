@@ -349,13 +349,17 @@ def sparse_eval_gpu(args, model, x, y, sub_idx, attn_bias, edge_index, device):
     total = 0
     correct = 0
     N = x.shape[0]
+    force_gt_induced_eval = str(getattr(args, "model", "")).lower() == "gt"
     seq_parallel_world_size = (
         get_sequence_parallel_world_size() if sequence_parallel_is_initialized() else 1
     )
     
     # num_batch = sub_idx.size(0) // args.seq_len + 1
     # seq_len = 128
-    eval_batch_size = get_seed_batch_size(args) if getattr(args, "batch_subgraph_mode", "induced") == "seed_rw" else args.seq_len
+    if force_gt_induced_eval:
+        eval_batch_size = args.seq_len
+    else:
+        eval_batch_size = get_seed_batch_size(args) if getattr(args, "batch_subgraph_mode", "induced") == "seed_rw" else args.seq_len
     num_batch = (sub_idx.size(0) + eval_batch_size - 1) // eval_batch_size
     
     
@@ -376,6 +380,7 @@ def sparse_eval_gpu(args, model, x, y, sub_idx, attn_bias, edge_index, device):
             edge_index,
             N,
             device=device,
+            force_induced_edges=force_gt_induced_eval,
         )
 
         x_i, y_i = x_i.to(device), y_i.to(device)

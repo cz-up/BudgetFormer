@@ -304,10 +304,14 @@ def add_node_fullgraph_sp_args(parser, defaults=None):
 
 
 def normalize_main_node_batch_sp_args(args):
+    if str(getattr(args, "model", "")).lower() == "gt":
+        args.attn_type = "sparse"
     return args
 
 
 def normalize_main_node_fullgraph_sp_args(args):
+    if str(getattr(args, "model", "")).lower() == "gt":
+        args.attn_type = "sparse"
     if args.model != "graphormer":
         args.num_global_node = 0
     elif args.num_global_node not in (0, 1):

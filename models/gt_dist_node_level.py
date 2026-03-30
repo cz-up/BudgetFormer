@@ -418,17 +418,13 @@ class CoreAttention(nn.Module):
         # ===================================
         # q, k, v: [b, s+p, np, hn], edge_index: [2, total_edges], attn_bias: [b, n, s+p, s+p]
         batch_size, s_len = q.size(0), q.size(1)
-         
-        if attn_type == "full":
-            x = self.full_attention(k, q, v, attn_bias, edge_index=edge_index)
-        elif attn_type == "sparse":
-            x = self.sparse_attention_bias(q, k, v, edge_index, attn_bias)
-        elif attn_type == "flash":
-            q = q.half()
-            k = k.half()
-            v = v.half()
-            x = flash_attn_func(q, k, v, self.attention_dropout_rate)
-            x = x.float()
+        attn_type = "sparse" if attn_type is None else str(attn_type).lower()
+        if attn_type != "sparse":
+            raise ValueError(
+                f"GT is restricted to graph-neighborhood sparse attention to match the original implementation; "
+                f"got attn_type={attn_type!r}."
+            )
+        x = self.sparse_attention_bias(q, k, v, edge_index, attn_bias)
         
         # [b, s+p, hp]
         x = x.view(batch_size, s_len, -1)
@@ -544,44 +540,49 @@ class EncoderLayer(nn.Module):
         self, hidden_size, ffn_size, dropout_rate, attention_dropout_rate, num_heads
     ):
         super(EncoderLayer, self).__init__()
-
-        self.self_attention_norm = nn.LayerNorm(hidden_size)
         self.self_attention = MultiHeadAttention(
             hidden_size, attention_dropout_rate, num_heads
         )
         self.self_attention_dropout = nn.Dropout(dropout_rate)
         self.O = nn.Linear(hidden_size, hidden_size)
-        
-        self.layer_norm1 = nn.LayerNorm(hidden_size)
-            
-        # FFN
-        self.FFN_layer1 = nn.Linear(hidden_size, hidden_size*2)
-        self.FFN_layer2 = nn.Linear(hidden_size*2, hidden_size)
 
-        self.layer_norm2 = nn.LayerNorm(hidden_size)
-            
-            
+        # Match the original Graph Transformer block order:
+        # attention -> residual -> norm -> FFN -> residual -> norm.
+        self.batch_norm1 = nn.BatchNorm1d(hidden_size)
+
+        self.FFN_layer1 = nn.Linear(hidden_size, hidden_size * 2)
+        self.FFN_layer2 = nn.Linear(hidden_size*2, hidden_size)
+        self.batch_norm2 = nn.BatchNorm1d(hidden_size)
+
+    @staticmethod
+    def _apply_batch_norm(x: torch.Tensor, bn: nn.BatchNorm1d) -> torch.Tensor:
+        orig_shape = x.shape
+        x = x.reshape(-1, orig_shape[-1])
+        x = bn(x)
+        return x.reshape(orig_shape)
+
     def forward(self, x, attn_bias=None, edge_index=None, attn_type=None):
         # ==================================
         # MHA
-        # ==================================     
-        # x: [b, s/p+1, h]
+        # ==================================
+        # x: [b, s/p, h]
+        h_in1 = x
         y = self.self_attention(x, attn_bias, edge_index=edge_index, attn_type=attn_type)
         y = self.self_attention_dropout(y)
         y = self.O(y)
-        x = x + y
-        x = self.layer_norm1(x)
+        x = h_in1 + y
+        x = self._apply_batch_norm(x, self.batch_norm1)
 
         # ==================================
         # MLP
-        # ==================================    
-
-        y = self.FFN_layer1(y)
+        # ==================================
+        h_in2 = x
+        y = self.FFN_layer1(x)
         y = F.relu(y)
         y = self.self_attention_dropout(y)
         y = self.FFN_layer2(y)
-        x = x + y
-        x = self.layer_norm2(x)
+        x = h_in2 + y
+        x = self._apply_batch_norm(x, self.batch_norm2)
 
         return x
         

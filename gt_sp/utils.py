@@ -962,15 +962,19 @@ def get_batch_blockize(
     seq_parallel_world_rank = get_sequence_parallel_rank() if sequence_parallel_is_initialized() else 0
     seq_length = args.seq_len
     batch_mode = getattr(args, "batch_subgraph_mode", "induced")
+    model_name = str(getattr(args, "model", "")).lower()
     dynamic_split_sizes = None
     dev = None
+    sampled_nodes = None
+    induced_edge_index_i_raw = None
+    rw_edge_index_i_raw = None
     if device is not None:
         dev = torch.device(device) if not isinstance(device, torch.device) else device
 
     if force_induced_edges:
         x_i = x[idx_batch]
         y_i = y[idx_batch]
-        edge_index_i_raw = gen_sub_edge_index(edge_index, idx_batch, N)
+        induced_edge_index_i_raw = gen_sub_edge_index(edge_index, idx_batch, N)
     elif batch_mode == "seed_rw":
         if seq_parallel_world_size > 1:
             src_rank = get_sequence_parallel_src_rank()
@@ -981,7 +985,7 @@ def get_batch_blockize(
 
         do_sample = (seq_parallel_world_size <= 1) or (dist.get_rank() == src_rank)
         if do_sample:
-            sampled_nodes, edge_index_i_raw = sample_seed_rw_subgraph(
+            sampled_nodes, rw_edge_index_i_raw = sample_seed_rw_subgraph(
                 edge_index=edge_index,
                 seed_nodes=idx_batch,
                 num_nodes=N,
@@ -991,7 +995,7 @@ def get_batch_blockize(
             )
         else:
             sampled_nodes = None
-            edge_index_i_raw = None
+            rw_edge_index_i_raw = None
 
         if seq_parallel_world_size > 1:
             assert dev is not None, "seed_rw broadcasting requires a concrete device in sequence parallel mode."
@@ -1000,7 +1004,7 @@ def get_batch_blockize(
                 sizes_broad = torch.tensor(
                     [
                         int(sampled_nodes.size(0)),
-                        int(edge_index_i_raw.size(1)),
+                        int(rw_edge_index_i_raw.size(1)),
                     ],
                     device=broad_device,
                     dtype=torch.long,
@@ -1013,14 +1017,14 @@ def get_batch_blockize(
             sampled_edge_count = int(sizes_broad[1].item())
             if do_sample:
                 sampled_nodes_broad = sampled_nodes.to(broad_device)
-                edge_index_broad = edge_index_i_raw.to(broad_device)
+                edge_index_broad = rw_edge_index_i_raw.to(broad_device)
             else:
                 sampled_nodes_broad = torch.empty(sampled_node_count, device=broad_device, dtype=torch.long)
                 edge_index_broad = torch.empty((2, sampled_edge_count), device=broad_device, dtype=torch.long)
             dist.broadcast(sampled_nodes_broad, src_rank, group=group)
             dist.broadcast(edge_index_broad, src_rank, group=group)
             sampled_nodes = sampled_nodes_broad.cpu()
-            edge_index_i_raw = edge_index_broad.cpu()
+            rw_edge_index_i_raw = edge_index_broad.cpu()
 
         x_i = x[sampled_nodes]
         y_i = y.new_full((sampled_nodes.size(0),) + tuple(y.shape[1:]), -100)
@@ -1029,6 +1033,7 @@ def get_batch_blockize(
             seed_mask_cpu = seed_label_mask.to(torch.bool).cpu()
             seed_labels[~seed_mask_cpu] = -100
         y_i[:idx_batch.shape[0]] = seed_labels
+        induced_edge_index_i_raw = gen_sub_edge_index(edge_index, sampled_nodes, N)
 
         split_sizes = [t.shape[0] for t in torch.tensor_split(torch.zeros(sampled_nodes.size(0)), seq_parallel_world_size, dim=0)]
         dynamic_split_sizes = split_sizes
@@ -1040,7 +1045,7 @@ def get_batch_blockize(
         x_i = x[idx_batch]  # [s, x_d]
         y_i = y[idx_batch]  # [s]
         # Keep raw (0-indexed, before fix_edge_index) subgraph for local_spd and RW sampling.
-        edge_index_i_raw = gen_sub_edge_index(edge_index, idx_batch, N)
+        induced_edge_index_i_raw = gen_sub_edge_index(edge_index, idx_batch, N)
 
     # --- attn_bias (optional, controlled by args.attn_bias_mode) ---
     _attn_bias_mode = getattr(args, 'attn_bias_mode', 'none')
@@ -1055,16 +1060,51 @@ def get_batch_blockize(
                 "Consider using --attn_bias_mode none or reducing --seq_len."
             )
         full_attn_bias = _compute_local_spd_bias(
-            edge_index_i_raw.cpu(), n_nodes=_n_real, max_dist=_max_dist,
+            induced_edge_index_i_raw.cpu(), n_nodes=_n_real, max_dist=_max_dist,
         )  # [n_real, n_real, d]
 
     attn_bias = None
     if force_induced_edges:
-        edge_index_i_heads = edge_index_i_raw
+        edge_index_i_heads = induced_edge_index_i_raw
+    elif model_name == "gt":
+        edge_parts = [induced_edge_index_i_raw]
+        if batch_mode == "seed_rw":
+            if rw_edge_index_i_raw is not None and rw_edge_index_i_raw.numel() > 0:
+                edge_parts.append(rw_edge_index_i_raw)
+            edge_index_i_heads = _merge_edge_index_list(edge_parts)
+        else:
+            rw_base = induced_edge_index_i_raw
+            rw_dev = resolve_random_walk_device(args, dev if dev is not None else rw_base.device)
+            if rw_base.device != rw_dev:
+                rw_base = rw_base.to(rw_dev)
+            try:
+                rw_edge_index_i_raw = build_head_hop_edges(
+                    edge_index=rw_base,
+                    num_nodes=x_i.size(0),
+                    num_heads=args.num_heads,
+                    num_groups=1,
+                    device=rw_base.device,
+                    walk_length=getattr(args, "head_hop_walk_length", 4),
+                    walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
+                )
+            except RuntimeError:
+                rw_base = rw_base.to("cpu")
+                rw_edge_index_i_raw = build_head_hop_edges(
+                    edge_index=rw_base,
+                    num_nodes=x_i.size(0),
+                    num_heads=args.num_heads,
+                    num_groups=1,
+                    device=rw_base.device,
+                    walk_length=getattr(args, "head_hop_walk_length", 4),
+                    walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
+                )
+            if rw_edge_index_i_raw is not None and rw_edge_index_i_raw.numel() > 0:
+                edge_parts.append(rw_edge_index_i_raw)
+            edge_index_i_heads = _merge_edge_index_list(edge_parts)
     elif batch_mode == "seed_rw":
-        edge_index_i_heads = edge_index_i_raw
+        edge_index_i_heads = rw_edge_index_i_raw
     else:
-        rw_base = edge_index_i_raw
+        rw_base = induced_edge_index_i_raw
         rw_dev = resolve_random_walk_device(args, dev if dev is not None else rw_base.device)
         if rw_base.device != rw_dev:
             rw_base = rw_base.to(rw_dev)
