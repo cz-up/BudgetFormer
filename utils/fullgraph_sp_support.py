@@ -647,6 +647,8 @@ class _AdaptiveEdgeBudgetController:
         
         self.auto_hold_released = False
         self.baseline_acc = -1.0
+        self.bootstrap_baseline_loss = float("inf")
+        self.bootstrap_baseline_acc = -1.0
         
         self.frozen = not self.enabled
         if not self.enabled:
@@ -1152,6 +1154,39 @@ def _bootstrap_initial_edge_budget(
             f"chosen=({best_state['real_edges_per_query']},{best_state['rw_edges_per_query']}{chosen_wl}) "
             f"probe_loss={best_loss:.4f} probe_edges={best_edge_count}"
         )
+    
+    # Calibrate RelGain Threshold from bootstrap results
+    # Sort by edge count to analyze improvements as we scale budget
+    sorted_summaries = sorted(candidate_summaries, key=lambda x: x[2])
+    min_pos_rel_gain = float('inf')
+    curr_best_loss = sorted_summaries[0][1]
+    curr_best_edges = sorted_summaries[0][2]
+    
+    found_any_improvement = False
+    for i in range(1, len(sorted_summaries)):
+        s_loss = sorted_summaries[i][1]
+        s_edges = sorted_summaries[i][2]
+        if s_loss < curr_best_loss - 1e-6:
+            delta_edges = max(s_edges - curr_best_edges, 1)
+            rel_gain = (curr_best_loss - s_loss) / (max(curr_best_loss, 1e-6) * delta_edges)
+            if rel_gain > 0:
+                min_pos_rel_gain = min(min_pos_rel_gain, rel_gain)
+                found_any_improvement = True
+            curr_best_loss = s_loss
+            curr_best_edges = s_edges
+            
+    if found_any_improvement and min_pos_rel_gain != float('inf'):
+        # Use the minimum observed positive relative gain as the dynamic threshold
+        controller.gain_threshold = min_pos_rel_gain
+        if args.rank == 0:
+            print(f"  ↳ BudgetCtrl [Calibrated] rel_gain_threshold set to {controller.gain_threshold:.8f} based on bootstrap improvements.")
+    else:
+        # Fallback to a small default if no improvements found during bootstrap
+        controller.gain_threshold = 1e-7
+        if args.rank == 0:
+            print(f"  ↳ BudgetCtrl [Calibrated] No improvements during bootstrap. Using fallback threshold {controller.gain_threshold:.8e}")
+
+    controller.bootstrap_baseline_loss = float(best_loss)
     return best_state
 
 
@@ -1216,6 +1251,7 @@ def _maybe_update_edge_budget(
         adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
         edge_pools=probe_edge_pools,
     )
+    # 1. Base Evaluation
     base_loss, base_acc = _probe_loss_sp(
         args, model, x_local, local_y, local_probe_idx, base_edges,
         device, amp_dtype, sp_group, sp_world_size,
@@ -1223,30 +1259,13 @@ def _maybe_update_edge_budget(
     base_count = _edge_count(base_edges)
     del base_edges
 
-    explicit_hold_epochs = int(getattr(args, "adaptive_edge_budget_bootstrap_hold_epochs", 0))
-    if explicit_hold_epochs > 0 and epoch <= explicit_hold_epochs:
-        return
-
-    # Check Accuracy Breakout Trigger
-    if not controller.auto_hold_released:
-        if controller.baseline_acc < 0.0:
-            controller.baseline_acc = base_acc
-            
-        # Accuracy breakout threshold: > +1% absolute accuracy
-        if base_acc > controller.baseline_acc + 0.1:
-            controller.auto_hold_released = True
-            if args.rank == 0:
-                print(f"  ↳ BudgetCtrl [AutoHoldReleased] acc broken out: {base_acc:.4f} > baseline={controller.baseline_acc:.4f}")
-        else:
-            if args.rank == 0:
-                print(f"  ↳ BudgetCtrl [AutoHold] epoch={epoch} acc={base_acc:.4f} (baseline={controller.baseline_acc:.4f}, awaiting +1% breakout)")
-            return
-
+    # 2. Candidate Evaluation
     best_kind = None
     best_gain = float("-inf")
     best_state = None
-    best_loss = None
-    best_count = None
+    best_loss = base_loss
+    best_count = base_count
+    
     for kind, cand_state in controller.candidate_states().items():
         cand_edges = _build_probe_attention_edges(
             args,
@@ -1270,7 +1289,10 @@ def _maybe_update_edge_budget(
         )
         cand_count = _edge_count(cand_edges)
         delta_edges = max(cand_count - base_count, 1)
-        gain = (base_loss - cand_loss) / float(delta_edges)
+        
+        # RELATIVE GAIN: (base_loss - cand_loss) / (base_loss * delta_edges)
+        gain = (base_loss - cand_loss) / (max(base_loss, 1e-6) * float(delta_edges))
+        
         if gain > best_gain:
             best_kind = kind
             best_gain = gain
@@ -1280,19 +1302,32 @@ def _maybe_update_edge_budget(
             
         del cand_edges
 
+    # 3. Check Condition for Release or Continued Update
+    if not controller.auto_hold_released:
+        # Release trigger: Only if we find a significant relative gain
+        if best_gain > controller.gain_threshold:
+            controller.auto_hold_released = True
+            if args.rank == 0:
+                print(f"  ↳ BudgetCtrl [AutoHoldReleased] via significant rel_gain: {best_gain:.8f} > threshold={controller.gain_threshold:.8f}")
+        else:
+            if args.rank == 0:
+                print(
+                    f"  ↳ BudgetCtrl [AutoHold] epoch={epoch} searching... "
+                    f"best_rel_gain_found={best_gain:.8f} (threshold={controller.gain_threshold:.8f})"
+                )
+            return
+
+    # 4. Standard Update (if released)
     controller.update(best_kind if best_gain > controller.gain_threshold else None,
                       best_gain, best_state if best_gain > controller.gain_threshold else None)
 
     if args.rank == 0:
+        actual_move = best_kind if best_gain > controller.gain_threshold else "STAY"
+        cur_budget = controller.current_state()
         print(
-            f"  ↳ BudgetCtrl epoch={epoch} probe_loss={base_loss:.4f} "
-            f"edges={base_count} choice={best_kind or 'frozen_base'} gain={best_gain:.6e} "
-            f"next_real={controller.real_budget} next_rw={controller.rw_budget}"
-            + (
-                f" cand_loss={best_loss:.4f} cand_edges={best_count}"
-                if best_loss is not None and best_count is not None
-                else ""
-            )
+            f"  ↳ BudgetCtrl update epoch={epoch} move={actual_move} rel_gain={best_gain:.8f} "
+            f"new_budget=({cur_budget['real_edges_per_query']},{cur_budget['rw_edges_per_query']}) "
+            f"probe_loss={best_loss:.4f} probe_edges={best_count}"
         )
 
 
