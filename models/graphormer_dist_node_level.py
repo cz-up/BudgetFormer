@@ -46,7 +46,7 @@ class CoreAttention(nn.Module):
     """
     Core attention
     """
-    def __init__(self, hidden_size, attention_dropout_rate, num_heads, attn_bias_dim, chunk_size: int | None = None):
+    def __init__(self, hidden_size, attention_dropout_rate, num_heads, attn_bias_dim):
         super(CoreAttention, self).__init__()
 
         # SP group: Per attention head and per partition values.
@@ -64,8 +64,6 @@ class CoreAttention(nn.Module):
         self.att_dropout = nn.Dropout(attention_dropout_rate)
         self.attention_dropout_rate = attention_dropout_rate
 
-        env_chunk = os.getenv("TORCH_FULL_ATTN_CHUNK", "").strip()
-        self.full_chunk_size = chunk_size if chunk_size else (int(env_chunk) if env_chunk.isdigit() else 0)
         env_sparse_chunk = os.getenv("TORCH_SPARSE_QUERY_CHUNK", "").strip()
         self.sparse_query_chunk_size = int(env_sparse_chunk) if env_sparse_chunk.isdigit() else 0
         self.capture_full_attn = False
@@ -454,47 +452,6 @@ class CoreAttention(nn.Module):
             wV = v.new_zeros(v.size(0), num_heads, self.hidden_size_per_attention_head)
             Z = v.new_zeros(v.size(0), num_heads, 1)
         return wV / (Z + 1e-6)
-
-    def set_full_attention_chunk_size(self, chunk_size: int | None) -> None:
-        self.full_chunk_size = int(chunk_size) if chunk_size else 0
-
-    def _full_attention_chunked(self, k, q, v, attn_bias, edge_index=None):
-        batch_size, seq_q, num_heads_local, head_dim = q.size()
-        seq_k = k.size(1)
-        chunk = max(int(self.full_chunk_size), 1)
-
-        q_flat = q.permute(0, 2, 1, 3).contiguous().view(-1, seq_q, head_dim)
-        k_flat = k.permute(0, 2, 1, 3).contiguous().view(-1, seq_k, head_dim)
-        v_flat = v.permute(0, 2, 1, 3).contiguous().view(-1, seq_k, head_dim)
-        k_t = k_flat.transpose(1, 2)
-
-        if attn_bias is not None:
-            bias = attn_bias.view(batch_size, num_heads_local, seq_q, seq_k)
-            bias = bias.permute(0, 1, 2, 3).contiguous().view(-1, seq_q, seq_k)
-        else:
-            bias = None
-
-        attn_probs_full = None
-
-        context = q_flat.new_empty((q_flat.size(0), seq_q, head_dim))
-        for start in range(0, seq_q, chunk):
-            end = min(start + chunk, seq_q)
-            q_chunk = q_flat[:, start:end, :] * self.scale
-            scores = torch.bmm(q_chunk, k_t)
-            if bias is not None:
-                scores = scores + bias[:, start:end, :]
-            probs = torch.softmax(scores, dim=-1)
-            probs = self.att_dropout(probs)
-            context[:, start:end, :] = torch.bmm(probs, v_flat)
-            if attn_probs_full is not None:
-                attn_probs_full[:, start:end, :] = probs
-
-        context = context.view(batch_size, num_heads_local, seq_q, head_dim).permute(0, 2, 1, 3).contiguous()
-        context = context.view(batch_size, seq_q, -1)
-
-        return context
-
-
 
     def full_attention(self, k, q, v, attn_bias, edge_index=None):
         # [b, np, sq+1, sk+1]

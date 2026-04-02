@@ -105,9 +105,9 @@ def _load_default_split(dataset_name: str, root_dir: str, wait_for_rank0: bool =
 
 def _load_data(args):
     data_path = args.dataset_dir + args.dataset
-    feature = torch.load(data_path + "/x.pt")
-    y = torch.load(data_path + "/y.pt")
-    edge_index_global = torch.load(data_path + "/edge_index.pt")
+    feature = _torch_load_cpu(data_path + "/x.pt")
+    y = _torch_load_cpu(data_path + "/y.pt")
+    edge_index_global = _torch_load_cpu(data_path + "/edge_index.pt")
     num_nodes = feature.shape[0]
 
     if args.to_bidirected:
@@ -136,6 +136,32 @@ def _load_data(args):
             f"test={split_idx['test'].shape[0]:,}"
         )
     return feature, y, edge_index_global, num_nodes, split_idx
+
+
+def _torch_load_cpu(path: str):
+    attempts = (
+        {"weights_only": True, "mmap": True},
+        {"weights_only": False, "mmap": True},
+        {"weights_only": True},
+        {"weights_only": False},
+        {},
+    )
+    last_exc = None
+    for extra_kwargs in attempts:
+        kwargs = {"map_location": "cpu", **extra_kwargs}
+        try:
+            return torch.load(path, **kwargs)
+        except TypeError as exc:
+            last_exc = exc
+            continue
+        except RuntimeError as exc:
+            last_exc = exc
+            if extra_kwargs:
+                continue
+            raise
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError(f"Failed to load tensor from {path}")
 
 
 def _build_model(args, feature, y, device):
@@ -1624,7 +1650,7 @@ def _restore_dropout(states):
         module.train(training_state)
 
 
-def _eval_sp(args, model, feature, y, split_idx, edge_index_global, num_nodes,
+def _eval_sp(args, model, x_local, y, split_idx, edge_index_global, num_nodes,
              device, rw_device, sp_group, sp_src_rank, sp_rank, sp_world_size,
              rank_start, rank_end, local_nodes, amp_dtype=None, cached_edge_index=None,
              edge_budget_state=None, adaptive_edge_budget_cfg=None):
@@ -1644,7 +1670,6 @@ def _eval_sp(args, model, feature, y, split_idx, edge_index_global, num_nodes,
     model.train()
     drop_states = _set_dropout_eval(model)
     with torch.no_grad():
-        x_local = feature[rank_start:rank_end].float().to(device)
         with _autocast_context(device, amp_dtype):
             out_local = model(x_local, None, edge_index_eval, attn_type=args.attn_type)
         pred_local = out_local.argmax(dim=1)
@@ -1674,6 +1699,8 @@ def _eval_sp(args, model, feature, y, split_idx, edge_index_global, num_nodes,
 
     result = None
     if args.rank == 0:
+        if y is None or split_idx is None:
+            raise RuntimeError("Rank 0 requires full labels and split_idx for evaluation.")
         valid_n = min(int(pred_global.size(0)), int(num_nodes))
         pred_global = pred_global[:valid_n]
         y_cpu = y[:valid_n].cpu().view(-1)

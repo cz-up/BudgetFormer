@@ -103,7 +103,6 @@ def main():
         os.makedirs(args.model_dir, exist_ok=True)
 
     feature, y, edge_index_global, num_nodes, split_idx = _load_data(args)
-    feature = feature.float()
     valid_idx = split_idx.get("valid")
     valid_size = int(valid_idx.numel()) if valid_idx is not None else 0
     adaptive_edge_budget_cfg = _resolve_adaptive_edge_budget_config(args, valid_size)
@@ -152,7 +151,13 @@ def main():
     model = _build_model(args, feature, y, device)
     sync_params_and_buffers(model)
 
-    x_local = feature[rank_start:rank_end].to(device)
+    x_local = feature[rank_start:rank_end].float().to(device)
+    y_eval = y if args.rank == 0 else None
+    split_idx_eval = split_idx if args.rank == 0 else None
+    del feature
+    if args.rank != 0:
+        del y
+        del split_idx
     if edge_budget_controller.enabled:
         t_bs_start = time.time()
         initial_budget_state = _bootstrap_initial_edge_budget(
@@ -384,9 +389,9 @@ def main():
             accs = _eval_sp(
                 args,
                 model,
-                feature,
-                y,
-                split_idx,
+                x_local,
+                y_eval,
+                split_idx_eval,
                 edge_index_global,
                 num_nodes,
                 device,
