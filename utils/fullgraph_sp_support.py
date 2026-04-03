@@ -207,7 +207,6 @@ class _AdaptiveEdgeBudgetConfig:
     gain_threshold: float
     max_total_edges_per_query: int
     bootstrap_search_epochs: int
-    bootstrap_hold_epochs: int
     bootstrap_candidate_limit: int
     static_seed_epochs: int
     bootstrap_walk_length_candidates: tuple  # () = disabled (use args.head_hop_walk_length)
@@ -306,14 +305,6 @@ def _resolve_adaptive_edge_budget_config(args, valid_size: int) -> _AdaptiveEdge
             bootstrap_search_epochs = 0
     bootstrap_search_epochs = max(0, bootstrap_search_epochs)
 
-    bootstrap_hold_epochs = int(getattr(args, "adaptive_edge_budget_bootstrap_hold_epochs", 0))
-    if enabled:
-        if bootstrap_hold_epochs == 0:
-            bootstrap_hold_epochs = bootstrap_search_epochs
-        elif bootstrap_hold_epochs < 0:
-            bootstrap_hold_epochs = 0
-    bootstrap_hold_epochs = max(0, bootstrap_hold_epochs)
-
     bootstrap_candidate_limit = int(getattr(args, "adaptive_edge_budget_bootstrap_candidate_limit", 0))
     if enabled:
         if bootstrap_candidate_limit == 0:
@@ -325,7 +316,7 @@ def _resolve_adaptive_edge_budget_config(args, valid_size: int) -> _AdaptiveEdge
     static_seed_epochs = int(getattr(args, "adaptive_edge_budget_static_seed_epochs", 0))
     if enabled:
         if static_seed_epochs == 0:
-            static_seed_epochs = bootstrap_hold_epochs
+            static_seed_epochs = bootstrap_search_epochs
         elif static_seed_epochs < 0:
             static_seed_epochs = 0
     static_seed_epochs = max(0, static_seed_epochs)
@@ -353,7 +344,6 @@ def _resolve_adaptive_edge_budget_config(args, valid_size: int) -> _AdaptiveEdge
         gain_threshold=float(getattr(args, "adaptive_edge_budget_gain_threshold", 0.0)),
         max_total_edges_per_query=max(0, int(getattr(args, "max_total_edges_per_query", 0))),
         bootstrap_search_epochs=bootstrap_search_epochs,
-        bootstrap_hold_epochs=bootstrap_hold_epochs,
         bootstrap_candidate_limit=bootstrap_candidate_limit,
         static_seed_epochs=static_seed_epochs,
         bootstrap_walk_length_candidates=bootstrap_walk_length_candidates,
@@ -667,7 +657,6 @@ class _AdaptiveEdgeBudgetController:
         self.warmup_epochs = None if config.warmup_epochs is None else int(config.warmup_epochs)
         self.gain_threshold = float(config.gain_threshold)
         self.patience = int(config.patience)
-        self.bootstrap_hold_epochs = int(config.bootstrap_hold_epochs)
         self.bad_rounds = 0
         self.seen_positive_gain = False
         
@@ -1181,36 +1170,11 @@ def _bootstrap_initial_edge_budget(
             f"probe_loss={best_loss:.4f} probe_edges={best_edge_count}"
         )
     
-    # Calibrate RelGain Threshold from bootstrap results
-    # Sort by edge count to analyze improvements as we scale budget
-    sorted_summaries = sorted(candidate_summaries, key=lambda x: x[2])
-    min_pos_rel_gain = float('inf')
-    curr_best_loss = sorted_summaries[0][1]
-    curr_best_edges = sorted_summaries[0][2]
-    
-    found_any_improvement = False
-    for i in range(1, len(sorted_summaries)):
-        s_loss = sorted_summaries[i][1]
-        s_edges = sorted_summaries[i][2]
-        if s_loss < curr_best_loss - 1e-6:
-            delta_edges = max(s_edges - curr_best_edges, 1)
-            rel_gain = (curr_best_loss - s_loss) / (max(curr_best_loss, 1e-6) * delta_edges)
-            if rel_gain > 0:
-                min_pos_rel_gain = min(min_pos_rel_gain, rel_gain)
-                found_any_improvement = True
-            curr_best_loss = s_loss
-            curr_best_edges = s_edges
-            
-    if found_any_improvement and min_pos_rel_gain != float('inf'):
-        # Use the minimum observed positive relative gain as the dynamic threshold
-        controller.gain_threshold = min_pos_rel_gain
-        if args.rank == 0:
-            print(f"  ↳ BudgetCtrl [Calibrated] rel_gain_threshold set to {controller.gain_threshold:.8f} based on bootstrap improvements.")
-    else:
-        # Fallback to a small default if no improvements found during bootstrap
-        controller.gain_threshold = 1e-7
-        if args.rank == 0:
-            print(f"  ↳ BudgetCtrl [Calibrated] No improvements during bootstrap. Using fallback threshold {controller.gain_threshold:.8e}")
+    if args.rank == 0:
+        print(
+            "  ↳ BudgetCtrl [ThresholdFixed] "
+            f"rel_gain_threshold remains {controller.gain_threshold:.8e} from args."
+        )
 
     controller.bootstrap_baseline_loss = float(best_loss)
     return best_state
@@ -1240,6 +1204,7 @@ def _maybe_update_edge_budget(
     if (
         (not controller.enabled)
         or controller.frozen
+        or epoch <= int(adaptive_edge_budget_cfg.bootstrap_search_epochs)
         or (controller.warmup_epochs is not None and epoch > controller.warmup_epochs)
     ):
         return
@@ -1282,7 +1247,6 @@ def _maybe_update_edge_budget(
         args, model, x_local, local_y, local_probe_idx, base_edges,
         device, amp_dtype, sp_group, sp_world_size,
     )
-    base_count = _edge_count(base_edges)
     del base_edges
 
     # 2. Candidate Evaluation
@@ -1290,7 +1254,7 @@ def _maybe_update_edge_budget(
     best_gain = float("-inf")
     best_state = None
     best_loss = base_loss
-    best_count = base_count
+    best_count = 0
     
     for kind, cand_state in controller.candidate_states().items():
         cand_edges = _build_probe_attention_edges(
@@ -1314,10 +1278,9 @@ def _maybe_update_edge_budget(
             device, amp_dtype, sp_group, sp_world_size,
         )
         cand_count = _edge_count(cand_edges)
-        delta_edges = max(cand_count - base_count, 1)
         
-        # RELATIVE GAIN: (base_loss - cand_loss) / (base_loss * delta_edges)
-        gain = (base_loss - cand_loss) / (max(base_loss, 1e-6) * float(delta_edges))
+        # Relative improvement against the current budget; no edge-count normalization.
+        gain = (base_loss - cand_loss) / max(base_loss, 1e-6)
         
         if gain > best_gain:
             best_kind = kind
@@ -1334,12 +1297,15 @@ def _maybe_update_edge_budget(
         if best_gain > controller.gain_threshold:
             controller.auto_hold_released = True
             if args.rank == 0:
-                print(f"  ↳ BudgetCtrl [AutoHoldReleased] via significant rel_gain: {best_gain:.8f} > threshold={controller.gain_threshold:.8f}")
+                print(
+                    "  ↳ BudgetCtrl [AutoHoldReleased] via significant rel_gain: "
+                    f"{best_gain:.8e} > threshold={controller.gain_threshold:.8e}"
+                )
         else:
             if args.rank == 0:
                 print(
                     f"  ↳ BudgetCtrl [AutoHold] epoch={epoch} searching... "
-                    f"best_rel_gain_found={best_gain:.8f} (threshold={controller.gain_threshold:.8f})"
+                    f"best_rel_gain_found={best_gain:.8e} (threshold={controller.gain_threshold:.8e})"
                 )
             return
 
@@ -1351,7 +1317,7 @@ def _maybe_update_edge_budget(
         actual_move = best_kind if best_gain > controller.gain_threshold else "STAY"
         cur_budget = controller.current_state()
         print(
-            f"  ↳ BudgetCtrl update epoch={epoch} move={actual_move} rel_gain={best_gain:.8f} "
+            f"  ↳ BudgetCtrl update epoch={epoch} move={actual_move} rel_gain={best_gain:.8e} "
             f"new_budget=({cur_budget['real_edges_per_query']},{cur_budget['rw_edges_per_query']}) "
             f"probe_loss={best_loss:.4f} probe_edges={best_count}"
         )

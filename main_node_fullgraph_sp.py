@@ -233,7 +233,6 @@ def main():
             f"warmup={adaptive_edge_budget_cfg.warmup_epochs if adaptive_edge_budget_cfg.warmup_epochs is not None else 'none'} "
             f"patience={adaptive_edge_budget_cfg.patience} "
             f"bootstrap_search={adaptive_edge_budget_cfg.bootstrap_search_epochs} "
-            f"bootstrap_hold={adaptive_edge_budget_cfg.bootstrap_hold_epochs} "
             f"static_seed={adaptive_edge_budget_cfg.static_seed_epochs})"
         )
         print(f"{'=' * 72}\n")
@@ -266,7 +265,6 @@ def main():
 
     for epoch in range(1, args.epochs + 1):
         t_epoch = time.time()
-        was_released = edge_budget_controller.auto_hold_released
         model.train()
         optimizer.zero_grad(set_to_none=True)
 
@@ -426,6 +424,7 @@ def main():
             del accs
             _cuda_empty_cache(args)
 
+        t_adjust_start = time.time()
         _maybe_update_edge_budget(
             args,
             adaptive_edge_budget_cfg,
@@ -447,16 +446,10 @@ def main():
             amp_dtype,
             sp_world_size,
         )
+        total_adjustment_time += (time.time() - t_adjust_start)
 
         if sp_world_size > 1:
             dist.barrier(group=sp_group)
-
-        epoch_time_total = time.time() - t_epoch
-        if edge_budget_controller.enabled:
-            if was_released:
-                total_adjustment_time += epoch_time_total
-            else:
-                total_bootstrap_time += epoch_time_total
 
     edge_prefetcher.close()
 

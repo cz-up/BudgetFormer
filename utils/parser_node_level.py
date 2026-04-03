@@ -140,12 +140,6 @@ def add_node_common_args(parser, defaults=None):
         help="advanced override; 0 uses a short automatic pre-training search to select the initial (real, rw) budget, <0 disables it",
     )
     parser.add_argument(
-        "--adaptive_edge_budget_bootstrap_hold_epochs",
-        type=int,
-        default=defaults.get("adaptive_edge_budget_bootstrap_hold_epochs", 0),
-        help="advanced override; 0 keeps the selected bootstrap budget fixed for the automatic default number of early epochs, <0 disables the hold phase",
-    )
-    parser.add_argument(
         "--adaptive_edge_budget_bootstrap_candidate_limit",
         type=int,
         default=defaults.get("adaptive_edge_budget_bootstrap_candidate_limit", 0),
