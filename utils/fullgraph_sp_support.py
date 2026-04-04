@@ -183,8 +183,6 @@ def _build_model(args, feature, y, device):
             **common,
             num_global_node=args.num_global_node,
         ).to(device)
-        if getattr(args, "sparse_query_chunk_size", 0) > 0:
-            model.set_sparse_attention_query_chunk_size(args.sparse_query_chunk_size)
         if getattr(args, "activation_checkpoint", False):
             model.set_activation_checkpoint(True)
     elif args.model == "gt":
@@ -644,8 +642,7 @@ def _build_probe_attention_edges(
     else:
         merged_cpu = None
 
-    merged = _broadcast_prefetched_edges(merged_cpu, device, sp_group, sp_src_rank, sp_rank)
-    return _finalize_attention_edges(args, merged)
+    return _broadcast_prefetched_edges(merged_cpu, device, sp_group, sp_src_rank, sp_rank)
 
 
 
@@ -1468,14 +1465,6 @@ def _build_merged_edges(args, edge_index_global, num_nodes, final_device, rw_dev
         merged = adjust_edge_index_nomerge(merged, nodes_per_rank)
     return merged
 
-
-
-def _finalize_attention_edges(args, merged):
-    if args.attn_type == "sparse" and getattr(args, "sparse_query_chunk_size", 0) > 0:
-        return _pack_chunked_edges(merged, args.sparse_query_chunk_size, mode="gpu_chunk")
-    return merged
-
-
 def _build_prefetched_cpu_edges(args, edge_index_global, num_nodes, rw_device, nodes_per_rank, edge_seed,
                                 edge_budget_state=None, adaptive_edge_budget_cfg=None):
     seed_ctx = _fixed_torch_cpu_seed(edge_seed) if edge_seed is not None else contextlib.nullcontext()
@@ -1505,79 +1494,6 @@ def _broadcast_prefetched_edges(merged_cpu, device, sp_group, sp_src_rank, sp_ra
             merged = torch.empty((2, int(size_t.item())), device=device, dtype=torch.long)
         dist.broadcast(merged, sp_src_rank, group=sp_group)
     return merged
-
-
-def _pack_chunked_edges(merged, chunk_size, mode):
-    chunk = max(int(chunk_size), 1)
-    edge_store = merged.detach()
-
-    if mode == "cpu_stream":
-        edge_store = edge_store.cpu()
-    elif mode != "gpu_chunk":
-        raise ValueError(f"Unsupported chunked edge payload mode: {mode}")
-
-    if edge_store.numel() == 0:
-        empty = torch.empty((0,), dtype=torch.long, device=edge_store.device)
-        offsets = torch.zeros(1, dtype=torch.long, device=edge_store.device)
-        if mode == "cpu_stream":
-            empty = _pin_cpu_tensor(empty)
-            offsets = _pin_cpu_tensor(offsets)
-        return {
-            "mode": mode,
-            "src": empty,
-            "dst": empty.clone(),
-            "offsets": offsets,
-            "chunk_size": chunk,
-        }
-
-    edge_index = edge_store[:2].to(torch.long).contiguous()
-    edge_hops = edge_store[2].to(torch.long).contiguous() if edge_store.size(0) == 3 else None
-
-    order = torch.argsort(edge_index[1])
-    src_sorted = edge_index[0].index_select(0, order).contiguous()
-    dst_sorted = edge_index[1].index_select(0, order).contiguous()
-    hop_sorted = edge_hops.index_select(0, order).contiguous() if edge_hops is not None else None
-
-    max_dst = int(dst_sorted.max().item()) if dst_sorted.numel() > 0 else -1
-    num_chunks = max((max_dst + chunk) // chunk, 0)
-    offsets = torch.zeros(num_chunks + 1, dtype=torch.long, device=dst_sorted.device)
-    if dst_sorted.numel() > 0 and num_chunks > 0:
-        dst_bins = torch.div(dst_sorted, chunk, rounding_mode="floor")
-        counts = torch.bincount(dst_bins, minlength=num_chunks)
-        offsets[1:] = counts.cumsum(dim=0)
-
-    if mode == "cpu_stream":
-        src_sorted = _pin_cpu_tensor(src_sorted)
-        dst_sorted = _pin_cpu_tensor(dst_sorted)
-        offsets = _pin_cpu_tensor(offsets)
-        if hop_sorted is not None:
-            hop_sorted = _pin_cpu_tensor(hop_sorted)
-
-    payload = {
-        "mode": mode,
-        "src": src_sorted,
-        "dst": dst_sorted,
-        "offsets": offsets,
-        "chunk_size": chunk,
-    }
-    if hop_sorted is not None:
-        payload["hops"] = hop_sorted
-    return payload
-
-
-def _build_streaming_edges(args, edge_index_global, num_nodes, rw_device, nodes_per_rank, edge_seed=None,
-                           edge_budget_state=None, adaptive_edge_budget_cfg=None,
-                           walk_length_override=None):
-    seed_ctx = fixed_random_seed(edge_seed) if edge_seed is not None else contextlib.nullcontext()
-    with seed_ctx:
-        merged = _build_merged_edges(
-            args, edge_index_global, num_nodes, "cpu", rw_device, nodes_per_rank,
-            edge_seed=edge_seed,
-            edge_budget_state=edge_budget_state,
-            adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
-            walk_length_override=walk_length_override,
-        )
-    return _pack_chunked_edges(merged, args.sparse_query_chunk_size, mode="cpu_stream")
 
 
 def _build_and_broadcast_edges(args, edge_index_global, num_nodes, device, rw_device, sp_group,
@@ -1621,19 +1537,7 @@ def _build_attention_edges(args, edge_index_global, num_nodes, device, rw_device
                            sp_src_rank, sp_rank, nodes_per_rank, edge_seed=None,
                            edge_budget_state=None, adaptive_edge_budget_cfg=None,
                            walk_length_override=None):
-    if getattr(args, "stream_edges_from_cpu", False):
-        return _build_streaming_edges(
-            args,
-            edge_index_global,
-            num_nodes,
-            rw_device,
-            nodes_per_rank,
-            edge_seed=edge_seed,
-            edge_budget_state=edge_budget_state,
-            adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
-            walk_length_override=walk_length_override,
-        )
-    merged = _build_and_broadcast_edges(
+    return _build_and_broadcast_edges(
         args,
         edge_index_global,
         num_nodes,
@@ -1648,7 +1552,6 @@ def _build_attention_edges(args, edge_index_global, num_nodes, device, rw_device
         adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
         walk_length_override=walk_length_override,
     )
-    return _finalize_attention_edges(args, merged)
 
 
 def _set_dropout_eval(model):
@@ -1674,7 +1577,6 @@ def _eval_sp(args, model, x_local, y, split_idx, edge_index_global, num_nodes,
             edge_index_eval = _build_attention_edges(
                 args, edge_index_global, num_nodes, device, rw_device,
                 sp_group, sp_src_rank, sp_rank, local_nodes,
-                edge_seed=args.seed if getattr(args, "stream_edges_from_cpu", False) else None,
                 edge_budget_state=edge_budget_state,
                 adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
             )

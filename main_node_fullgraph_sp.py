@@ -42,7 +42,6 @@ from utils.fullgraph_sp_support import (
     _broadcast_prefetched_edges,
     _cuda_empty_cache,
     _eval_sp,
-    _finalize_attention_edges,
     _get_process_peak_rss_mib,
     _get_process_rss_mib,
     _load_data,
@@ -79,10 +78,6 @@ def main():
     )
     add_node_fullgraph_sp_args(parser)
     args = normalize_main_node_fullgraph_sp_args(parser.parse_args())
-    if args.stream_edges_from_cpu and args.attn_type != "sparse":
-        raise ValueError("--stream_edges_from_cpu currently requires --attn_type sparse.")
-    if args.stream_edges_from_cpu and args.sparse_query_chunk_size <= 0:
-        raise ValueError("--stream_edges_from_cpu requires --sparse_query_chunk_size > 0.")
     if _adaptive_edge_budget_enabled(args) and args.random_walk_prefetch:
         raise ValueError("--adaptive_edge_budget is not compatible with --random_walk_prefetch.")
 
@@ -201,7 +196,6 @@ def main():
     prefetch_cpu_rw = (
         dynamic_edges
         and getattr(args, "random_walk_prefetch", False)
-        and not getattr(args, "stream_edges_from_cpu", False)
         and rw_device.type == "cpu"
         and device.startswith("cuda")
     )
@@ -220,8 +214,6 @@ def main():
         print(f"  Random-walk device: {rw_device}")
         print(f"  CPU RW prefetch: {int(prefetch_cpu_rw)}")
         print(f"  AMP dtype: {args.amp_dtype}")
-        print(f"  CPU edge streaming: {int(bool(getattr(args, 'stream_edges_from_cpu', False)))}")
-        print(f"  Sparse query chunk size: {getattr(args, 'sparse_query_chunk_size', 0)}")
         print(
             f"  Random edge blocks: {int(_random_block_sampling_enabled(args, adaptive_edge_budget_cfg))} "
             f"(max_total={adaptive_edge_budget_cfg.max_total_edges_per_query})"
@@ -269,14 +261,12 @@ def main():
         optimizer.zero_grad(set_to_none=True)
 
         t_rw = time.time()
-        merged = None
         prefetched_cpu = None
         if cached_edge_index is not None:
             edge_index_rw = cached_edge_index
         else:
             use_epoch_seed = (
-                getattr(args, "stream_edges_from_cpu", False)
-                or prefetch_cpu_rw
+                prefetch_cpu_rw
                 or random_blocks_dynamic
             )
             if use_epoch_seed:
@@ -289,8 +279,7 @@ def main():
             if edge_prefetcher.enabled:
                 prefetched_cpu = edge_prefetcher.pop(epoch)
             if prefetched_cpu is not None:
-                merged = _broadcast_prefetched_edges(prefetched_cpu, device, sp_group, sp_src_rank, sp_rank)
-                edge_index_rw = _finalize_attention_edges(args, merged)
+                edge_index_rw = _broadcast_prefetched_edges(prefetched_cpu, device, sp_group, sp_src_rank, sp_rank)
             else:
                 edge_index_rw = _build_attention_edges(
                     args,
@@ -365,8 +354,6 @@ def main():
         del out_local, loss, local_y_eff, valid_train_mask, local_train_idx_eff
         if cached_edge_index is None:
             del edge_index_rw
-        if merged is not None:
-            del merged
         if prefetched_cpu is not None:
             del prefetched_cpu
         _cuda_empty_cache(args)
