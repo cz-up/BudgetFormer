@@ -1041,8 +1041,7 @@ def _bootstrap_initial_edge_budget(
     initial_model_state = _clone_model_state_to_cpu(model)
     probe_seed = int(getattr(args, "seed", 0))
 
-    candidate_summaries = []
-
+    candidate_specs = []
     for walk_length in wl_candidates:
         probe_edge_pools = None
         if sp_rank == sp_src_rank:
@@ -1058,35 +1057,68 @@ def _bootstrap_initial_edge_budget(
             )
 
         for candidate_state in candidate_states:
+            full_candidate_state = dict(candidate_state)
+            if walk_length is not None:
+                full_candidate_state["walk_length"] = walk_length
+            candidate_specs.append(
+                {
+                    "budget_state": dict(candidate_state),
+                    "full_state": full_candidate_state,
+                    "walk_length": walk_length,
+                    "probe_edge_pools": probe_edge_pools,
+                    "model_state": initial_model_state,
+                    "trained_epochs": 0,
+                    "loss": float("inf"),
+                    "edge_count": float("inf"),
+                }
+            )
+
+    total_rounds = max(1, int(adaptive_edge_budget_cfg.bootstrap_search_epochs))
+    active_specs = list(candidate_specs)
+    last_round_summaries = []
+
+    def _summary_sort_key(item):
+        _, loss, edges = item
+        return (float(loss), int(edges))
+
+    def _fmt_summary(state, loss, trained_epochs):
+        wl_str = f",L={state['walk_length']}" if "walk_length" in state else ""
+        return f"({state['real_edges_per_query']},{state['rw_edges_per_query']}{wl_str})@{loss:.4f}[e={trained_epochs}]"
+
+    for round_idx in range(total_rounds):
+        if not active_specs:
+            break
+
+        round_summaries = []
+        for spec in active_specs:
             _set_seed(int(getattr(args, "seed", 0)))
-            model.load_state_dict(initial_model_state, strict=True)
+            model.load_state_dict(spec["model_state"], strict=True)
             optimizer, lr_scheduler, scaler = _build_optimizer_bundle(args, model, device, amp_dtype)
 
-            for _ in range(int(adaptive_edge_budget_cfg.bootstrap_search_epochs)):
-                _train_one_epoch_with_budget(
-                    args,
-                    adaptive_edge_budget_cfg,
-                    model,
-                    optimizer,
-                    lr_scheduler,
-                    scaler,
-                    x_local,
-                    local_y,
-                    local_train_idx,
-                    edge_index_global,
-                    num_nodes,
-                    device,
-                    rw_device,
-                    sp_group,
-                    sp_src_rank,
-                    sp_rank,
-                    local_nodes,
-                    amp_dtype,
-                    sp_world_size,
-                    candidate_state,
-                    probe_seed,
-                    walk_length_override=walk_length,
-                )
+            _train_one_epoch_with_budget(
+                args,
+                adaptive_edge_budget_cfg,
+                model,
+                optimizer,
+                lr_scheduler,
+                scaler,
+                x_local,
+                local_y,
+                local_train_idx,
+                edge_index_global,
+                num_nodes,
+                device,
+                rw_device,
+                sp_group,
+                sp_src_rank,
+                sp_rank,
+                local_nodes,
+                amp_dtype,
+                sp_world_size,
+                spec["budget_state"],
+                probe_seed,
+                walk_length_override=spec["walk_length"],
+            )
 
             probe_edges = _build_probe_attention_edges(
                 args,
@@ -1100,10 +1132,10 @@ def _bootstrap_initial_edge_budget(
                 local_nodes,
                 probe_idx_global,
                 edge_seed=probe_seed,
-                edge_budget_state=candidate_state,
+                edge_budget_state=spec["budget_state"],
                 adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
-                edge_pools=probe_edge_pools,
-                walk_length_override=walk_length,
+                edge_pools=spec["probe_edge_pools"],
+                walk_length_override=spec["walk_length"],
             )
             candidate_loss, _ = _probe_loss_sp(
                 args,
@@ -1118,29 +1150,47 @@ def _bootstrap_initial_edge_budget(
                 sp_world_size,
             )
             candidate_edge_count = _edge_count(probe_edges)
+            spec["model_state"] = _clone_model_state_to_cpu(model)
+            spec["trained_epochs"] += 1
+            spec["loss"] = float(candidate_loss)
+            spec["edge_count"] = int(candidate_edge_count)
+            round_summaries.append((spec, float(candidate_loss), int(candidate_edge_count)))
             del probe_edges, optimizer, lr_scheduler, scaler
 
-            full_candidate_state = dict(candidate_state)
-            if walk_length is not None:
-                full_candidate_state["walk_length"] = walk_length
-            candidate_summaries.append((full_candidate_state, float(candidate_loss), int(candidate_edge_count)))
+        if not round_summaries:
+            break
 
-    best_state = None
-    best_loss = float('inf')
-    best_edge_count = float('inf')
-    
-    for state, loss, edges in candidate_summaries:
-        if loss < best_loss - 1e-6 or (abs(loss - best_loss) <= 1e-6 and edges < best_edge_count):
-            best_state = state
-            best_loss = loss
-            best_edge_count = edges
+        round_summaries.sort(key=_summary_sort_key)
+        last_round_summaries = round_summaries
+        is_last_round = (round_idx + 1 >= total_rounds) or (len(round_summaries) <= 1)
+        keep_count = len(round_summaries) if is_last_round else max(1, (len(round_summaries) + 1) // 2)
+        active_specs = [item[0] for item in round_summaries[:keep_count]]
 
-    if len(candidate_summaries) > 1:
-        all_losses = [c[1] for c in candidate_summaries]
+        if args.rank == 0:
+            best_spec, best_loss_round, best_edges_round = round_summaries[0]
+            print(
+                "  ↳ BootstrapBudgetSearch "
+                f"round={round_idx + 1}/{total_rounds} "
+                f"active={len(round_summaries)} keep={keep_count} "
+                f"best={_fmt_summary(best_spec['full_state'], best_loss_round, best_spec['trained_epochs'])} "
+                f"probe_edges={best_edges_round}"
+            )
+
+        if is_last_round:
+            break
+
+    if not last_round_summaries:
+        return None
+
+    best_spec, best_loss, best_edge_count = min(last_round_summaries, key=_summary_sort_key)
+    best_state = dict(best_spec["full_state"])
+
+    if len(last_round_summaries) > 1:
+        all_losses = [loss for _, loss, _ in last_round_summaries]
         max_v = max(all_losses)
         min_v = min(all_losses)
         rel_var = (max_v - min_v) / max(min_v, 1e-6)
-        
+
         if rel_var > 0.01:
             controller.auto_hold_released = True
             if args.rank == 0:
@@ -1154,16 +1204,15 @@ def _bootstrap_initial_edge_budget(
     _set_seed(int(getattr(args, "seed", 0)))
 
     if args.rank == 0:
-        def _fmt(state, loss):
-            wl_str = f",L={state['walk_length']}" if "walk_length" in state else ""
-            return f"({state['real_edges_per_query']},{state['rw_edges_per_query']}{wl_str})@{loss:.4f}"
         formatted_candidates = ", ".join(
-            _fmt(state, loss) for state, loss, _ in candidate_summaries
+            _fmt_summary(spec["full_state"], spec["loss"], spec["trained_epochs"])
+            for spec in candidate_specs
         )
         chosen_wl = f",L={best_state['walk_length']}" if "walk_length" in best_state else ""
         print(
             "  ↳ BootstrapBudgetSearch "
-            f"epochs={adaptive_edge_budget_cfg.bootstrap_search_epochs} "
+            f"strategy=successive_halving "
+            f"rounds={total_rounds} "
             f"walk_lengths={[w for w in wl_candidates if w is not None] or 'default'} "
             f"candidates=[{formatted_candidates}] "
             f"chosen=({best_state['real_edges_per_query']},{best_state['rw_edges_per_query']}{chosen_wl}) "
