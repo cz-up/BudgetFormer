@@ -154,7 +154,39 @@ class CoreAttention(nn.Module):
             attn_bias = attn_bias.unsqueeze(2).repeat(1, 1, batch_size, 1, 1)
             attn_bias = attn_bias.view(batch_size * node_num, batch_size * node_num, -1)
 
-        if isinstance(edge_index, list):
+        if isinstance(edge_index, dict):
+            if edge_index.get("mode") != "cpu_stream":
+                raise ValueError(f"Unsupported sparse edge payload mode: {edge_index.get('mode')}")
+
+            src_cpu = edge_index["src"]
+            dst_cpu = edge_index["dst"]
+            offsets = edge_index["offsets"]
+            offsets_list = offsets.tolist()
+            wV = v.new_zeros(v.size(0), num_heads, self.hidden_size_per_attention_head)
+            Z = v.new_zeros(v.size(0), num_heads, 1)
+            non_blocking = src_cpu.device.type == "cpu"
+
+            for start, end in zip(offsets_list[:-1], offsets_list[1:]):
+                if end <= start:
+                    continue
+                src = src_cpu[start:end].to(device=k.device, dtype=torch.long, non_blocking=non_blocking)
+                dst = dst_cpu[start:end].to(device=k.device, dtype=torch.long, non_blocking=non_blocking)
+                src_k = k[src]
+                dst_q = q[dst]
+                score = torch.mul(src_k, dst_q)
+                score = score / self.scale
+                score = score.sum(-1, keepdim=True).clamp(-5, 5)
+
+                if attn_bias is not None:
+                    score = score + attn_bias[src, dst, :].unsqueeze(-1)
+
+                score = torch.exp(score)
+                msg = v[src] * score
+                scatter(msg, dst, dim=0, out=wV, reduce='add')
+                scatter(score, dst, dim=0, out=Z, reduce='add')
+
+            x = wV / (Z + 1e-6)
+        elif isinstance(edge_index, list):
             wV = None
             Z = None
             groups = max(1, len(edge_index))

@@ -68,6 +68,18 @@ def add_node_common_args(parser, defaults=None):
         help="mixed precision dtype for model forward: none|bf16|fp16",
     )
     parser.add_argument(
+        "--profile_sp_comm",
+        action="store_true",
+        default=defaults.get("profile_sp_comm", False),
+        help="profile SeqAllToAll and full-graph edge broadcast communication time",
+    )
+    parser.add_argument(
+        "--stream_edges_from_cpu",
+        action="store_true",
+        default=defaults.get("stream_edges_from_cpu", False),
+        help="keep full-graph sparse edges on CPU and stream fixed-size edge chunks to GPU",
+    )
+    parser.add_argument(
         "--random_walk_prefetch",
         action="store_true",
         default=defaults.get("random_walk_prefetch", False),

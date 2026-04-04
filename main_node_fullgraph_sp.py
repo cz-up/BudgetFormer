@@ -17,6 +17,11 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
+from gt_sp.comm_profiler import (
+    enable_comm_profiler,
+    get_comm_profile_summary,
+    reset_comm_profiler,
+)
 from gt_sp.initialize import (
     get_sequence_parallel_group,
     get_sequence_parallel_rank,
@@ -27,7 +32,7 @@ from gt_sp.initialize import (
     set_global_token_indices,
     set_last_batch_global_token_indices,
 )
-from gt_sp.reducer import sync_params_and_buffers
+from gt_sp.reducer import build_gradient_reducer, sync_params_and_buffers
 from gt_sp.utils import resolve_random_walk_device
 from utils.fullgraph_sp_support import (
     _AdaptiveEdgeBudgetController,
@@ -62,6 +67,100 @@ from utils.parser_node_level import (
 )
 
 
+def _format_comm_profile(summary, train_time_s: float):
+    if not summary:
+        return []
+    denom_ms = max(float(train_time_s) * 1000.0, 1e-6)
+    ordered = (
+        "seq_all_to_all_fwd",
+        "seq_all_to_all_bwd",
+        "edge_broadcast",
+        "edge_build_local",
+        "edge_real_sample",
+        "edge_rw_build",
+        "edge_rw_sample",
+        "edge_merge",
+    )
+    lines = []
+    for name in ordered:
+        stat = summary.get(name)
+        if stat is None or stat.get("kind", "timing") != "timing":
+            continue
+        total_ms = float(stat["total_ms"])
+        payload_mib = float(stat["total_bytes"]) / (1024.0 ** 2)
+        lines.append(
+            f"  - {name:18s}: total={total_ms:8.2f} ms  "
+            f"avg={stat['avg_ms']:7.2f} ms  "
+            f"count={stat['count']:3d}  "
+            f"share={100.0 * total_ms / denom_ms:5.1f}%  "
+            f"payload={payload_mib:8.2f} MiB"
+        )
+    return lines
+
+
+def _format_edge_cardinality(summary):
+    real_edges = summary.get("edge_real_edges")
+    rw_edges = summary.get("edge_rw_edges")
+    merged_edges = summary.get("edge_merged_edges")
+    if real_edges is None and rw_edges is None and merged_edges is None:
+        return []
+    return [
+        "  - edge_cardinality  : "
+        f"real={int(real_edges['value']) if real_edges is not None else 0:,}  "
+        f"rw={int(rw_edges['value']) if rw_edges is not None else 0:,}  "
+        f"merged={int(merged_edges['value']) if merged_edges is not None else 0:,}"
+    ]
+
+
+def _aggregate_comm_profile(summary):
+    if not dist.is_initialized():
+        return summary
+
+    gathered = [None for _ in range(dist.get_world_size())]
+    dist.all_gather_object(gathered, summary)
+
+    merged = {}
+    for rank_summary in gathered:
+        if not rank_summary:
+            continue
+        for name, stat in rank_summary.items():
+            kind = stat.get("kind", "timing")
+            cur = merged.get(name)
+            if kind == "scalar":
+                value = stat["value"]
+                reduce = stat.get("reduce", "last")
+                if cur is None:
+                    merged[name] = {"kind": "scalar", "reduce": reduce, "value": value}
+                elif reduce == "sum":
+                    cur["value"] += value
+                elif reduce == "max":
+                    cur["value"] = value if value > cur["value"] else cur["value"]
+                elif reduce == "last":
+                    cur["value"] = value
+                else:
+                    raise ValueError(f"Unsupported profiler scalar reduction: {reduce}")
+                continue
+
+            total_ms = float(stat["total_ms"])
+            total_bytes = int(stat["total_bytes"])
+            if cur is None:
+                merged[name] = {
+                    "kind": "timing",
+                    "count": int(stat["count"]),
+                    "total_ms": total_ms,
+                    "avg_ms": float(stat["avg_ms"]),
+                    "total_bytes": total_bytes,
+                }
+                continue
+            if total_ms > cur["total_ms"]:
+                cur["count"] = int(stat["count"])
+                cur["total_ms"] = total_ms
+                cur["avg_ms"] = float(stat["avg_ms"])
+            if total_bytes > cur["total_bytes"]:
+                cur["total_bytes"] = total_bytes
+    return merged
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Full-Graph Node-Level Training with Sequence Parallel."
@@ -78,6 +177,8 @@ def main():
     )
     add_node_fullgraph_sp_args(parser)
     args = normalize_main_node_fullgraph_sp_args(parser.parse_args())
+    if getattr(args, "stream_edges_from_cpu", False) and args.attn_type != "sparse":
+        raise ValueError("--stream_edges_from_cpu currently requires --attn_type sparse.")
     if _adaptive_edge_budget_enabled(args) and args.random_walk_prefetch:
         raise ValueError("--adaptive_edge_budget is not compatible with --random_walk_prefetch.")
 
@@ -93,6 +194,7 @@ def main():
     amp_dtype = _resolve_amp_dtype(args)
     rw_device = resolve_random_walk_device(args, device)
     _set_seed(args.seed)
+    enable_comm_profiler(bool(getattr(args, "profile_sp_comm", False)))
 
     if args.rank == 0:
         os.makedirs(args.model_dir, exist_ok=True)
@@ -145,6 +247,11 @@ def main():
 
     model = _build_model(args, feature, y, device)
     sync_params_and_buffers(model)
+    grad_reducer = build_gradient_reducer(
+        model,
+        process_group=sp_group,
+        world_size=sp_world_size,
+    )
 
     x_local = feature[rank_start:rank_end].float().to(device)
     y_eval = y if args.rank == 0 else None
@@ -175,6 +282,7 @@ def main():
             local_num_nodes,
             amp_dtype,
             sp_world_size,
+            grad_reducer,
         )
         total_bootstrap_time += (time.time() - t_bs_start)
         edge_budget_controller.set_state(initial_budget_state)
@@ -195,6 +303,7 @@ def main():
     dynamic_edges = _use_rw_edges(args, adaptive_edge_budget_cfg=adaptive_edge_budget_cfg) or random_blocks_dynamic
     prefetch_cpu_rw = (
         dynamic_edges
+        and not getattr(args, "stream_edges_from_cpu", False)
         and getattr(args, "random_walk_prefetch", False)
         and rw_device.type == "cpu"
         and device.startswith("cuda")
@@ -213,6 +322,7 @@ def main():
         )
         print(f"  Random-walk device: {rw_device}")
         print(f"  CPU RW prefetch: {int(prefetch_cpu_rw)}")
+        print(f"  CPU edge streaming: {int(bool(getattr(args, 'stream_edges_from_cpu', False)))}")
         print(f"  AMP dtype: {args.amp_dtype}")
         print(
             f"  Random edge blocks: {int(_random_block_sampling_enabled(args, adaptive_edge_budget_cfg))} "
@@ -257,6 +367,8 @@ def main():
 
     for epoch in range(1, args.epochs + 1):
         t_epoch = time.time()
+        if getattr(args, "profile_sp_comm", False):
+            reset_comm_profiler()
         model.train()
         optimizer.zero_grad(set_to_none=True)
 
@@ -266,6 +378,8 @@ def main():
             edge_index_rw = cached_edge_index
         else:
             use_epoch_seed = (
+                getattr(args, "stream_edges_from_cpu", False)
+                or
                 prefetch_cpu_rw
                 or random_blocks_dynamic
             )
@@ -329,17 +443,13 @@ def main():
         fwd_time = time.time() - t_fwd
 
         t_bwd = time.time()
+        grad_reducer.prepare_backward()
         if scaler.is_enabled():
             scaler.scale(loss).backward()
         else:
             loss.backward()
+        grad_reducer.finalize_backward()
         bwd_time = time.time() - t_bwd
-
-        if sp_world_size > 1:
-            for param in model.parameters():
-                if param.grad is not None:
-                    param.grad.div_(sp_world_size)
-                    dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, group=sp_group)
 
         if scaler.is_enabled():
             scaler.step(optimizer)
@@ -361,6 +471,9 @@ def main():
         epoch_time = time.time() - t_epoch
         cpu_rss = _get_process_rss_mib()
         cpu_rss_peak = _get_process_peak_rss_mib()
+        comm_profile = None
+        if getattr(args, "profile_sp_comm", False):
+            comm_profile = _aggregate_comm_profile(get_comm_profile_summary(reset=True))
         if args.rank == 0:
             print(
                 f"Epoch {epoch:04d} | loss={loss_val:.4f} (ema={loss_ema:.4f}) "
@@ -368,6 +481,11 @@ def main():
                 f"(rw={rw_time:.2f}s fwd={fwd_time:.2f}s bwd={bwd_time:.2f}s) "
                 f"| cpu_rss={cpu_rss:.1f}/{cpu_rss_peak:.1f} MiB"
             )
+            if comm_profile:
+                for line in _format_comm_profile(comm_profile, rw_time + fwd_time + bwd_time):
+                    print(line)
+                for line in _format_edge_cardinality(comm_profile):
+                    print(line)
 
         if epoch % args.eval_every == 0:
             t_eval = time.time()

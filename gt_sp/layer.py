@@ -11,6 +11,7 @@ import torch.distributed as dist
 import numpy as np
 import copy
 
+from gt_sp.comm_profiler import profile_call
 from gt_sp.initialize import (
     get_sequence_parallel_group,
     get_sequence_parallel_world_size,
@@ -28,23 +29,38 @@ from gt_sp.utils import (
 class _SeqAllToAll(torch.autograd.Function):
 
     @staticmethod
+    def _run_all_to_all(group: dist.ProcessGroup, input: Tensor, scatter_idx: int, gather_idx: int, tag: str) -> Tensor:
+        seq_world_size = get_sequence_parallel_world_size()
+
+        input_list = [t.contiguous() for t in torch.tensor_split(input, seq_world_size, scatter_idx)]
+        output_list = [torch.empty_like(input_list[0]) for _ in range(seq_world_size)]
+        payload_bytes = int(input.numel() * input.element_size())
+
+        def _collective():
+            torch.distributed.all_to_all(output_list, input_list, group=group)
+            return torch.cat(output_list, dim=gather_idx).contiguous()
+
+        return profile_call(tag, _collective, device=input.device, payload_bytes=payload_bytes)
+
+    @staticmethod
     def forward(ctx: Any, group: dist.ProcessGroup, input: Tensor, scatter_idx: int, gather_idx: int) -> Tensor:
 
         ctx.group = group
         ctx.scatter_idx = scatter_idx
         ctx.gather_idx = gather_idx
 
-        seq_world_size = get_sequence_parallel_world_size()
-
-        input_list = [t.contiguous() for t in torch.tensor_split(input, seq_world_size, scatter_idx)]
-        output_list = [torch.empty_like(input_list[0]) for _ in range(seq_world_size)]
-
-        torch.distributed.all_to_all(output_list, input_list, group=group)
-        return torch.cat(output_list, dim=gather_idx).contiguous()
+        return _SeqAllToAll._run_all_to_all(group, input, scatter_idx, gather_idx, "seq_all_to_all_fwd")
 
     @staticmethod
     def backward(ctx: Any, *grad_output: Tensor) -> Tuple[None, Tensor, None, None]:
-        return (None, _SeqAllToAll.apply(ctx.group, *grad_output, ctx.gather_idx, ctx.scatter_idx), None, None)
+        grad_input = _SeqAllToAll._run_all_to_all(
+            ctx.group,
+            grad_output[0],
+            ctx.gather_idx,
+            ctx.scatter_idx,
+            "seq_all_to_all_bwd",
+        )
+        return (None, grad_input, None, None)
 
 
 class _SeqGather(torch.autograd.Function):
