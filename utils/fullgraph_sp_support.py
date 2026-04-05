@@ -1635,13 +1635,26 @@ def _build_and_broadcast_edges(args, edge_index_global, num_nodes, device, rw_de
                                sp_src_rank, sp_rank, nodes_per_rank, edge_seed=None,
                                edge_budget_state=None, adaptive_edge_budget_cfg=None,
                                walk_length_override=None):
-    if sp_rank == sp_src_rank:
-        seed_ctx = (
-            _fixed_torch_cpu_seed(edge_seed)
-            if edge_seed is not None and torch.device(rw_device).type == "cpu"
-            else contextlib.nullcontext()
-        )
-        with seed_ctx:
+    # ---------------------------------------------------------------------------
+    # O3 Optimization: Rank-Local Edge Construction (eliminates edge broadcast).
+    #
+    # When edge_seed is fixed, every SP rank produces an identical edge_index by
+    # running the same deterministic random walk under the same seed via
+    # fixed_random_seed(), which resets both CPU and CUDA RNG states.
+    # torch_cluster.random_walk is an integer-indexed operation with no
+    # floating-point reductions, so it is bit-identical across ranks given the
+    # same seed and graph topology.
+    #
+    # This removes the dist.broadcast() call from the hot path, eliminating
+    # O(|E_sampled|) inter-rank communication per training step.
+    #
+    # Fallback: when edge_seed is None (un-seeded dynamic edges) the original
+    # broadcast path is preserved to keep cross-rank consistency.
+    # ---------------------------------------------------------------------------
+    if edge_seed is not None:
+        # Rank-local path: all ranks independently build the same edge_index.
+        # fixed_random_seed handles both CPU and CUDA RNG (covers gpu rw_device).
+        with fixed_random_seed(edge_seed):
             merged = profile_call(
                 "edge_build_local",
                 lambda: _build_merged_edges(
@@ -1658,6 +1671,30 @@ def _build_and_broadcast_edges(args, edge_index_global, num_nodes, device, rw_de
                 ),
                 device=device,
             )
+        # Record a zero-byte entry so the comm profiler stats remain consistent.
+        profile_call("edge_broadcast", lambda: None, device=device, payload_bytes=0)
+        return merged
+
+    # ---------------------------------------------------------------------------
+    # Fallback: original broadcast path when edge_seed is None.
+    # ---------------------------------------------------------------------------
+    if sp_rank == sp_src_rank:
+        merged = profile_call(
+            "edge_build_local",
+            lambda: _build_merged_edges(
+                args,
+                edge_index_global,
+                num_nodes,
+                device,
+                rw_device,
+                nodes_per_rank,
+                edge_seed=edge_seed,
+                edge_budget_state=edge_budget_state,
+                adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
+                walk_length_override=walk_length_override,
+            ),
+            device=device,
+        )
         size_t = torch.tensor([merged.shape[1]], device=device, dtype=torch.long)
     else:
         size_t = torch.empty(1, device=device, dtype=torch.long)
