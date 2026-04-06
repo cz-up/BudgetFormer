@@ -583,11 +583,6 @@ def _build_probe_edge_pools(
         else contextlib.nullcontext()
     )
     with seed_ctx:
-        self_loop_pool = None
-        if getattr(args, "include_self_loops", 0):
-            self_loop = torch.stack([probe_idx_global, probe_idx_global], dim=0)
-            self_loop_pool = self_loop.to(dtype=torch.long, device="cpu")
-
         real_pool = None
         if _use_real_edges(args, adaptive_edge_budget_cfg):
             real_pool = _filter_edge_index_by_dst(edge_index_global.cpu(), probe_idx_global)
@@ -613,10 +608,8 @@ def _build_probe_edge_pools(
                 rw_pool = rw_pool.to(dtype=torch.long, device="cpu")
 
     return {
-        "self_loop": self_loop_pool,
         "real": real_pool,
         "rw": rw_pool,
-
     }
 
 
@@ -630,10 +623,6 @@ def _assemble_edges_from_pools(
     adaptive_edge_budget_cfg=None,
 ):
     parts = []
-    self_loop = edge_pools.get("self_loop")
-    if self_loop is not None and self_loop.numel() > 0:
-        parts.append(self_loop)
-
     real_edges = edge_pools.get("real")
     rw_edges = edge_pools.get("rw")
     real_edges, rw_edges = _sample_random_edge_blocks_with_state(
@@ -654,8 +643,6 @@ def _assemble_edges_from_pools(
         template = edge_pools.get("real")
         if template is None:
             template = edge_pools.get("rw")
-        if template is None:
-            template = edge_pools.get("self_loop")
         if template is None:
             merged = torch.zeros((2, 0), dtype=torch.long)
         else:
@@ -1469,10 +1456,6 @@ def _build_merged_edges(args, edge_index_global, num_nodes, final_device, rw_dev
                         walk_length_override=None):
     parts = []
     final_torch_device = torch.device(final_device)
-    if getattr(args, "include_self_loops", 0):
-        self_loop = torch.arange(num_nodes, device=final_torch_device, dtype=torch.long)
-        self_loop = torch.stack([self_loop, self_loop], dim=0)
-        parts.append(self_loop)
     real_edges = _resolve_real_edges_for_state(
         args,
         edge_index_global,

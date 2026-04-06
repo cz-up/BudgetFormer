@@ -297,7 +297,6 @@ def add_node_fullgraph_sp_args(parser, defaults=None):
         default=defaults.get("include_real_edges", 0),
         help="legacy full-graph flag for including all real edges; with --random_edge_blocks and --max_total_edges_per_query > 0, real-edge blocks are enabled automatically",
     )
-    parser.add_argument("--include_self_loops", type=int, default=defaults.get("include_self_loops", 0))
     parser.add_argument(
         "--to_bidirected",
         action="store_true",

@@ -317,7 +317,6 @@ def main():
         print(f"  Edge_index: full graph E={edge_index_global.shape[1]:,}")
         print(
             f"  Sparse edges: real={int(_use_real_edges(args, adaptive_edge_budget_cfg))} "
-            f"self={int(bool(args.include_self_loops))} "
             f"rw={int(_use_rw_edges(args, adaptive_edge_budget_cfg=adaptive_edge_budget_cfg))}"
         )
         print(f"  Random-walk device: {rw_device}")
