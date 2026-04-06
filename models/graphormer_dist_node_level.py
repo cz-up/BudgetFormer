@@ -891,7 +891,7 @@ class Graphormer(nn.Module):
         # Active only when attn_bias is not None (i.e. local_spd mode).
         self.attn_bias_proj = nn.Linear(attn_bias_dim, num_heads, bias=False)
         self.activation_checkpoint = False
-        self.activation_checkpoint_mode = "layer"
+        self.activation_checkpoint_mode = "none"
         self._comm_ckpt: _CommAwareCheckpointer | None = None
         self.apply(lambda module: init_params(module, n_layers=n_layers))
 
@@ -971,14 +971,25 @@ class Graphormer(nn.Module):
             if hasattr(core_attn, "disable_hop_mass_tracking"):
                 core_attn.disable_hop_mass_tracking()
 
-    def set_activation_checkpoint(self, enabled: bool = True, mode: str = "layer") -> None:
-        if mode not in ("layer", "ffn_only", "comm_aware"):
+    def set_activation_checkpoint(self, enabled: bool = True, mode: str | None = None) -> None:
+        mode_aliases = {
+            None: "none",
+            "none": "none",
+            "all": "layer",
+            "layer": "layer",
+            "ffn_only": "ffn_only",
+            "adaptive": "comm_aware",
+            "comm_aware": "comm_aware",
+        }
+        resolved_mode = mode_aliases.get(mode)
+        if resolved_mode is None:
             raise ValueError(
-                f"activation_checkpoint_mode must be 'layer', 'ffn_only', or 'comm_aware', got {mode!r}"
+                f"activation_checkpoint_mode must be 'all', 'ffn_only', or 'adaptive', got {mode!r}"
             )
-        self.activation_checkpoint = bool(enabled)
-        self.activation_checkpoint_mode = mode
-        if mode == "comm_aware":
+        enabled = bool(enabled) and resolved_mode != "none"
+        self.activation_checkpoint = enabled
+        self.activation_checkpoint_mode = resolved_mode if enabled else "none"
+        if self.activation_checkpoint_mode == "comm_aware":
             self._comm_ckpt = _CommAwareCheckpointer(len(self.layers))
         else:
             self._comm_ckpt = None
@@ -1060,7 +1071,7 @@ class Graphormer(nn.Module):
 
         # transformer encoder
         use_ckpt = self.activation_checkpoint and self.training and torch.is_grad_enabled()
-        ckpt_mode = getattr(self, "activation_checkpoint_mode", "layer")
+        ckpt_mode = getattr(self, "activation_checkpoint_mode", "none")
 
         # comm_aware: plan() only resets peak stats (WARMUP/CALIBRATE) or is a
         # no-op (ACTIVE). Modes are set by notify_step_end() after each optimizer

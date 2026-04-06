@@ -55,22 +55,16 @@ def add_node_common_args(parser, defaults=None):
         help="device for random-walk subgraph construction: same|cpu|cuda|cuda:N",
     )
     parser.add_argument(
-        "--activation_checkpoint",
-        action="store_true",
-        default=defaults.get("activation_checkpoint", False),
-        help="enable encoder-layer activation checkpointing",
-    )
-    parser.add_argument(
         "--activation_checkpoint_mode",
         type=str,
-        default=defaults.get("activation_checkpoint_mode", "layer"),
-        choices=["layer", "ffn_only", "comm_aware"],
+        default=defaults.get("activation_checkpoint_mode"),
+        choices=["all", "ffn_only", "adaptive"],
         help=(
-            "activation checkpoint granularity: "
-            "'layer' checkpoints the full EncoderLayer (default, saves most memory); "
+            "activation checkpoint mode: "
+            "'all' checkpoints the full EncoderLayer; "
             "'ffn_only' checkpoints only the FFN block, keeping all MHA activations to "
             "eliminate A2A recomputation from backward (faster backward, higher peak memory); "
-            "'comm_aware' dynamically decides per layer at each forward pass — layers are "
+            "'adaptive' dynamically decides per layer at each forward pass — layers are "
             "assigned 'keep_mha' greedily from the last layer inward until GPU free memory "
             "is exhausted, adapting to runtime memory pressure from edge sampling etc."
         ),
@@ -313,12 +307,14 @@ def add_node_fullgraph_sp_args(parser, defaults=None):
 
 
 def normalize_main_node_batch_sp_args(args):
+    _normalize_checkpoint_args(args)
     if str(getattr(args, "model", "")).lower() == "gt":
         args.attn_type = "sparse"
     return args
 
 
 def normalize_main_node_fullgraph_sp_args(args):
+    _normalize_checkpoint_args(args)
     if str(getattr(args, "model", "")).lower() == "gt":
         args.attn_type = "sparse"
     if args.model != "graphormer":
@@ -331,3 +327,13 @@ def normalize_main_node_fullgraph_sp_args(args):
 def parser_add_main_args(parser):
     add_node_common_args(parser)
     add_node_batch_sp_args(parser)
+
+
+def _normalize_checkpoint_args(args):
+    checkpoint_mode = getattr(args, "activation_checkpoint_mode", None)
+    if checkpoint_mode is None:
+        return
+    checkpoint_mode = str(checkpoint_mode).lower()
+    if checkpoint_mode not in {"all", "ffn_only", "adaptive"}:
+        raise ValueError(f"Unsupported activation_checkpoint_mode: {checkpoint_mode}")
+    args.activation_checkpoint_mode = checkpoint_mode
