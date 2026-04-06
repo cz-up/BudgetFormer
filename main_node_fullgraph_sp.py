@@ -458,6 +458,12 @@ def main():
             optimizer.step()
         lr_scheduler.step()
 
+        # Notify comm-aware checkpointer that this step is complete.
+        # Must happen after optimizer.step() so that optimizer state (lazily
+        # allocated on the first step) is included in the peak measurement.
+        if hasattr(model, "comm_aware_notify_step_end"):
+            model.comm_aware_notify_step_end(device)
+
         loss_val = loss.item()
         loss_ema = loss_val if loss_ema is None else 0.9 * loss_ema + 0.1 * loss_val
 

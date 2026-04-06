@@ -188,7 +188,8 @@ def _build_model(args, feature, y, device):
             num_global_node=args.num_global_node,
         ).to(device)
         if getattr(args, "activation_checkpoint", False):
-            model.set_activation_checkpoint(True)
+            mode = getattr(args, "activation_checkpoint_mode", "layer")
+            model.set_activation_checkpoint(True, mode=mode)
     elif args.model == "gt":
         model = GT(
             **common,

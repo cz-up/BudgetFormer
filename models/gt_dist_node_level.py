@@ -412,6 +412,82 @@ class CoreAttention(nn.Module):
                     self.hop_mass_max = needed
 
 
+    # ------------------------------------------------------------------
+    # Two-phase sparse attention for communication-computation overlap.
+    # Phase 1 (sparse_score_phase): depends only on Q and K
+    # Phase 2 (sparse_aggregate_phase): depends on V and the scores
+    # ------------------------------------------------------------------
+
+    def sparse_score_phase(self, k, q, edge_index, attn_bias):
+        """Compute sparse attention scores using only Q and K.
+
+        Returns a dict of intermediate results consumed by
+        ``sparse_aggregate_phase``.
+
+        Supports only the plain-tensor edge_index path (no list / dict).
+        """
+        batch_size, node_num = k.size(0), k.size(1)
+        if self.training:
+            num_heads = self.num_attention_heads_per_partition
+        else:
+            num_heads = self.num_heads
+
+        if isinstance(edge_index, torch.Tensor) and edge_index.dim() == 2 and edge_index.size(0) == 3:
+            edge_index = edge_index[:2]
+
+        q_flat = q.view(-1, num_heads, self.hidden_size_per_attention_head)
+        k_flat = k.view(-1, num_heads, self.hidden_size_per_attention_head)
+
+        src = k_flat[edge_index[0].to(torch.long)]
+        dest = q_flat[edge_index[1].to(torch.long)]
+        score = torch.mul(src, dest)
+        score = score / self.scale
+        score = score.sum(-1, keepdim=True).clamp(-5, 5)
+
+        if attn_bias is not None:
+            attn_bias = attn_bias.permute(0, 2, 3, 1).contiguous().unsqueeze(2).repeat(1, 1, batch_size, 1, 1)
+            attn_bias = attn_bias.view(batch_size * node_num, batch_size * node_num, num_heads)
+            attn_bias = attn_bias.repeat(1, 1, 1, num_heads)
+            score = score + attn_bias[
+                edge_index[0].to(torch.long),
+                edge_index[1].to(torch.long),
+                :,
+            ].unsqueeze(2)
+
+        score = torch.exp(score)
+
+        return {
+            "score": score,
+            "edge_index": edge_index,
+            "num_heads": num_heads,
+            "total_nodes": q_flat.size(0),
+            "batch_size": batch_size,
+            "s_len": q.size(1),
+        }
+
+    def sparse_aggregate_phase(self, score_ctx, v):
+        """Apply precomputed scores to V and scatter-aggregate.
+
+        Consumes the dict returned by ``sparse_score_phase``.
+        """
+        score = score_ctx["score"]
+        edge_index = score_ctx["edge_index"]
+        num_heads = score_ctx["num_heads"]
+        total_nodes = score_ctx["total_nodes"]
+
+        v_flat = v.view(-1, num_heads, self.hidden_size_per_attention_head)
+
+        msg = v_flat[edge_index[0].to(torch.long)] * score
+
+        wV = torch.zeros_like(v_flat)
+        scatter(msg, edge_index[1], dim=0, out=wV, reduce='add')
+
+        Z = score.new_zeros(total_nodes, num_heads, 1)
+        scatter(score, edge_index[1], dim=0, out=Z, reduce='add')
+
+        x = wV / (Z + 1e-6)
+        return x
+
     def forward(self, q, k, v, attn_bias=None, edge_index=None, attn_type=None):
         # ===================================
         # Raw attention scores. [b, np, s+1, s+1]
@@ -436,7 +512,7 @@ class MultiHeadAttention(nn.Module):
     """Distributed multi-headed attention.
 
     """
-    def __init__(self, hidden_size, attention_dropout_rate, num_heads):
+    def __init__(self, hidden_size, attention_dropout_rate, num_heads, overlap_comm=False):
         super(MultiHeadAttention, self).__init__()
 
         self.num_heads = num_heads
@@ -448,7 +524,7 @@ class MultiHeadAttention(nn.Module):
         local_attn = CoreAttention(
             hidden_size, attention_dropout_rate, num_heads)
         if sequence_parallel_is_initialized():
-            self.dist_attn = DistributedAttentionNodeLevel(local_attn, get_sequence_parallel_group())
+            self.dist_attn = DistributedAttentionNodeLevel(local_attn, get_sequence_parallel_group(), overlap_comm=overlap_comm)
         else:
             self.dist_attn = local_attn
 
@@ -537,11 +613,11 @@ class MultiHeadAttention(nn.Module):
 
 class EncoderLayer(nn.Module):
     def __init__(
-        self, hidden_size, ffn_size, dropout_rate, attention_dropout_rate, num_heads
+        self, hidden_size, ffn_size, dropout_rate, attention_dropout_rate, num_heads, overlap_comm=False,
     ):
         super(EncoderLayer, self).__init__()
         self.self_attention = MultiHeadAttention(
-            hidden_size, attention_dropout_rate, num_heads
+            hidden_size, attention_dropout_rate, num_heads, overlap_comm=overlap_comm,
         )
         self.self_attention_dropout = nn.Dropout(dropout_rate)
         self.O = nn.Linear(hidden_size, hidden_size)
@@ -624,6 +700,7 @@ class GT(nn.Module):
         attention_dropout_rate,
         ffn_dim,
         num_global_node,
+        overlap_comm=False,
     ):
         super().__init__()
         self.node_encoder = nn.Linear(input_dim, hidden_dim)
@@ -632,7 +709,7 @@ class GT(nn.Module):
 
         encoders = [
             EncoderLayer(
-                hidden_dim, ffn_dim, dropout_rate, attention_dropout_rate, num_heads
+                hidden_dim, ffn_dim, dropout_rate, attention_dropout_rate, num_heads, overlap_comm=overlap_comm,
             )
             for _ in range(n_layers)
         ]

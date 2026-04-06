@@ -638,6 +638,220 @@ class EncoderLayer(nn.Module):
         return x
     
 
+class _CommAwareCheckpointer:
+    """Communication-aware selective rematerialization for Graphormer SP training.
+
+    Standard activation checkpointing checkpoints the full EncoderLayer, which
+    forces backward to re-execute all A2A collective communications (3 pre-attn
+    A2As + 1 post-attn A2A) and the sparse scatter-gather attention.  This class
+    decides *per layer* whether to:
+
+      "keep_mha"   – run MHA without checkpointing so that post-A2A Q/K/V
+                     activations are retained by autograd, eliminating A2A
+                     recomputation in backward.  Only the cheap FFN block is
+                     checkpointed.
+      "full_layer" – checkpoint the entire EncoderLayer (original behaviour).
+
+    Why estimation-based budgets fail
+    -----------------------------------
+    It is tempting to estimate M_layer from the Q/K/V tensor shapes, but in
+    keep_mha mode autograd must retain *all* intermediate tensors of the MHA
+    block — not just Q/K/V post-A2A.  For sparse graph attention this includes
+    the edge-indexed tensors ``src``, ``dest``, ``score``, ``msg``, ``wV``, and
+    the pre-output-A2A context.  These are O(|E| × np × hn) and can easily be
+    5-10× larger than the Q/K/V estimate alone, causing the budget to be wildly
+    over-estimated and OOM.
+
+    Measurement-based two-step calibration
+    ----------------------------------------
+    Instead of estimating M_layer, this class measures it directly via two
+    warmup steps:
+
+      Step 0 – WARMUP  : all layers → full_layer.  Peak stats are reset so a
+                          clean high-watermark for this step is recorded.
+      Step 1 – CALIBRATE: last layer → keep_mha, rest → full_layer.  Peak stats
+                          are reset again.
+      After step 1 – ``notify_step_end()`` reads both peaks and computes
+                          M_layer = peak_calibrate − peak_warmup.
+                          It then greedily plans the ACTIVE mode assignment.
+      Step 2+ – ACTIVE : use pre-planned modes; ``plan()`` is a no-op.
+
+    ``notify_step_end(device)`` must be called by the training loop after each
+    step's backward + optimizer.step() + lr_scheduler.step().  This ensures the
+    measurement includes the optimizer state (lazily initialised on the first
+    step) and is taken when no transient activations are live.
+
+    Layer priority
+    --------------
+    Layers are assigned "keep_mha" greedily from the last layer inward.
+    Backward runs last-to-first, so keeping the final layers eliminates
+    recomputation on the earliest part of the backward critical path.
+
+    Safety constraint
+    -----------------
+    Budget = GPU_total × (1 − margin) − peak_warmup
+
+    With k keep_mha layers the worst-case peak ≈ peak_warmup + k × M_layer.
+    We want that ≤ GPU_total × (1 − margin), so k ≤ budget / M_layer.
+    """
+
+    # Internal states
+    _WARMUP = 0
+    _CALIBRATE = 1
+    _ACTIVE = 2
+
+    def __init__(self, n_layers: int, safety_margin: float = 0.20):
+        self.n_layers = n_layers
+        self.safety_margin = float(safety_margin)
+        self._modes: list = ["full_layer"] * n_layers
+        self._state: int = self._WARMUP
+        self._peak_warmup: int = 0          # max_memory_allocated during warmup step
+        self._fwd_mem_warmup: int = 0       # memory_allocated at end of warmup forward
+        self._fwd_mem_calibrate: int = 0    # memory_allocated at end of calibrate forward
+        self._m_layer: int = 0              # measured bytes per keep_mha layer
+        self._last_n_keep: int = -1
+
+    @staticmethod
+    def _is_rank0() -> bool:
+        try:
+            import torch.distributed as _dist
+            return (not _dist.is_initialized()) or _dist.get_rank() == 0
+        except Exception:
+            return True
+
+    def plan(self, device) -> None:
+        """Assign checkpoint modes for the upcoming forward pass.
+
+        In WARMUP / CALIBRATE states resets the CUDA peak-memory counter so
+        that ``notify_step_end`` can read a clean high-watermark window.
+        In ACTIVE state this is a pure no-op.
+        """
+        if not torch.cuda.is_available():
+            return
+
+        if self._state == self._WARMUP:
+            self._modes = ["full_layer"] * self.n_layers
+            torch.cuda.reset_peak_memory_stats(device)
+            if self._is_rank0():
+                print(
+                    f"[CommAwareCheckpointer] WARMUP: "
+                    f"all {self.n_layers} layers → full_layer"
+                )
+
+        elif self._state == self._CALIBRATE:
+            # Keep only the last layer to measure its live activation footprint.
+            modes = ["full_layer"] * self.n_layers
+            modes[-1] = "keep_mha"
+            self._modes = modes
+            torch.cuda.reset_peak_memory_stats(device)
+            if self._is_rank0():
+                print(
+                    f"[CommAwareCheckpointer] CALIBRATE: "
+                    f"last layer → keep_mha, rest → full_layer"
+                )
+
+        # ACTIVE: modes already set by notify_step_end; nothing to do here.
+
+    def record_post_forward_memory(self, device) -> None:
+        """Record live memory immediately after the encoder forward completes.
+
+        Must be called from Graphormer.forward() after the layer loop but
+        before returning (i.e. before loss computation and backward).  At this
+        point every keep_mha layer's autograd tensors are live in memory, giving
+        the true per-layer cost without the noise introduced by backward spikes
+        or optimizer-state allocations.
+
+        Why not use peak-based diff:
+            In full_layer mode the backward recomputes one layer at a time,
+            creating a spike that is the warmup peak.  With keep_mha=1 that
+            spike is *eliminated* for the last layer, so peak_calibrate ≤
+            peak_warmup and the diff is negative — useless.  Measuring live
+            memory after forward sidesteps this entirely.
+        """
+        if not torch.cuda.is_available():
+            return
+        live = torch.cuda.memory_allocated(device)
+        if self._state == self._WARMUP:
+            self._fwd_mem_warmup = live
+        elif self._state == self._CALIBRATE:
+            self._fwd_mem_calibrate = live
+
+    def notify_step_end(self, device) -> None:
+        """Call after backward + optimizer.step() + lr_scheduler.step().
+
+        Advances the internal state machine and, in CALIBRATE state, computes
+        M_layer and the greedy layer assignment.
+        """
+        if not torch.cuda.is_available():
+            return
+        is_r0 = self._is_rank0()
+        total = torch.cuda.get_device_properties(device).total_memory
+
+        if self._state == self._WARMUP:
+            self._peak_warmup = torch.cuda.max_memory_allocated(device)
+            self._state = self._CALIBRATE
+            if is_r0:
+                print(
+                    f"[CommAwareCheckpointer] warmup done: "
+                    f"peak={self._peak_warmup/(1024**2):.0f} MiB, "
+                    f"fwd_live={self._fwd_mem_warmup/(1024**2):.0f} MiB "
+                    f"(total={total/(1024**2):.0f} MiB)"
+                )
+
+        elif self._state == self._CALIBRATE:
+            # M_layer = additional live memory from one keep_mha layer,
+            # measured at forward-end before any backward allocation.
+            # This correctly captures all autograd-retained tensors:
+            # post-A2A Q/K/V, sparse-attention intermediates (src/dest/score/
+            # msg/wV), and the pre-output-A2A context — the quantities that
+            # peak-based diff misses when backward spikes differ between steps.
+            m_layer = self._fwd_mem_calibrate - self._fwd_mem_warmup
+            if m_layer <= 0:
+                # Extremely unlikely: might happen if forward allocations are
+                # non-deterministic.  Use 15 % of warmup peak as safe fallback.
+                m_layer = max(int(self._peak_warmup * 0.15), 1)
+                if is_r0:
+                    print(
+                        f"[CommAwareCheckpointer] WARNING: "
+                        f"fwd_calibrate ({self._fwd_mem_calibrate/(1024**2):.0f} MiB) "
+                        f"≤ fwd_warmup ({self._fwd_mem_warmup/(1024**2):.0f} MiB); "
+                        f"fallback M_layer={m_layer/(1024**2):.1f} MiB"
+                    )
+            self._m_layer = m_layer
+
+            # Budget = room above the warmup full-layer peak, with margin.
+            # Worst-case new peak ≈ peak_warmup + k × M_layer.
+            budget = max(int(total * (1.0 - self.safety_margin) - self._peak_warmup), 0)
+            modes = ["full_layer"] * self.n_layers
+            remaining = budget
+            for i in reversed(range(self.n_layers)):
+                if remaining >= self._m_layer:
+                    modes[i] = "keep_mha"
+                    remaining -= self._m_layer
+                else:
+                    break
+            self._modes = modes
+            self._state = self._ACTIVE
+
+            n_keep = sum(1 for m in modes if m == "keep_mha")
+            self._last_n_keep = n_keep
+            if is_r0:
+                m_mib = self._m_layer / (1024**2)
+                print(
+                    f"[CommAwareCheckpointer] ACTIVE: "
+                    f"M_layer={m_mib:.1f} MiB (live-measured), "
+                    f"keep_mha={n_keep}/{self.n_layers} layers "
+                    f"(peak_warmup={self._peak_warmup/(1024**2):.0f} MiB, "
+                    f"budget={budget/(1024**2):.0f} MiB, "
+                    f"retained={n_keep * m_mib:.1f} MiB)"
+                )
+
+        # ACTIVE: no re-planning needed (stable after calibration).
+
+    def mode(self, layer_idx: int) -> str:
+        return self._modes[layer_idx]
+
+
 class Graphormer(nn.Module):
     """Graphormer for node-level task: one node - one token
         global token index: 0
@@ -677,6 +891,8 @@ class Graphormer(nn.Module):
         # Active only when attn_bias is not None (i.e. local_spd mode).
         self.attn_bias_proj = nn.Linear(attn_bias_dim, num_heads, bias=False)
         self.activation_checkpoint = False
+        self.activation_checkpoint_mode = "layer"
+        self._comm_ckpt: _CommAwareCheckpointer | None = None
         self.apply(lambda module: init_params(module, n_layers=n_layers))
 
     @staticmethod
@@ -755,8 +971,26 @@ class Graphormer(nn.Module):
             if hasattr(core_attn, "disable_hop_mass_tracking"):
                 core_attn.disable_hop_mass_tracking()
 
-    def set_activation_checkpoint(self, enabled: bool = True) -> None:
+    def set_activation_checkpoint(self, enabled: bool = True, mode: str = "layer") -> None:
+        if mode not in ("layer", "ffn_only", "comm_aware"):
+            raise ValueError(
+                f"activation_checkpoint_mode must be 'layer', 'ffn_only', or 'comm_aware', got {mode!r}"
+            )
         self.activation_checkpoint = bool(enabled)
+        self.activation_checkpoint_mode = mode
+        if mode == "comm_aware":
+            self._comm_ckpt = _CommAwareCheckpointer(len(self.layers))
+        else:
+            self._comm_ckpt = None
+
+    def comm_aware_notify_step_end(self, device) -> None:
+        """Call from the training loop after backward + optimizer.step() + lr_scheduler.step().
+
+        Advances the comm-aware checkpointer state machine.  This is a no-op
+        when comm_aware mode is not active.
+        """
+        if self._comm_ckpt is not None:
+            self._comm_ckpt.notify_step_end(device)
 
     def reset_hop_mass_stats(self) -> None:
         for layer in self.layers:
@@ -825,13 +1059,55 @@ class Graphormer(nn.Module):
             graph_attn_bias = None
 
         # transformer encoder
-        for enc_layer in self.layers:
-            if self.activation_checkpoint and self.training and torch.is_grad_enabled():
-                def custom_forward(hidden_states, layer=enc_layer):
-                    return layer(hidden_states, attn_bias=graph_attn_bias, edge_index=edge_index, attn_type=attn_type)
-                output = checkpoint(custom_forward, output)
-            else:
+        use_ckpt = self.activation_checkpoint and self.training and torch.is_grad_enabled()
+        ckpt_mode = getattr(self, "activation_checkpoint_mode", "layer")
+
+        # comm_aware: plan() only resets peak stats (WARMUP/CALIBRATE) or is a
+        # no-op (ACTIVE). Modes are set by notify_step_end() after each optimizer
+        # step, where the true peak — including optimizer state and all transient
+        # allocations — has been fully recorded.
+        if use_ckpt and ckpt_mode == "comm_aware" and self._comm_ckpt is not None:
+            self._comm_ckpt.plan(output.device)
+
+        for i, enc_layer in enumerate(self.layers):
+            if not use_ckpt:
                 output = enc_layer(output, attn_bias=graph_attn_bias, edge_index=edge_index, attn_type=attn_type)
+                continue
+
+            # Resolve per-layer mode: comm_aware assigns each layer independently.
+            if ckpt_mode == "comm_aware" and self._comm_ckpt is not None:
+                layer_mode = self._comm_ckpt.mode(i)
+            else:
+                layer_mode = ckpt_mode  # "layer" or "ffn_only" applies uniformly
+
+            if layer_mode in ("keep_mha", "ffn_only"):
+                # MHA runs without checkpointing: autograd retains post-A2A Q/K/V
+                # and sparse-attention outputs, so backward never re-executes any
+                # A2A collective or the graph-edge scatter-gather.
+                y = enc_layer.self_attention_norm(output)
+                y = enc_layer.self_attention(y, attn_bias=graph_attn_bias, edge_index=edge_index, attn_type=attn_type)
+                y = enc_layer.self_attention_dropout(y)
+                output = output + y
+                # Only the FFN block is checkpointed: 2 dense linears + LayerNorm,
+                # cheap to recompute and free of any communication.
+                def _ffn(h, layer=enc_layer):
+                    y = layer.ffn_norm(h)
+                    y = layer.ffn(y)
+                    y = layer.ffn_dropout(y)
+                    return h + y
+                output = checkpoint(_ffn, output)
+            else:
+                # "full_layer" / "layer": original behaviour.
+                def _full(h, layer=enc_layer):
+                    return layer(h, attn_bias=graph_attn_bias, edge_index=edge_index, attn_type=attn_type)
+                output = checkpoint(_full, output)
+
+        # Snapshot live memory right after the encoder loop, before backward.
+        # All keep_mha autograd tensors are live here; this is the measurement
+        # point for M_layer calibration.
+        if use_ckpt and ckpt_mode == "comm_aware" and self._comm_ckpt is not None:
+            self._comm_ckpt.record_post_forward_memory(output.device)
+
         output = self.final_ln(output)
 
         # output part

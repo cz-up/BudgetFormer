@@ -207,22 +207,27 @@ class DistributedAttention(torch.nn.Module):
     
 
 class DistributedAttentionNodeLevel(torch.nn.Module):
-    """Distributed attn with attn bias copy in each rank.
-    For graph-level tasks, no global tokens
+    """Distributed attention for node-level tasks (GT model, no global tokens).
+
+    When ``overlap_comm=True`` and the following conditions hold the layer
+    overlaps Value AllToAll with Q·K score computation on a separate CUDA
+    stream.  Otherwise the original synchronous path is used.
 
     Arguments:
         local_attention (Module): local attention with q,k,v
         sequence_process_group (ProcessGroup): sequence parallel process group
         scatter_idx (int): scatter_idx for all2all comm
         gather_idx (int): gather_idx for all2all comm
+        overlap_comm (bool): enable computation-communication overlap
     """
 
     def __init__(
         self,
         local_attention: Module,
         sequence_process_group: dist.ProcessGroup,
-        scatter_idx: int = 2, # head
-        gather_idx: int = 1, # s
+        scatter_idx: int = 2,  # head
+        gather_idx: int = 1,  # s
+        overlap_comm: bool = False,
     ) -> None:
 
         super(DistributedAttentionNodeLevel, self).__init__()
@@ -230,6 +235,32 @@ class DistributedAttentionNodeLevel(torch.nn.Module):
         self.spg = sequence_process_group
         self.scatter_idx = scatter_idx
         self.gather_idx = gather_idx
+
+        self.overlap_comm = (
+            bool(overlap_comm)
+            and torch.cuda.is_available()
+            and hasattr(local_attention, "sparse_score_phase")
+            and hasattr(local_attention, "sparse_aggregate_phase")
+        )
+        self._comm_stream: torch.cuda.Stream | None = None
+
+    def _get_comm_stream(self) -> torch.cuda.Stream:
+        if self._comm_stream is None:
+            self._comm_stream = torch.cuda.Stream()
+        return self._comm_stream
+
+    def _can_overlap(self, attn_bias, edge_index, attn_type) -> bool:
+        if not self.overlap_comm:
+            return False
+        if not self.training:
+            return False
+        if str(attn_type).lower() != "sparse":
+            return False
+        if not isinstance(edge_index, torch.Tensor) or edge_index.dim() != 2:
+            return False
+        if attn_bias is not None:
+            return False
+        return True
 
     def forward(self, query: Tensor, key: Tensor, value: Tensor, attn_bias: Tensor, edge_index: Tensor, attn_type, *args: Any) -> Tensor:
         """ forward
@@ -243,45 +274,57 @@ class DistributedAttentionNodeLevel(torch.nn.Module):
         Returns:
             * output (Tensor): context output
         """
-        # if self.training:
-        # in shape : [b, s/p, n_head, hn]
-        # global token embedding (index = 0) is same for each rank
-        # print(f'rank: {get_sequence_parallel_rank()}, q: {query[:, 0, :, :].view(4, 1, -1)}')
+        if not self.training:
+            return self.local_attn(query, key, value, attn_bias, edge_index, attn_type, *args)
 
-        if self.training:
-            query_layer = _SeqAllToAll.apply(self.spg, query, self.scatter_idx, self.gather_idx)
-            key_layer = _SeqAllToAll.apply(self.spg, key, self.scatter_idx, self.gather_idx)
+        # ---- AllToAll Q, K ----
+        query_layer = _SeqAllToAll.apply(self.spg, query, self.scatter_idx, self.gather_idx)
+        key_layer = _SeqAllToAll.apply(self.spg, key, self.scatter_idx, self.gather_idx)
+
+        if self._can_overlap(attn_bias, edge_index, attn_type):
+            # === Overlapped path ===
+            comm_stream = self._get_comm_stream()
+            default_stream = torch.cuda.current_stream()
+
+            qk_done = torch.cuda.Event()
+            qk_done.record(default_stream)
+
+            with torch.cuda.stream(comm_stream):
+                comm_stream.wait_event(qk_done)
+                value_layer = _SeqAllToAll.apply(self.spg, value, self.scatter_idx, self.gather_idx)
+                v_done = torch.cuda.Event()
+                v_done.record(comm_stream)
+
+            # Score computation overlaps with V AllToAll.
+            score_ctx = self.local_attn.sparse_score_phase(
+                key_layer, query_layer, edge_index, None,
+            )
+
+            default_stream.wait_event(v_done)
+            value_layer.record_stream(default_stream)
+            context_layer = self.local_attn.sparse_aggregate_phase(
+                score_ctx, value_layer,
+            )
+            batch_size = query_layer.size(0)
+            s_len = query_layer.size(1)
+            context_layer = context_layer.view(batch_size, s_len, -1)
+        else:
+            # === Original synchronous path ===
             value_layer = _SeqAllToAll.apply(self.spg, value, self.scatter_idx, self.gather_idx)
-            # out shape : [b, s, np, hn]
 
-            # attn_bias, forward: split in head dim, backward: all-gather
-            # in shape : [b, n_head, s/p, s+1]
             if attn_bias is not None:
-                # -> [b, np, s, s]
                 attn_bias_layer = _SeqAllToAll.apply(self.spg, attn_bias, 1, 2)
-                # out shape : [b, np, s, s+p]
             else:
                 attn_bias_layer = attn_bias
-        else:
-            query_layer = query
-            key_layer = key
-            value_layer = value
-            attn_bias_layer = attn_bias
-        
-        # q, k, v: [b, s, np, hn]
-        # -> [b, s, hp]
-        context_layer = self.local_attn(query_layer, key_layer, value_layer, attn_bias_layer, edge_index, attn_type, *args)
+
+            context_layer = self.local_attn(
+                query_layer, key_layer, value_layer,
+                attn_bias_layer, edge_index, attn_type, *args,
+            )
 
         if self.training:
-            # [b, s+p, hp] -> [b, s+p, hp]
-            # context_layer = copy_global_token0(context_layer, extend_dim=1)
-            
-            # [b, s, hp] -> [b, s/p, h]
-            # gather_idx: 1, scatter_idx: 2
-            
             output = _SeqAllToAll.apply(self.spg, context_layer, self.gather_idx, self.scatter_idx)
         else:
             output = context_layer
 
-        # out e.g., [b, s/p+1, h]
         return output

@@ -61,6 +61,21 @@ def add_node_common_args(parser, defaults=None):
         help="enable encoder-layer activation checkpointing",
     )
     parser.add_argument(
+        "--activation_checkpoint_mode",
+        type=str,
+        default=defaults.get("activation_checkpoint_mode", "layer"),
+        choices=["layer", "ffn_only", "comm_aware"],
+        help=(
+            "activation checkpoint granularity: "
+            "'layer' checkpoints the full EncoderLayer (default, saves most memory); "
+            "'ffn_only' checkpoints only the FFN block, keeping all MHA activations to "
+            "eliminate A2A recomputation from backward (faster backward, higher peak memory); "
+            "'comm_aware' dynamically decides per layer at each forward pass — layers are "
+            "assigned 'keep_mha' greedily from the last layer inward until GPU free memory "
+            "is exhausted, adapting to runtime memory pressure from edge sampling etc."
+        ),
+    )
+    parser.add_argument(
         "--amp_dtype",
         type=str,
         default=defaults.get("amp_dtype", "none"),
