@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from torch_geometric.utils import coalesce
 
 from gt_sp.comm_profiler import profile_call, record_scalar
+from gt_sp.reducer import build_gradient_reducer
 from gt_sp.utils import (
     _merge_edge_index_list,
     adjust_edge_index_nomerge,
@@ -209,6 +210,7 @@ class _AdaptiveEdgeBudgetConfig:
     max_total_edges_per_query: int
     bootstrap_search_epochs: int
     bootstrap_candidate_limit: int
+    bootstrap_n_layers: int
     static_seed_epochs: int
     bootstrap_walk_length_candidates: tuple  # () = disabled (use args.head_hop_walk_length)
 
@@ -301,7 +303,7 @@ def _resolve_adaptive_edge_budget_config(args, valid_size: int) -> _AdaptiveEdge
     bootstrap_search_epochs = int(getattr(args, "adaptive_edge_budget_bootstrap_search_epochs", 0))
     if enabled:
         if bootstrap_search_epochs == 0:
-            bootstrap_search_epochs = 3
+            bootstrap_search_epochs = 2
         elif bootstrap_search_epochs < 0:
             bootstrap_search_epochs = 0
     bootstrap_search_epochs = max(0, bootstrap_search_epochs)
@@ -313,6 +315,9 @@ def _resolve_adaptive_edge_budget_config(args, valid_size: int) -> _AdaptiveEdge
         elif bootstrap_candidate_limit < 0:
             bootstrap_candidate_limit = 0
     bootstrap_candidate_limit = max(0, bootstrap_candidate_limit)
+
+    bootstrap_n_layers = int(getattr(args, "adaptive_edge_budget_bootstrap_n_layers", 0))
+    bootstrap_n_layers = max(0, bootstrap_n_layers)
 
     static_seed_epochs = int(getattr(args, "adaptive_edge_budget_static_seed_epochs", 0))
     if enabled:
@@ -346,6 +351,7 @@ def _resolve_adaptive_edge_budget_config(args, valid_size: int) -> _AdaptiveEdge
         max_total_edges_per_query=max(0, int(getattr(args, "max_total_edges_per_query", 0))),
         bootstrap_search_epochs=bootstrap_search_epochs,
         bootstrap_candidate_limit=bootstrap_candidate_limit,
+        bootstrap_n_layers=bootstrap_n_layers,
         static_seed_epochs=static_seed_epochs,
         bootstrap_walk_length_candidates=bootstrap_walk_length_candidates,
     )
@@ -591,7 +597,10 @@ def _build_probe_edge_pools(
 
         rw_pool = None
         if _use_rw_edges(args, adaptive_edge_budget_cfg=adaptive_edge_budget_cfg):
-            wl = walk_length_override if walk_length_override is not None else getattr(args, "head_hop_walk_length", 4)
+            wl = _resolve_walk_length(
+                args,
+                walk_length_override=walk_length_override,
+            )
             rw_pool = build_head_hop_edges(
                 edge_index=edge_index_global,
                 num_nodes=num_nodes,
@@ -673,6 +682,11 @@ def _build_probe_attention_edges(
     if sp_rank == sp_src_rank:
         pools = edge_pools
         if pools is None:
+            resolved_walk_length = _resolve_walk_length(
+                args,
+                edge_budget_state=edge_budget_state,
+                walk_length_override=walk_length_override,
+            )
             pools = _build_probe_edge_pools(
                 args,
                 edge_index_global,
@@ -681,7 +695,7 @@ def _build_probe_attention_edges(
                 probe_idx_global,
                 edge_seed=edge_seed,
                 adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
-                walk_length_override=walk_length_override,
+                walk_length_override=resolved_walk_length,
             )
         merged_cpu = _assemble_edges_from_pools(
             args,
@@ -719,28 +733,38 @@ class _AdaptiveEdgeBudgetController:
         if not self.enabled:
             self.real_budget = self.max_total
             self.rw_budget = 0
+            self.walk_length = None
             return
 
         self.real_budget = 1 if self.max_total > 0 else 0
         self.rw_budget = 1 if self.max_total > 0 else 0
+        self.walk_length = None
 
     def current_state(self):
-        return {
+        state = {
             "real_edges_per_query": int(self.real_budget),
             "rw_edges_per_query": int(self.rw_budget),
         }
+        if self.walk_length is not None:
+            state["walk_length"] = int(self.walk_length)
+        return state
 
     def candidate_states(self):
         out = {}
         if self.real_budget + self.rw_budget + self.block_size <= self.max_total:
-            out["real_up"] = {
+            real_up = {
                 "real_edges_per_query": self.real_budget + self.block_size,
                 "rw_edges_per_query": self.rw_budget,
             }
-            out["rw_up"] = {
+            rw_up = {
                 "real_edges_per_query": self.real_budget,
                 "rw_edges_per_query": self.rw_budget + self.block_size,
             }
+            if self.walk_length is not None:
+                real_up["walk_length"] = int(self.walk_length)
+                rw_up["walk_length"] = int(self.walk_length)
+            out["real_up"] = real_up
+            out["rw_up"] = rw_up
         return out
 
     def set_state(self, state) -> None:
@@ -748,6 +772,8 @@ class _AdaptiveEdgeBudgetController:
             return
         self.real_budget = int(state.get("real_edges_per_query", self.real_budget))
         self.rw_budget = int(state.get("rw_edges_per_query", self.rw_budget))
+        if "walk_length" in state:
+            self.walk_length = int(state["walk_length"])
 
     def update(self, choice, best_gain, next_state=None):
         if best_gain > 0.0:
@@ -755,6 +781,8 @@ class _AdaptiveEdgeBudgetController:
         if next_state is not None and choice is not None:
             self.real_budget = int(next_state["real_edges_per_query"])
             self.rw_budget = int(next_state["rw_edges_per_query"])
+            if "walk_length" in next_state:
+                self.walk_length = int(next_state["walk_length"])
             self.bad_rounds = 0
             return
         if not self.seen_positive_gain:
@@ -881,6 +909,50 @@ def _clone_model_state_to_cpu(model):
         name: tensor.detach().cpu().clone()
         for name, tensor in model.state_dict().items()
     }
+
+
+@contextlib.contextmanager
+def _temporary_bootstrap_layer_subset(
+    args,
+    config: _AdaptiveEdgeBudgetConfig,
+    model,
+    sp_group,
+    sp_world_size,
+    grad_reducer,
+):
+    target_n_layers = int(config.bootstrap_n_layers)
+    model_layers = getattr(model, "layers", None)
+    if target_n_layers <= 0 or model_layers is None:
+        yield model, grad_reducer, None
+        return
+
+    full_n_layers = len(model_layers)
+    if target_n_layers >= full_n_layers:
+        yield model, grad_reducer, None
+        return
+
+    original_layers = model.layers
+    original_n_layers = getattr(model, "n_layers", None)
+    original_ckpt_mode = getattr(model, "activation_checkpoint_mode", None)
+
+    try:
+        model.layers = torch.nn.ModuleList(list(original_layers[:target_n_layers]))
+        if original_n_layers is not None:
+            model.n_layers = target_n_layers
+        if hasattr(model, "set_activation_checkpoint"):
+            model.set_activation_checkpoint(mode=getattr(args, "activation_checkpoint_mode", None))
+        bootstrap_grad_reducer = build_gradient_reducer(
+            model,
+            process_group=sp_group,
+            world_size=sp_world_size,
+        )
+        yield model, bootstrap_grad_reducer, full_n_layers
+    finally:
+        model.layers = original_layers
+        if original_n_layers is not None:
+            model.n_layers = original_n_layers
+        if hasattr(model, "set_activation_checkpoint"):
+            model.set_activation_checkpoint(mode=original_ckpt_mode)
 
 
 def _select_probe_nodes(split_idx, probe_size: int, seed: int):
@@ -1078,190 +1150,207 @@ def _bootstrap_initial_edge_budget(
     if probe_idx_global is None or local_probe_idx is None or probe_idx_global.numel() == 0:
         return None
 
-    candidate_states = _auto_initial_budget_candidates(edge_index_global, num_nodes, adaptive_edge_budget_cfg)
-    if not candidate_states:
-        return None
+    full_initial_model_state = _clone_model_state_to_cpu(model)
+    try:
+        with _temporary_bootstrap_layer_subset(
+            args,
+            adaptive_edge_budget_cfg,
+            model,
+            sp_group,
+            sp_world_size,
+            grad_reducer,
+        ) as (bootstrap_model, bootstrap_grad_reducer, full_n_layers):
+            if args.rank == 0 and full_n_layers is not None:
+                print(
+                    "  ↳ BootstrapBudgetSearch "
+                    f"temporary_model_layers={len(bootstrap_model.layers)}/{full_n_layers}"
+                )
 
-    wl_candidates = list(adaptive_edge_budget_cfg.bootstrap_walk_length_candidates)
-    if not wl_candidates:
-        wl_candidates = [None]
+            candidate_states = _auto_initial_budget_candidates(edge_index_global, num_nodes, adaptive_edge_budget_cfg)
+            if not candidate_states:
+                return None
 
-    initial_model_state = _clone_model_state_to_cpu(model)
-    probe_seed = int(getattr(args, "seed", 0))
+            wl_candidates = list(adaptive_edge_budget_cfg.bootstrap_walk_length_candidates)
+            if not wl_candidates:
+                wl_candidates = [None]
 
-    candidate_specs = []
-    for walk_length in wl_candidates:
-        probe_edge_pools = None
-        if sp_rank == sp_src_rank:
-            probe_edge_pools = _build_probe_edge_pools(
-                args,
-                edge_index_global,
-                num_nodes,
-                rw_device,
-                probe_idx_global,
-                edge_seed=probe_seed,
-                adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
-                walk_length_override=walk_length,
-            )
+            initial_model_state = _clone_model_state_to_cpu(bootstrap_model)
+            probe_seed = int(getattr(args, "seed", 0))
 
-        for candidate_state in candidate_states:
-            full_candidate_state = dict(candidate_state)
-            if walk_length is not None:
-                full_candidate_state["walk_length"] = walk_length
-            candidate_specs.append(
-                {
-                    "budget_state": dict(candidate_state),
-                    "full_state": full_candidate_state,
-                    "walk_length": walk_length,
-                    "probe_edge_pools": probe_edge_pools,
-                    "model_state": initial_model_state,
-                    "trained_epochs": 0,
-                    "loss": float("inf"),
-                    "edge_count": float("inf"),
-                }
-            )
+            candidate_specs = []
+            for walk_length in wl_candidates:
+                probe_edge_pools = None
+                if sp_rank == sp_src_rank:
+                    probe_edge_pools = _build_probe_edge_pools(
+                        args,
+                        edge_index_global,
+                        num_nodes,
+                        rw_device,
+                        probe_idx_global,
+                        edge_seed=probe_seed,
+                        adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
+                        walk_length_override=walk_length,
+                    )
 
-    total_rounds = max(1, int(adaptive_edge_budget_cfg.bootstrap_search_epochs))
-    active_specs = list(candidate_specs)
-    last_round_summaries = []
+                for candidate_state in candidate_states:
+                    full_candidate_state = dict(candidate_state)
+                    if walk_length is not None:
+                        full_candidate_state["walk_length"] = walk_length
+                    candidate_specs.append(
+                        {
+                            "budget_state": dict(candidate_state),
+                            "full_state": full_candidate_state,
+                            "walk_length": walk_length,
+                            "probe_edge_pools": probe_edge_pools,
+                            "model_state": initial_model_state,
+                            "trained_epochs": 0,
+                            "loss": float("inf"),
+                            "edge_count": float("inf"),
+                        }
+                    )
 
-    def _summary_sort_key(item):
-        _, loss, edges = item
-        return (float(loss), int(edges))
+            total_rounds = max(1, int(adaptive_edge_budget_cfg.bootstrap_search_epochs))
+            active_specs = list(candidate_specs)
+            last_round_summaries = []
 
-    def _fmt_summary(state, loss, trained_epochs):
-        wl_str = f",L={state['walk_length']}" if "walk_length" in state else ""
-        return f"({state['real_edges_per_query']},{state['rw_edges_per_query']}{wl_str})@{loss:.4f}[e={trained_epochs}]"
+            def _summary_sort_key(item):
+                _, loss, edges = item
+                return (float(loss), int(edges))
 
-    for round_idx in range(total_rounds):
-        if not active_specs:
-            break
+            def _fmt_summary(state, loss, trained_epochs):
+                wl_str = f",L={state['walk_length']}" if "walk_length" in state else ""
+                return f"({state['real_edges_per_query']},{state['rw_edges_per_query']}{wl_str})@{loss:.4f}[e={trained_epochs}]"
 
-        round_summaries = []
-        for spec in active_specs:
+            for round_idx in range(total_rounds):
+                if not active_specs:
+                    break
+
+                round_summaries = []
+                for spec in active_specs:
+                    _set_seed(int(getattr(args, "seed", 0)))
+                    bootstrap_model.load_state_dict(spec["model_state"], strict=True)
+                    optimizer, lr_scheduler, scaler = _build_optimizer_bundle(args, bootstrap_model, device, amp_dtype)
+
+                    _train_one_epoch_with_budget(
+                        args,
+                        adaptive_edge_budget_cfg,
+                        bootstrap_model,
+                        optimizer,
+                        lr_scheduler,
+                        scaler,
+                        x_local,
+                        local_y,
+                        local_train_idx,
+                        edge_index_global,
+                        num_nodes,
+                        device,
+                        rw_device,
+                        sp_group,
+                        sp_src_rank,
+                        sp_rank,
+                        local_nodes,
+                        amp_dtype,
+                        sp_world_size,
+                        bootstrap_grad_reducer,
+                        spec["budget_state"],
+                        probe_seed,
+                        walk_length_override=spec["walk_length"],
+                    )
+
+                    probe_edges = _build_probe_attention_edges(
+                        args,
+                        edge_index_global,
+                        num_nodes,
+                        device,
+                        rw_device,
+                        sp_group,
+                        sp_src_rank,
+                        sp_rank,
+                        local_nodes,
+                        probe_idx_global,
+                        edge_seed=probe_seed,
+                        edge_budget_state=spec["budget_state"],
+                        adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
+                        edge_pools=spec["probe_edge_pools"],
+                        walk_length_override=spec["walk_length"],
+                    )
+                    candidate_loss, _ = _probe_loss_sp(
+                        args,
+                        bootstrap_model,
+                        x_local,
+                        local_y,
+                        local_probe_idx,
+                        probe_edges,
+                        device,
+                        amp_dtype,
+                        sp_group,
+                        sp_world_size,
+                    )
+                    candidate_edge_count = _edge_count(probe_edges)
+                    spec["model_state"] = _clone_model_state_to_cpu(bootstrap_model)
+                    spec["trained_epochs"] += 1
+                    spec["loss"] = float(candidate_loss)
+                    spec["edge_count"] = int(candidate_edge_count)
+                    round_summaries.append((spec, float(candidate_loss), int(candidate_edge_count)))
+                    del probe_edges, optimizer, lr_scheduler, scaler
+
+                if not round_summaries:
+                    break
+
+                round_summaries.sort(key=_summary_sort_key)
+                last_round_summaries = round_summaries
+                is_last_round = (round_idx + 1 >= total_rounds) or (len(round_summaries) <= 1)
+                keep_count = len(round_summaries) if is_last_round else max(1, (len(round_summaries) + 1) // 2)
+                active_specs = [item[0] for item in round_summaries[:keep_count]]
+
+                if args.rank == 0:
+                    best_spec, best_loss_round, best_edges_round = round_summaries[0]
+                    print(
+                        "  ↳ BootstrapBudgetSearch "
+                        f"round={round_idx + 1}/{total_rounds} "
+                        f"active={len(round_summaries)} keep={keep_count} "
+                        f"best={_fmt_summary(best_spec['full_state'], best_loss_round, best_spec['trained_epochs'])} "
+                        f"probe_edges={best_edges_round}"
+                    )
+
+                if is_last_round:
+                    break
+
+            if not last_round_summaries:
+                return None
+
+            best_spec, best_loss, best_edge_count = min(last_round_summaries, key=_summary_sort_key)
+            best_state = dict(best_spec["full_state"])
+
+            bootstrap_model.load_state_dict(initial_model_state, strict=True)
             _set_seed(int(getattr(args, "seed", 0)))
-            model.load_state_dict(spec["model_state"], strict=True)
-            optimizer, lr_scheduler, scaler = _build_optimizer_bundle(args, model, device, amp_dtype)
 
-            _train_one_epoch_with_budget(
-                args,
-                adaptive_edge_budget_cfg,
-                model,
-                optimizer,
-                lr_scheduler,
-                scaler,
-                x_local,
-                local_y,
-                local_train_idx,
-                edge_index_global,
-                num_nodes,
-                device,
-                rw_device,
-                sp_group,
-                sp_src_rank,
-                sp_rank,
-                local_nodes,
-                amp_dtype,
-                sp_world_size,
-                grad_reducer,
-                spec["budget_state"],
-                probe_seed,
-                walk_length_override=spec["walk_length"],
-            )
+            if args.rank == 0:
+                formatted_candidates = ", ".join(
+                    _fmt_summary(spec["full_state"], spec["loss"], spec["trained_epochs"])
+                    for spec in candidate_specs
+                )
+                chosen_wl = f",L={best_state['walk_length']}" if "walk_length" in best_state else ""
+                print(
+                    "  ↳ BootstrapBudgetSearch "
+                    f"strategy=successive_halving "
+                    f"rounds={total_rounds} "
+                    f"walk_lengths={[w for w in wl_candidates if w is not None] or 'default'} "
+                    f"candidates=[{formatted_candidates}] "
+                    f"chosen=({best_state['real_edges_per_query']},{best_state['rw_edges_per_query']}{chosen_wl}) "
+                    f"probe_loss={best_loss:.4f} probe_edges={best_edge_count}"
+                )
 
-            probe_edges = _build_probe_attention_edges(
-                args,
-                edge_index_global,
-                num_nodes,
-                device,
-                rw_device,
-                sp_group,
-                sp_src_rank,
-                sp_rank,
-                local_nodes,
-                probe_idx_global,
-                edge_seed=probe_seed,
-                edge_budget_state=spec["budget_state"],
-                adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
-                edge_pools=spec["probe_edge_pools"],
-                walk_length_override=spec["walk_length"],
-            )
-            candidate_loss, _ = _probe_loss_sp(
-                args,
-                model,
-                x_local,
-                local_y,
-                local_probe_idx,
-                probe_edges,
-                device,
-                amp_dtype,
-                sp_group,
-                sp_world_size,
-            )
-            candidate_edge_count = _edge_count(probe_edges)
-            spec["model_state"] = _clone_model_state_to_cpu(model)
-            spec["trained_epochs"] += 1
-            spec["loss"] = float(candidate_loss)
-            spec["edge_count"] = int(candidate_edge_count)
-            round_summaries.append((spec, float(candidate_loss), int(candidate_edge_count)))
-            del probe_edges, optimizer, lr_scheduler, scaler
+            if args.rank == 0:
+                print(
+                    "  ↳ BudgetCtrl [ThresholdFixed] "
+                    f"rel_gain_threshold remains {controller.gain_threshold:.8e} from args."
+                )
 
-        if not round_summaries:
-            break
-
-        round_summaries.sort(key=_summary_sort_key)
-        last_round_summaries = round_summaries
-        is_last_round = (round_idx + 1 >= total_rounds) or (len(round_summaries) <= 1)
-        keep_count = len(round_summaries) if is_last_round else max(1, (len(round_summaries) + 1) // 2)
-        active_specs = [item[0] for item in round_summaries[:keep_count]]
-
-        if args.rank == 0:
-            best_spec, best_loss_round, best_edges_round = round_summaries[0]
-            print(
-                "  ↳ BootstrapBudgetSearch "
-                f"round={round_idx + 1}/{total_rounds} "
-                f"active={len(round_summaries)} keep={keep_count} "
-                f"best={_fmt_summary(best_spec['full_state'], best_loss_round, best_spec['trained_epochs'])} "
-                f"probe_edges={best_edges_round}"
-            )
-
-        if is_last_round:
-            break
-
-    if not last_round_summaries:
-        return None
-
-    best_spec, best_loss, best_edge_count = min(last_round_summaries, key=_summary_sort_key)
-    best_state = dict(best_spec["full_state"])
-
-
-    model.load_state_dict(initial_model_state, strict=True)
-    _set_seed(int(getattr(args, "seed", 0)))
-
-    if args.rank == 0:
-        formatted_candidates = ", ".join(
-            _fmt_summary(spec["full_state"], spec["loss"], spec["trained_epochs"])
-            for spec in candidate_specs
-        )
-        chosen_wl = f",L={best_state['walk_length']}" if "walk_length" in best_state else ""
-        print(
-            "  ↳ BootstrapBudgetSearch "
-            f"strategy=successive_halving "
-            f"rounds={total_rounds} "
-            f"walk_lengths={[w for w in wl_candidates if w is not None] or 'default'} "
-            f"candidates=[{formatted_candidates}] "
-            f"chosen=({best_state['real_edges_per_query']},{best_state['rw_edges_per_query']}{chosen_wl}) "
-            f"probe_loss={best_loss:.4f} probe_edges={best_edge_count}"
-        )
-    
-    if args.rank == 0:
-        print(
-            "  ↳ BudgetCtrl [ThresholdFixed] "
-            f"rel_gain_threshold remains {controller.gain_threshold:.8e} from args."
-        )
-
-    controller.bootstrap_baseline_loss = float(best_loss)
-    return best_state
+            controller.bootstrap_baseline_loss = float(best_loss)
+            return best_state
+    finally:
+        model.load_state_dict(full_initial_model_state, strict=True)
 
 
 def _maybe_update_edge_budget(
@@ -1298,6 +1387,7 @@ def _maybe_update_edge_budget(
         return
 
     probe_seed = int(getattr(args, "seed", 0)) + 100000 + int(epoch)
+    base_state = controller.current_state()
     probe_edge_pools = None
     if sp_rank == sp_src_rank:
         probe_edge_pools = _build_probe_edge_pools(
@@ -1308,8 +1398,8 @@ def _maybe_update_edge_budget(
             probe_idx_global,
             edge_seed=probe_seed,
             adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
+            walk_length_override=base_state.get("walk_length"),
         )
-    base_state = controller.current_state()
     base_edges = _build_probe_attention_edges(
         args,
         edge_index_global,
@@ -1467,7 +1557,11 @@ def _build_merged_edges(args, edge_index_global, num_nodes, final_device, rw_dev
     record_scalar("edge_real_edges", int(real_edges.size(1)) if real_edges is not None else 0, reduce="max")
     rw_heads = None
     if _use_rw_edges(args, edge_budget_state, adaptive_edge_budget_cfg):
-        wl = walk_length_override if walk_length_override is not None else getattr(args, "head_hop_walk_length", 4)
+        wl = _resolve_walk_length(
+            args,
+            edge_budget_state=edge_budget_state,
+            walk_length_override=walk_length_override,
+        )
         rw_heads = profile_call(
             "edge_rw_build",
             lambda: build_head_hop_edges(
@@ -1509,6 +1603,14 @@ def _build_merged_edges(args, edge_index_global, num_nodes, final_device, rw_dev
     merged = profile_call("edge_merge", _assemble, device=final_torch_device)
     record_scalar("edge_merged_edges", int(merged.size(1)), reduce="max")
     return merged
+
+
+def _resolve_walk_length(args, edge_budget_state=None, walk_length_override=None) -> int:
+    if walk_length_override is not None:
+        return max(1, int(walk_length_override))
+    if edge_budget_state is not None and "walk_length" in edge_budget_state:
+        return max(1, int(edge_budget_state["walk_length"]))
+    return max(1, int(getattr(args, "head_hop_walk_length", 4)))
 
 
 def _pack_streaming_edges(merged_cpu):
@@ -1584,9 +1686,9 @@ def _build_prefetched_cpu_edges(args, edge_index_global, num_nodes, rw_device, n
         merged_cpu = _build_merged_edges(
             args, edge_index_global, num_nodes, "cpu", rw_device, nodes_per_rank,
             edge_seed=edge_seed,
-            edge_budget_state=edge_budget_state,
-            adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
-        )
+        edge_budget_state=edge_budget_state,
+        adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
+    )
     if merged_cpu.device.type == "cpu":
         merged_cpu = _pin_cpu_tensor(merged_cpu.contiguous())
     return merged_cpu

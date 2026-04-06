@@ -411,15 +411,17 @@ def main():
             if edge_prefetcher.enabled and epoch < args.epochs:
                 next_epoch = epoch + 1
                 next_seed = args.seed + next_epoch
+                next_budget_state = dict(edge_budget_controller.current_state())
                 edge_prefetcher.submit(
                     next_epoch,
-                    lambda next_seed=next_seed: _build_prefetched_cpu_edges(
+                    lambda next_seed=next_seed, next_budget_state=next_budget_state: _build_prefetched_cpu_edges(
                         args,
                         edge_index_global,
                         num_nodes,
                         rw_device,
                         local_num_nodes,
                         next_seed,
+                        edge_budget_state=next_budget_state,
                         adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
                     ),
                 )

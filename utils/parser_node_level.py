@@ -146,13 +146,19 @@ def add_node_common_args(parser, defaults=None):
         "--adaptive_edge_budget_bootstrap_search_epochs",
         type=int,
         default=defaults.get("adaptive_edge_budget_bootstrap_search_epochs", 0),
-        help="advanced override; 0 uses a short automatic pre-training search to select the initial (real, rw) budget, <0 disables it",
+        help="advanced override; 0 uses a short automatic pre-training search (default 2 rounds) to select the initial (real, rw) budget, <0 disables it",
     )
     parser.add_argument(
         "--adaptive_edge_budget_bootstrap_candidate_limit",
         type=int,
         default=defaults.get("adaptive_edge_budget_bootstrap_candidate_limit", 0),
         help="advanced override; 0 uses the default number of auto-generated bootstrap budget candidates, <0 keeps the full auto-generated set",
+    )
+    parser.add_argument(
+        "--adaptive_edge_budget_bootstrap_n_layers",
+        type=int,
+        default=defaults.get("adaptive_edge_budget_bootstrap_n_layers", 0),
+        help="advanced override; >0 uses a temporary N-layer proxy model during bootstrap budget search, <=0 keeps the full model",
     )
     parser.add_argument(
         "--adaptive_edge_budget_static_seed_epochs",
@@ -163,10 +169,10 @@ def add_node_common_args(parser, defaults=None):
     parser.add_argument(
         "--walk_length_candidates",
         type=str,
-        default=defaults.get("walk_length_candidates", ""),
+        default=defaults.get("walk_length_candidates", "4,6,8"),
         help=(
             "comma-separated walk lengths to jointly search during bootstrap budget selection, "
-            "e.g. '4,6,8'; empty or 'none' disables walk-length search and uses --head_hop_walk_length"
+            "e.g. '4,6,8'; default searches 4,6,8; use 'none' to disable walk-length search and use --head_hop_walk_length"
         ),
     )
     parser.add_argument("--rank", type=int, default=defaults.get("rank"))
