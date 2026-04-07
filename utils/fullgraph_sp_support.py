@@ -227,6 +227,8 @@ def _pin_cpu_tensor(tensor):
 def _random_block_sampling_enabled(args, adaptive_edge_budget_cfg=None) -> bool:
     if adaptive_edge_budget_cfg is not None and adaptive_edge_budget_cfg.enabled:
         return True
+    if _fixed_edge_budget_enabled(args, adaptive_edge_budget_cfg):
+        return True
     return bool(getattr(args, "random_edge_blocks", False))
 
 
@@ -234,9 +236,31 @@ def _adaptive_edge_budget_enabled(args) -> bool:
     return bool(getattr(args, "adaptive_edge_budget", False))
 
 
+def _fixed_edge_budget_state_from_args(args):
+    fixed_real = getattr(args, "fixed_real_edges_per_query", None)
+    fixed_rw = getattr(args, "fixed_rw_edges_per_query", None)
+    if fixed_real is None or fixed_rw is None:
+        return None
+    state = {
+        "real_edges_per_query": int(fixed_real),
+        "rw_edges_per_query": int(fixed_rw),
+    }
+    fixed_walk = getattr(args, "fixed_walk_length", None)
+    if fixed_walk is not None:
+        state["walk_length"] = int(fixed_walk)
+    return state
+
+
+def _fixed_edge_budget_enabled(args, adaptive_edge_budget_cfg=None) -> bool:
+    if adaptive_edge_budget_cfg is not None and adaptive_edge_budget_cfg.enabled:
+        return False
+    return _fixed_edge_budget_state_from_args(args) is not None
+
+
 def _get_real_edge_budget(args, edge_budget_state=None, adaptive_edge_budget_cfg=None) -> int:
-    if edge_budget_state is not None and "real_edges_per_query" in edge_budget_state:
-        return int(edge_budget_state["real_edges_per_query"])
+    state = edge_budget_state if edge_budget_state is not None else _fixed_edge_budget_state_from_args(args)
+    if state is not None and "real_edges_per_query" in state:
+        return int(state["real_edges_per_query"])
     if adaptive_edge_budget_cfg is not None:
         max_tot = int(adaptive_edge_budget_cfg.max_total_edges_per_query)
     else:
@@ -247,8 +271,9 @@ def _get_real_edge_budget(args, edge_budget_state=None, adaptive_edge_budget_cfg
 
 
 def _get_rw_edge_budget(args, edge_budget_state=None, adaptive_edge_budget_cfg=None) -> int:
-    if edge_budget_state is not None and "rw_edges_per_query" in edge_budget_state:
-        return int(edge_budget_state["rw_edges_per_query"])
+    state = edge_budget_state if edge_budget_state is not None else _fixed_edge_budget_state_from_args(args)
+    if state is not None and "rw_edges_per_query" in state:
+        return int(state["rw_edges_per_query"])
     if int(getattr(args, "head_hop_walks_per_node", 0)) <= 0:
         return 0
     if adaptive_edge_budget_cfg is not None:
@@ -259,12 +284,16 @@ def _get_rw_edge_budget(args, edge_budget_state=None, adaptive_edge_budget_cfg=N
 
 
 def _use_real_edges(args, adaptive_edge_budget_cfg=None) -> bool:
+    if _fixed_edge_budget_enabled(args, adaptive_edge_budget_cfg):
+        return _get_real_edge_budget(args, adaptive_edge_budget_cfg=adaptive_edge_budget_cfg) > 0
     if _random_block_sampling_enabled(args, adaptive_edge_budget_cfg):
         return _get_real_edge_budget(args, adaptive_edge_budget_cfg=adaptive_edge_budget_cfg) > 0
     return bool(getattr(args, "include_real_edges", 0))
 
 
 def _use_real_edges_for_state(args, edge_budget_state=None, adaptive_edge_budget_cfg=None) -> bool:
+    if _fixed_edge_budget_enabled(args, adaptive_edge_budget_cfg):
+        return _get_real_edge_budget(args, edge_budget_state, adaptive_edge_budget_cfg) > 0
     if _random_block_sampling_enabled(args, adaptive_edge_budget_cfg):
         return _get_real_edge_budget(args, edge_budget_state, adaptive_edge_budget_cfg) > 0
     return bool(getattr(args, "include_real_edges", 0))
@@ -273,6 +302,8 @@ def _use_real_edges_for_state(args, edge_budget_state=None, adaptive_edge_budget
 def _use_rw_edges(args, edge_budget_state=None, adaptive_edge_budget_cfg=None) -> bool:
     if int(getattr(args, "head_hop_walks_per_node", 0)) <= 0:
         return False
+    if _fixed_edge_budget_enabled(args, adaptive_edge_budget_cfg):
+        return _get_rw_edge_budget(args, edge_budget_state, adaptive_edge_budget_cfg) > 0
     if _random_block_sampling_enabled(args, adaptive_edge_budget_cfg):
         return _get_rw_edge_budget(args, edge_budget_state, adaptive_edge_budget_cfg) > 0
     return True
@@ -509,14 +540,14 @@ def _resolve_real_edges_for_state(
     if not _use_real_edges_for_state(args, edge_budget_state, adaptive_edge_budget_cfg):
         return None
 
+    real_edges = edge_index_global.to(device)
     if not _random_block_sampling_enabled(args, adaptive_edge_budget_cfg):
-        return edge_index_global.to(device)
+        return real_edges
 
     real_budget = _get_real_edge_budget(args, edge_budget_state, adaptive_edge_budget_cfg)
     if real_budget <= 0:
         return None
 
-    real_edges = edge_index_global.to(device)
     if _random_block_sampling_enabled(args, adaptive_edge_budget_cfg):
         real_edges = profile_call(
             "edge_real_sample",
@@ -1610,6 +1641,9 @@ def _resolve_walk_length(args, edge_budget_state=None, walk_length_override=None
         return max(1, int(walk_length_override))
     if edge_budget_state is not None and "walk_length" in edge_budget_state:
         return max(1, int(edge_budget_state["walk_length"]))
+    fixed_walk_length = getattr(args, "fixed_walk_length", None)
+    if fixed_walk_length is not None:
+        return max(1, int(fixed_walk_length))
     return max(1, int(getattr(args, "head_hop_walk_length", 4)))
 
 

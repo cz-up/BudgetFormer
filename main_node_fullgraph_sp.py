@@ -47,6 +47,7 @@ from utils.fullgraph_sp_support import (
     _broadcast_prefetched_edges,
     _cuda_empty_cache,
     _eval_sp,
+    _fixed_edge_budget_state_from_args,
     _get_process_peak_rss_mib,
     _get_process_rss_mib,
     _load_data,
@@ -181,6 +182,9 @@ def main():
         raise ValueError("--stream_edges_from_cpu currently requires --attn_type sparse.")
     if _adaptive_edge_budget_enabled(args) and args.random_walk_prefetch:
         raise ValueError("--adaptive_edge_budget is not compatible with --random_walk_prefetch.")
+    fixed_edge_budget_state = _fixed_edge_budget_state_from_args(args)
+    if _adaptive_edge_budget_enabled(args) and fixed_edge_budget_state is not None:
+        raise ValueError("--fixed_real_edges_per_query/--fixed_rw_edges_per_query are not compatible with --adaptive_edge_budget.")
 
     initialize_distributed(args)
 
@@ -228,6 +232,9 @@ def main():
     local_y = y[rank_start:rank_end].to(device)
 
     edge_budget_controller = _AdaptiveEdgeBudgetController(adaptive_edge_budget_cfg)
+    if fixed_edge_budget_state is not None:
+        edge_budget_controller.set_state(fixed_edge_budget_state)
+        edge_budget_controller.frozen = True
     total_bootstrap_time = 0.0
     total_adjustment_time = 0.0
     probe_idx_global = None
@@ -327,6 +334,13 @@ def main():
             f"  Random edge blocks: {int(_random_block_sampling_enabled(args, adaptive_edge_budget_cfg))} "
             f"(max_total={adaptive_edge_budget_cfg.max_total_edges_per_query})"
         )
+        if fixed_edge_budget_state is not None:
+            print(
+                "  Fixed edge budget: "
+                f"real={fixed_edge_budget_state['real_edges_per_query']} "
+                f"rw={fixed_edge_budget_state['rw_edges_per_query']} "
+                f"walk_length={fixed_edge_budget_state.get('walk_length', getattr(args, 'head_hop_walk_length', 4))}"
+            )
         print(
             f"  Adaptive edge budget: {int(edge_budget_controller.enabled)} "
             f"(probe={adaptive_edge_budget_cfg.probe_size} "

@@ -308,6 +308,24 @@ def add_node_fullgraph_sp_args(parser, defaults=None):
         action="store_true",
         default=defaults.get("to_bidirected", False),
     )
+    parser.add_argument(
+        "--fixed_real_edges_per_query",
+        type=int,
+        default=defaults.get("fixed_real_edges_per_query"),
+        help="fixed full-graph sampling override; set together with --fixed_rw_edges_per_query to train with a manually specified adaptive-style edge budget",
+    )
+    parser.add_argument(
+        "--fixed_rw_edges_per_query",
+        type=int,
+        default=defaults.get("fixed_rw_edges_per_query"),
+        help="fixed full-graph sampling override; set together with --fixed_real_edges_per_query to train with a manually specified adaptive-style edge budget",
+    )
+    parser.add_argument(
+        "--fixed_walk_length",
+        type=int,
+        default=defaults.get("fixed_walk_length"),
+        help="optional fixed random-walk length paired with --fixed_real_edges_per_query/--fixed_rw_edges_per_query; defaults to --head_hop_walk_length when omitted",
+    )
     parser.add_argument("--seq_len", type=int, default=defaults.get("seq_len", 0), help="compat arg for shared launch scripts")
 
 
@@ -320,6 +338,7 @@ def normalize_main_node_batch_sp_args(args):
 
 def normalize_main_node_fullgraph_sp_args(args):
     _normalize_checkpoint_args(args)
+    _normalize_fixed_edge_budget_args(args)
     if str(getattr(args, "model", "")).lower() == "gt":
         args.attn_type = "sparse"
     if args.model != "graphormer":
@@ -342,3 +361,26 @@ def _normalize_checkpoint_args(args):
     if checkpoint_mode not in {"all", "ffn_only", "adaptive"}:
         raise ValueError(f"Unsupported activation_checkpoint_mode: {checkpoint_mode}")
     args.activation_checkpoint_mode = checkpoint_mode
+
+
+def _normalize_fixed_edge_budget_args(args):
+    fixed_real = getattr(args, "fixed_real_edges_per_query", None)
+    fixed_rw = getattr(args, "fixed_rw_edges_per_query", None)
+    fixed_walk = getattr(args, "fixed_walk_length", None)
+
+    if fixed_real is None and fixed_rw is None:
+        if fixed_walk is not None:
+            raise ValueError("--fixed_walk_length requires --fixed_real_edges_per_query and --fixed_rw_edges_per_query.")
+        return
+    if fixed_real is None or fixed_rw is None:
+        raise ValueError("--fixed_real_edges_per_query and --fixed_rw_edges_per_query must be set together.")
+    if int(fixed_real) < 0 or int(fixed_rw) < 0:
+        raise ValueError("Fixed edge budgets must be >= 0.")
+    args.fixed_real_edges_per_query = int(fixed_real)
+    args.fixed_rw_edges_per_query = int(fixed_rw)
+    if args.fixed_rw_edges_per_query > 0 and int(getattr(args, "head_hop_walks_per_node", 0)) <= 0:
+        raise ValueError("--fixed_rw_edges_per_query > 0 requires --head_hop_walks_per_node > 0.")
+    if fixed_walk is not None:
+        if int(fixed_walk) <= 0:
+            raise ValueError("--fixed_walk_length must be > 0 when provided.")
+        args.fixed_walk_length = int(fixed_walk)
