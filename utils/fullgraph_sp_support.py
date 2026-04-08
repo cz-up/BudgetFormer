@@ -4,6 +4,7 @@ import os
 import random
 import resource
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Optional
@@ -92,6 +93,86 @@ def _cuda_empty_cache(args) -> None:
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+
+def _try_cache_edge_index_on_gpu(
+    edge_index_global: torch.Tensor,
+    device: str,
+    rank: int = 0,
+    safety_factor: float = 0.5,
+):
+    """Attempt to move *edge_index_global* to GPU for persistent caching.
+
+    Avoids repeated host-to-device transfers in the rank-local edge-build path.
+    The check uses *safety_factor* as a guard: we only cache when the tensor
+    fits within ``safety_factor * free_GPU_bytes`` so that enough headroom
+    remains for optimizer state and forward/backward activations.
+
+    Returns:
+        (gpu_tensor, True)   – allocation succeeded; caller should replace
+                               edge_index_global with the returned tensor.
+        (None, False)        – not enough memory or CUDA unavailable; caller
+                               should keep the original CPU tensor and enable
+                               the broadcast path (force_edge_broadcast=True).
+    """
+    if not torch.cuda.is_available() or not device.startswith("cuda"):
+        return None, False
+    if edge_index_global.device.type == "cuda":
+        return edge_index_global, True  # already resident – nothing to do
+
+    edge_bytes = edge_index_global.numel() * edge_index_global.element_size()
+    gc.collect()
+    torch.cuda.empty_cache()
+    free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+    budget_bytes = int(free_bytes * safety_factor)
+
+    if edge_bytes > budget_bytes:
+        if rank == 0:
+            print(
+                f"[edge-cache] Insufficient GPU memory to cache edge_index_global "
+                f"({edge_bytes / (1024 ** 2):.1f} MiB needed, "
+                f"{budget_bytes / (1024 ** 2):.1f} MiB available "
+                f"[free={free_bytes / (1024 ** 2):.1f} MiB × safety={safety_factor:.0%}]). "
+                "Will use rank-0 broadcast path."
+            )
+        return None, False
+
+    try:
+        gpu_tensor = edge_index_global.to(device=device)
+        return gpu_tensor, True
+    except torch.cuda.OutOfMemoryError:
+        if rank == 0:
+            print(
+                "[edge-cache] OOM while caching edge_index_global on GPU; "
+                "falling back to broadcast path."
+            )
+        return None, False
+
+
+def _measure_edge_h2d_time(edge_index_global: torch.Tensor, device: str) -> float:
+    """Measure host-to-device transfer time for edge_index_global.
+
+    Performs a single timed .to(device) call with CUDA synchronisation for
+    accuracy, then immediately frees the GPU copy.  This keeps the warmup
+    peak_warmup measurement (taken later) free of edge-index bytes.
+
+    Returns elapsed seconds (0.0 when CUDA is unavailable or the tensor is
+    already resident on the target device).
+    """
+    if not torch.cuda.is_available() or not device.startswith("cuda"):
+        return 0.0
+    if edge_index_global.device.type == "cuda":
+        return 0.0
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize(device)
+    t0 = time.perf_counter()
+    _tmp = edge_index_global.to(device=device)
+    torch.cuda.synchronize(device)
+    t_h2d = time.perf_counter() - t0
+    del _tmp
+    torch.cuda.empty_cache()
+    return t_h2d
 
 
 def _to_bidirected_edge_index(edge_index: torch.Tensor, num_nodes: int) -> torch.Tensor:
@@ -188,7 +269,15 @@ def _build_model(args, feature, y, device):
             **common,
             num_global_node=args.num_global_node,
         ).to(device)
-        model.set_activation_checkpoint(mode=getattr(args, "activation_checkpoint_mode", None))
+        _ckpt_mode = getattr(args, "activation_checkpoint_mode", None)
+        # Defer checkpoint calibration when adaptive_edge_budget is also active:
+        # peak_warmup measured before the budget stabilises is too small and
+        # produces wrong keep_mha layer counts.
+        _ckpt_deferred = (
+            _ckpt_mode == "adaptive"
+            and _adaptive_edge_budget_enabled(args)
+        )
+        model.set_activation_checkpoint(mode=_ckpt_mode, deferred=_ckpt_deferred)
     elif args.model == "gt":
         model = GT(
             **common,

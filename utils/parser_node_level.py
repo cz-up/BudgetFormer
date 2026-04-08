@@ -54,127 +54,6 @@ def add_node_common_args(parser, defaults=None):
         default=defaults.get("random_walk_device", "same"),
         help="device for random-walk subgraph construction: same|cpu|cuda|cuda:N",
     )
-    parser.add_argument(
-        "--activation_checkpoint_mode",
-        type=str,
-        default=defaults.get("activation_checkpoint_mode"),
-        choices=["all", "ffn_only", "adaptive"],
-        help=(
-            "activation checkpoint mode: "
-            "'all' checkpoints the full EncoderLayer; "
-            "'ffn_only' checkpoints only the FFN block, keeping all MHA activations to "
-            "eliminate A2A recomputation from backward (faster backward, higher peak memory); "
-            "'adaptive' dynamically decides per layer at each forward pass — layers are "
-            "assigned 'keep_mha' greedily from the last layer inward until GPU free memory "
-            "is exhausted, adapting to runtime memory pressure from edge sampling etc."
-        ),
-    )
-    parser.add_argument(
-        "--amp_dtype",
-        type=str,
-        default=defaults.get("amp_dtype", "none"),
-        choices=["none", "bf16", "fp16"],
-        help="mixed precision dtype for model forward: none|bf16|fp16",
-    )
-    parser.add_argument(
-        "--profile_sp_comm",
-        action="store_true",
-        default=defaults.get("profile_sp_comm", False),
-        help="profile SeqAllToAll and full-graph edge broadcast communication time",
-    )
-    parser.add_argument(
-        "--stream_edges_from_cpu",
-        action="store_true",
-        default=defaults.get("stream_edges_from_cpu", False),
-        help="keep full-graph sparse edges on CPU and stream fixed-size edge chunks to GPU",
-    )
-    parser.add_argument(
-        "--random_walk_prefetch",
-        action="store_true",
-        default=defaults.get("random_walk_prefetch", False),
-        help="prefetch next epoch's CPU random-walk edges in a background thread (full-graph SP)",
-    )
-    parser.add_argument(
-        "--random_edge_blocks",
-        action="store_true",
-        default=defaults.get("random_edge_blocks", False),
-        help="for full-graph sparse attention, randomly sample per-query real/RW edge blocks before merging; enabled automatically with --adaptive_edge_budget",
-    )
-    parser.add_argument(
-        "--max_total_edges_per_query",
-        type=int,
-        default=defaults.get("max_total_edges_per_query", 0),
-        help="when --random_edge_blocks is enabled, keep at most this many total edges per query (<=0 disables). Automatically split if adaptive budget is disabled.",
-    )
-    parser.add_argument(
-        "--adaptive_edge_budget",
-        action="store_true",
-        default=defaults.get("adaptive_edge_budget", False),
-        help="enable probe-based greedy allocation between real-edge and RW edge budgets in full-graph sparse attention",
-    )
-    parser.add_argument(
-        "--adaptive_edge_budget_probe_size",
-        type=int,
-        default=defaults.get("adaptive_edge_budget_probe_size", 0),
-        help="advanced override; <=0 uses an automatic probe size based on validation split",
-    )
-    parser.add_argument(
-        "--adaptive_edge_budget_block_size",
-        type=int,
-        default=defaults.get("adaptive_edge_budget_block_size", 0),
-        help="advanced override; <=0 uses the default per-query edge block size",
-    )
-    parser.add_argument(
-        "--adaptive_edge_budget_warmup_epochs",
-        type=int,
-        default=defaults.get("adaptive_edge_budget_warmup_epochs", -1),
-        help="advanced override; >0 limits online budget updates to the first N epochs, 0 freezes immediately after bootstrap, <0 removes cap",
-    )
-    parser.add_argument(
-        "--adaptive_edge_budget_gain_threshold",
-        type=float,
-        default=defaults.get("adaptive_edge_budget_gain_threshold", 0.0),
-        help="advanced override for minimum probe-loss improvement per added edge required to keep expanding the budget",
-    )
-    parser.add_argument(
-        "--adaptive_edge_budget_patience",
-        type=int,
-        default=defaults.get("adaptive_edge_budget_patience", 0),
-        help="advanced override; <=0 uses the default stop patience",
-    )
-    parser.add_argument(
-        "--adaptive_edge_budget_bootstrap_search_epochs",
-        type=int,
-        default=defaults.get("adaptive_edge_budget_bootstrap_search_epochs", 0),
-        help="advanced override; 0 uses a short automatic pre-training search (default 2 rounds) to select the initial (real, rw) budget, <0 disables it",
-    )
-    parser.add_argument(
-        "--adaptive_edge_budget_bootstrap_candidate_limit",
-        type=int,
-        default=defaults.get("adaptive_edge_budget_bootstrap_candidate_limit", 0),
-        help="advanced override; 0 uses the default number of auto-generated bootstrap budget candidates, <0 keeps the full auto-generated set",
-    )
-    parser.add_argument(
-        "--adaptive_edge_budget_bootstrap_n_layers",
-        type=int,
-        default=defaults.get("adaptive_edge_budget_bootstrap_n_layers", 0),
-        help="advanced override; >0 uses a temporary N-layer proxy model during bootstrap budget search, <=0 keeps the full model",
-    )
-    parser.add_argument(
-        "--adaptive_edge_budget_static_seed_epochs",
-        type=int,
-        default=defaults.get("adaptive_edge_budget_static_seed_epochs", 0),
-        help="advanced override; 0 keeps early-epoch edge sampling deterministic for the automatic default number of epochs, <0 disables fixed early-epoch sampling",
-    )
-    parser.add_argument(
-        "--walk_length_candidates",
-        type=str,
-        default=defaults.get("walk_length_candidates", "4,6,8"),
-        help=(
-            "comma-separated walk lengths to jointly search during bootstrap budget selection, "
-            "e.g. '4,6,8'; default searches 4,6,8; use 'none' to disable walk-length search and use --head_hop_walk_length"
-        ),
-    )
     parser.add_argument("--rank", type=int, default=defaults.get("rank"))
     parser.add_argument("--local-rank", "--local_rank", type=int, default=defaults.get("local_rank"))
     parser.add_argument("--world-size", type=int, default=defaults.get("world_size"))
@@ -298,6 +177,127 @@ def add_node_fullgraph_sp_args(parser, defaults=None):
     defaults = defaults or {}
 
     parser.add_argument(
+        "--activation_checkpoint_mode",
+        type=str,
+        default=defaults.get("activation_checkpoint_mode"),
+        choices=["all", "ffn_only", "adaptive"],
+        help=(
+            "activation checkpoint mode: "
+            "'all' checkpoints the full EncoderLayer; "
+            "'ffn_only' checkpoints only the FFN block, keeping all MHA activations to "
+            "eliminate A2A recomputation from backward (faster backward, higher peak memory); "
+            "'adaptive' dynamically decides per layer at each forward pass — layers are "
+            "assigned 'keep_mha' greedily from the last layer inward until GPU free memory "
+            "is exhausted, adapting to runtime memory pressure from edge sampling etc."
+        ),
+    )
+    parser.add_argument(
+        "--amp_dtype",
+        type=str,
+        default=defaults.get("amp_dtype", "none"),
+        choices=["none", "bf16", "fp16"],
+        help="mixed precision dtype for model forward: none|bf16|fp16",
+    )
+    parser.add_argument(
+        "--profile_sp_comm",
+        action="store_true",
+        default=defaults.get("profile_sp_comm", False),
+        help="profile SeqAllToAll and full-graph edge broadcast communication time",
+    )
+    parser.add_argument(
+        "--stream_edges_from_cpu",
+        action="store_true",
+        default=defaults.get("stream_edges_from_cpu", False),
+        help="keep full-graph sparse edges on CPU and stream fixed-size edge chunks to GPU",
+    )
+    parser.add_argument(
+        "--random_walk_prefetch",
+        action="store_true",
+        default=defaults.get("random_walk_prefetch", False),
+        help="prefetch next epoch's CPU random-walk edges in a background thread (full-graph SP)",
+    )
+    parser.add_argument(
+        "--random_edge_blocks",
+        action="store_true",
+        default=defaults.get("random_edge_blocks", False),
+        help="for full-graph sparse attention, randomly sample per-query real/RW edge blocks before merging; enabled automatically with --adaptive_edge_budget",
+    )
+    parser.add_argument(
+        "--max_total_edges_per_query",
+        type=int,
+        default=defaults.get("max_total_edges_per_query", 0),
+        help="when --random_edge_blocks is enabled, keep at most this many total edges per query (<=0 disables). Automatically split if adaptive budget is disabled.",
+    )
+    parser.add_argument(
+        "--adaptive_edge_budget",
+        action="store_true",
+        default=defaults.get("adaptive_edge_budget", False),
+        help="enable probe-based greedy allocation between real-edge and RW edge budgets in full-graph sparse attention",
+    )
+    parser.add_argument(
+        "--adaptive_edge_budget_probe_size",
+        type=int,
+        default=defaults.get("adaptive_edge_budget_probe_size", 0),
+        help="advanced override; <=0 uses an automatic probe size based on validation split",
+    )
+    parser.add_argument(
+        "--adaptive_edge_budget_block_size",
+        type=int,
+        default=defaults.get("adaptive_edge_budget_block_size", 0),
+        help="advanced override; <=0 uses the default per-query edge block size",
+    )
+    parser.add_argument(
+        "--adaptive_edge_budget_warmup_epochs",
+        type=int,
+        default=defaults.get("adaptive_edge_budget_warmup_epochs", -1),
+        help="advanced override; >0 limits online budget updates to the first N epochs, 0 freezes immediately after bootstrap, <0 removes cap",
+    )
+    parser.add_argument(
+        "--adaptive_edge_budget_gain_threshold",
+        type=float,
+        default=defaults.get("adaptive_edge_budget_gain_threshold", 0.0),
+        help="advanced override for minimum probe-loss improvement per added edge required to keep expanding the budget",
+    )
+    parser.add_argument(
+        "--adaptive_edge_budget_patience",
+        type=int,
+        default=defaults.get("adaptive_edge_budget_patience", 0),
+        help="advanced override; <=0 uses the default stop patience",
+    )
+    parser.add_argument(
+        "--adaptive_edge_budget_bootstrap_search_epochs",
+        type=int,
+        default=defaults.get("adaptive_edge_budget_bootstrap_search_epochs", 0),
+        help="advanced override; 0 uses a short automatic pre-training search (default 2 rounds) to select the initial (real, rw) budget, <0 disables it",
+    )
+    parser.add_argument(
+        "--adaptive_edge_budget_bootstrap_candidate_limit",
+        type=int,
+        default=defaults.get("adaptive_edge_budget_bootstrap_candidate_limit", 0),
+        help="advanced override; 0 uses the default number of auto-generated bootstrap budget candidates, <0 keeps the full auto-generated set",
+    )
+    parser.add_argument(
+        "--adaptive_edge_budget_bootstrap_n_layers",
+        type=int,
+        default=defaults.get("adaptive_edge_budget_bootstrap_n_layers", 0),
+        help="advanced override; >0 uses a temporary N-layer proxy model during bootstrap budget search, <=0 keeps the full model",
+    )
+    parser.add_argument(
+        "--adaptive_edge_budget_static_seed_epochs",
+        type=int,
+        default=defaults.get("adaptive_edge_budget_static_seed_epochs", 0),
+        help="advanced override; 0 keeps early-epoch edge sampling deterministic for the automatic default number of epochs, <0 disables fixed early-epoch sampling",
+    )
+    parser.add_argument(
+        "--walk_length_candidates",
+        type=str,
+        default=defaults.get("walk_length_candidates", "4,6,8"),
+        help=(
+            "comma-separated walk lengths to jointly search during bootstrap budget selection, "
+            "e.g. '4,6,8'; default searches 4,6,8; use 'none' to disable walk-length search and use --head_hop_walk_length"
+        ),
+    )
+    parser.add_argument(
         "--include_real_edges",
         type=int,
         default=defaults.get("include_real_edges", 0),
@@ -352,11 +352,6 @@ def normalize_main_node_fullgraph_sp_args(args):
     elif args.num_global_node not in (0, 1):
         raise ValueError("main_node_fullgraph_sp.py currently supports at most one Graphormer virtual node.")
     return args
-
-
-def parser_add_main_args(parser):
-    add_node_common_args(parser)
-    add_node_batch_sp_args(parser)
 
 
 def _normalize_checkpoint_args(args):

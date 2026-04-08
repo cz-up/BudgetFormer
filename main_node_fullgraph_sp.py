@@ -47,6 +47,8 @@ from utils.fullgraph_sp_support import (
     _broadcast_prefetched_edges,
     _cuda_empty_cache,
     _eval_sp,
+    _measure_edge_h2d_time,
+    _try_cache_edge_index_on_gpu,
     _fixed_edge_budget_state_from_args,
     _get_process_peak_rss_mib,
     _get_process_rss_mib,
@@ -173,7 +175,6 @@ def main():
             "warmup_updates": 20,
             "sequence_parallel_size": 1,
             "num_global_node": 1,
-            "amp_dtype": "none",
         },
     )
     add_node_fullgraph_sp_args(parser)
@@ -317,6 +318,73 @@ def main():
     )
     edge_prefetcher = _CpuRandomWalkEdgePrefetcher(prefetch_cpu_rw and sp_rank == sp_src_rank)
 
+    # ------------------------------------------------------------------
+    # Edge-index GPU cache decision.
+    #
+    # adaptive checkpoint mode: the _CommAwareCheckpointer jointly decides
+    #   whether caching the edge index is worthwhile vs giving that memory
+    #   to keep_mha layers.  We measure t_h2d now (freeing the GPU copy
+    #   immediately so peak_warmup stays clean), register the info with the
+    #   checkpointer, and defer the actual cache to after calibration.
+    #
+    # all other modes: simple memory-check – cache if safety_factor × free
+    #   GPU memory ≥ edge_bytes, else fall back to broadcast path.
+    # ------------------------------------------------------------------
+    _is_adaptive_ckpt = getattr(args, "activation_checkpoint_mode", None) == "adaptive"
+    edge_index_gpu_cached = False
+    _adaptive_edge_decision_done = True  # True = no deferred work needed
+
+    _cuda_empty_cache(args)
+    if not _is_adaptive_ckpt:
+        # ---- Non-adaptive: simple memory-check path ----------------------
+        _ei_gpu, _ei_cached_local = _try_cache_edge_index_on_gpu(
+            edge_index_global, device, rank=args.rank
+        )
+        if sp_world_size > 1 and dist.is_initialized():
+            _can_cache_t = torch.tensor(
+                [int(_ei_cached_local)], device=device, dtype=torch.long
+            )
+            dist.all_reduce(_can_cache_t, op=dist.ReduceOp.MIN, group=sp_group)
+            if int(_can_cache_t.item()) == 0 and _ei_cached_local:
+                del _ei_gpu
+                _ei_gpu = None
+                _ei_cached_local = False
+        edge_index_gpu_cached = _ei_cached_local
+        if edge_index_gpu_cached:
+            edge_index_global = _ei_gpu
+            if args.rank == 0:
+                _ei_mib = edge_index_global.numel() * edge_index_global.element_size() / (1024 ** 2)
+                _free_mib = torch.cuda.mem_get_info(device)[0] / (1024 ** 2)
+                print(
+                    f"[edge-cache] edge_index_global cached on GPU "
+                    f"({_ei_mib:.1f} MiB; GPU free after: {_free_mib:.1f} MiB). "
+                    "Rank-local edge-build active (no per-epoch H2D transfer)."
+                )
+        else:
+            if _ei_gpu is not None:
+                del _ei_gpu
+            if not getattr(args, "force_edge_broadcast", False):
+                args.force_edge_broadcast = True
+                if args.rank == 0:
+                    print(
+                        "[edge-cache] edge_index_global not cached on GPU. "
+                        "force_edge_broadcast enabled to avoid per-epoch H2D transfers."
+                    )
+    else:
+        # ---- Adaptive: measure t_h2d, register with checkpointer, defer --
+        _t_h2d = _measure_edge_h2d_time(edge_index_global, device)
+        _edge_bytes_for_cache = edge_index_global.numel() * edge_index_global.element_size()
+        _comm_ckpt = getattr(model, "_comm_ckpt", None)
+        if _comm_ckpt is not None:
+            _comm_ckpt.set_edge_info(_edge_bytes_for_cache, _t_h2d)
+        if args.rank == 0:
+            print(
+                f"[edge-cache] Adaptive mode: t_h2d={_t_h2d * 1000:.1f} ms, "
+                f"edge={_edge_bytes_for_cache / (1024 ** 2):.1f} MiB. "
+                "Cache decision deferred to after calibration."
+            )
+        _adaptive_edge_decision_done = False  # applied inside the training loop
+
     if args.rank == 0:
         print(f"\n{'=' * 72}")
         print(f"Full-Graph SP Training  (sp_world_size={sp_world_size})")
@@ -333,6 +401,7 @@ def main():
         print(f"  CPU RW prefetch: {int(prefetch_cpu_rw)}")
         print(f"  CPU edge streaming: {int(bool(getattr(args, 'stream_edges_from_cpu', False)))}")
         print(f"  Force edge broadcast: {int(bool(getattr(args, 'force_edge_broadcast', False)))}")
+        print(f"  Edge index GPU cached: {int(edge_index_gpu_cached)}")
         print(f"  AMP dtype: {args.amp_dtype}")
         print(
             f"  Random edge blocks: {int(_random_block_sampling_enabled(args, adaptive_edge_budget_cfg))} "
@@ -368,6 +437,12 @@ def main():
     edge_broadcast_ms_sum = 0.0
     edge_broadcast_bytes_sum = 0
     edge_broadcast_epoch_count = 0
+    # For adaptive checkpoint + adaptive edge budget: track whether we have
+    # already notified the checkpointer that the edge budget is frozen.
+    # For all other cases (no deferred calibration), treat as already done.
+    _budget_frozen_notified = not (
+        _is_adaptive_ckpt and _adaptive_edge_budget_enabled(args)
+    )
 
     cached_edge_index = None
     if not dynamic_edges:
@@ -484,7 +559,64 @@ def main():
         # Must happen after optimizer.step() so that optimizer state (lazily
         # allocated on the first step) is included in the peak measurement.
         if hasattr(model, "comm_aware_notify_step_end"):
-            model.comm_aware_notify_step_end(device)
+            model.comm_aware_notify_step_end(device, t_bwd=bwd_time)
+
+        # Adaptive mode: apply edge-cache decision once calibration completes.
+        # The checkpointer transitions to ACTIVE after the calibrate step, so
+        # this block runs exactly once (at the start of epoch 3 effective work).
+        if _is_adaptive_ckpt and not _adaptive_edge_decision_done:
+            _comm_ckpt_check = getattr(model, "_comm_ckpt", None)
+            if _comm_ckpt_check is not None and _comm_ckpt_check.is_active():
+                _adaptive_edge_decision_done = True
+                _should_cache = int(_comm_ckpt_check.cache_edge)
+                # Synchronize: require all SP ranks to agree on CACHE.
+                # Using MIN so a single NO-CACHE vote overrides.
+                if sp_world_size > 1 and dist.is_initialized():
+                    _cache_agree = torch.tensor(
+                        [_should_cache], device=device, dtype=torch.long
+                    )
+                    dist.all_reduce(_cache_agree, op=dist.ReduceOp.MIN, group=sp_group)
+                    _should_cache = int(_cache_agree.item())
+                # Update _modes on every rank to match the agreed decision.
+                # Critical: without this, ranks that voted differently end up
+                # with inconsistent keep_mha assignments, causing A2A deadlock
+                # in the backward pass when checkpoint modes disagree.
+                _comm_ckpt_check.override_cache_decision(bool(_should_cache))
+                if _should_cache:
+                    _cuda_empty_cache(args)
+                    _ei_adp, _ei_adp_ok = _try_cache_edge_index_on_gpu(
+                        edge_index_global, device, rank=args.rank
+                    )
+                    if _ei_adp_ok:
+                        edge_index_global = _ei_adp
+                        edge_index_gpu_cached = True
+                        if args.rank == 0:
+                            _mib = (
+                                edge_index_global.numel()
+                                * edge_index_global.element_size()
+                                / (1024 ** 2)
+                            )
+                            print(
+                                f"[edge-cache] Applied: edge_index_global cached on GPU "
+                                f"({_mib:.1f} MiB). Rank-local build active."
+                            )
+                    else:
+                        if not getattr(args, "force_edge_broadcast", False):
+                            args.force_edge_broadcast = True
+                        if args.rank == 0:
+                            print(
+                                "[edge-cache] OOM when applying cache decision; "
+                                "falling back to broadcast path."
+                            )
+                else:
+                    if not getattr(args, "force_edge_broadcast", False):
+                        args.force_edge_broadcast = True
+                    if args.rank == 0:
+                        print(
+                            "[edge-cache] Decision: no cache. "
+                            "force_edge_broadcast enabled."
+                        )
+                _cuda_empty_cache(args)
 
         loss_val = loss.item()
         loss_ema = loss_val if loss_ema is None else 0.9 * loss_ema + 0.1 * loss_val
@@ -585,6 +717,31 @@ def main():
             sp_world_size,
         )
         total_adjustment_time += (time.time() - t_adjust_start)
+
+        # Notify the comm-aware checkpointer when the edge budget stabilises.
+        # "Stable" means: patience exhausted (controller.frozen), past the
+        # declared warmup window, or adaptive budget not enabled.
+        # We call this once; notify_budget_frozen() is idempotent (no-op if
+        # not in DEFERRED state).
+        if not _budget_frozen_notified:
+            _budget_is_stable = (
+                edge_budget_controller.frozen
+                or (
+                    adaptive_edge_budget_cfg.warmup_epochs is not None
+                    and epoch >= adaptive_edge_budget_cfg.warmup_epochs
+                )
+            )
+            if _budget_is_stable:
+                _budget_frozen_notified = True
+                if hasattr(model, "comm_aware_notify_budget_frozen"):
+                    model.comm_aware_notify_budget_frozen()
+                if args.rank == 0:
+                    print(
+                        f"[edge-cache] Edge budget stable at epoch {epoch} "
+                        f"(real={edge_budget_controller.real_budget}, "
+                        f"rw={edge_budget_controller.rw_budget}). "
+                        "Checkpoint calibration will start next epoch."
+                    )
 
         if sp_world_size > 1:
             dist.barrier(group=sp_group)

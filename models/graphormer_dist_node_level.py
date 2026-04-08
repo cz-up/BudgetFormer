@@ -696,20 +696,29 @@ class _CommAwareCheckpointer:
     """
 
     # Internal states
+    _DEFERRED = -1   # edge-budget still changing; calibration not yet started
     _WARMUP = 0
     _CALIBRATE = 1
     _ACTIVE = 2
 
-    def __init__(self, n_layers: int, safety_margin: float = 0.20):
+    def __init__(self, n_layers: int, safety_margin: float = 0.20, deferred: bool = False):
         self.n_layers = n_layers
         self.safety_margin = float(safety_margin)
         self._modes: list = ["full_layer"] * n_layers
-        self._state: int = self._WARMUP
+        self._state: int = self._DEFERRED if deferred else self._WARMUP
         self._peak_warmup: int = 0          # max_memory_allocated during warmup step
         self._fwd_mem_warmup: int = 0       # memory_allocated at end of warmup forward
         self._fwd_mem_calibrate: int = 0    # memory_allocated at end of calibrate forward
         self._m_layer: int = 0              # measured bytes per keep_mha layer
         self._last_n_keep: int = -1
+        # Edge-cache joint decision fields (set via set_edge_info before training).
+        self._edge_bytes: int = 0           # bytes of edge_index_global
+        self._t_h2d: float = 0.0            # measured H2D transfer time (seconds)
+        self._t_bwd_warmup: float = 0.0     # backward time during warmup step
+        self._t_bwd_calibrate: float = 0.0  # backward time during calibrate step
+        self._cache_edge: bool = False      # single-rank recommendation (pre-sync)
+        self._k_with: int = 0               # keep_mha layers if edge is cached
+        self._k_without: int = 0            # keep_mha layers if edge is not cached
 
     @staticmethod
     def _is_rank0() -> bool:
@@ -719,15 +728,38 @@ class _CommAwareCheckpointer:
         except Exception:
             return True
 
+    def notify_budget_frozen(self) -> None:
+        """Signal that the edge budget is stable and calibration can begin.
+
+        Transitions DEFERRED → WARMUP.  The next forward pass will trigger
+        WARMUP mode (peak-stats reset + all-full_layer).  A no-op when the
+        checkpointer is already past DEFERRED (e.g. no adaptive edge budget).
+        """
+        if self._state != self._DEFERRED:
+            return
+        self._state = self._WARMUP
+        if self._is_rank0():
+            print(
+                "[CommAwareCheckpointer] Edge budget frozen. "
+                "Starting WARMUP calibration on next forward pass."
+            )
+
     def plan(self, device) -> None:
         """Assign checkpoint modes for the upcoming forward pass.
 
+        In DEFERRED state all layers run as full_layer without resetting peak
+        stats (calibration is waiting for the edge budget to stabilise).
         In WARMUP / CALIBRATE states resets the CUDA peak-memory counter so
         that ``notify_step_end`` can read a clean high-watermark window.
         In ACTIVE state this is a pure no-op.
         """
         if not torch.cuda.is_available():
             return
+
+        if self._state == self._DEFERRED:
+            # Budget not yet stable: run all full_layer but do not measure.
+            self._modes = ["full_layer"] * self.n_layers
+            return  # no peak-stats reset, no log spam
 
         if self._state == self._WARMUP:
             self._modes = ["full_layer"] * self.n_layers
@@ -770,25 +802,38 @@ class _CommAwareCheckpointer:
         """
         if not torch.cuda.is_available():
             return
+        if self._state == self._DEFERRED:
+            return  # not measuring yet
         live = torch.cuda.memory_allocated(device)
         if self._state == self._WARMUP:
             self._fwd_mem_warmup = live
         elif self._state == self._CALIBRATE:
             self._fwd_mem_calibrate = live
 
-    def notify_step_end(self, device) -> None:
+    def notify_step_end(self, device, t_bwd: float = None) -> None:
         """Call after backward + optimizer.step() + lr_scheduler.step().
 
         Advances the internal state machine and, in CALIBRATE state, computes
-        M_layer and the greedy layer assignment.
+        M_layer, the backward-time delta, and the joint edge-cache / keep_mha
+        layer assignment.
+
+        Args:
+            device: CUDA device string used for memory queries.
+            t_bwd:  Wall-clock seconds for the backward pass of this step.
+                    Required for the edge-cache joint decision; ignored if
+                    set_edge_info() was never called.
         """
         if not torch.cuda.is_available():
             return
+        if self._state == self._DEFERRED:
+            return  # budget not yet frozen; calibration hasn't started
         is_r0 = self._is_rank0()
         total = torch.cuda.get_device_properties(device).total_memory
 
         if self._state == self._WARMUP:
             self._peak_warmup = torch.cuda.max_memory_allocated(device)
+            if t_bwd is not None:
+                self._t_bwd_warmup = float(t_bwd)
             self._state = self._CALIBRATE
             if is_r0:
                 print(
@@ -799,6 +844,9 @@ class _CommAwareCheckpointer:
                 )
 
         elif self._state == self._CALIBRATE:
+            if t_bwd is not None:
+                self._t_bwd_calibrate = float(t_bwd)
+
             # M_layer = additional live memory from one keep_mha layer,
             # measured at forward-end before any backward allocation.
             # This correctly captures all autograd-retained tensors:
@@ -820,33 +868,125 @@ class _CommAwareCheckpointer:
             self._m_layer = m_layer
 
             # Budget = room above the warmup full-layer peak, with margin.
-            # Worst-case new peak ≈ peak_warmup + k × M_layer.
             budget = max(int(total * (1.0 - self.safety_margin) - self._peak_warmup), 0)
-            modes = ["full_layer"] * self.n_layers
-            remaining = budget
-            for i in reversed(range(self.n_layers)):
-                if remaining >= self._m_layer:
-                    modes[i] = "keep_mha"
-                    remaining -= self._m_layer
-                else:
-                    break
-            self._modes = modes
+
+            # ----------------------------------------------------------------
+            # Joint edge-cache vs keep_mha decision.
+            #
+            # delta_t_bwd ≈ backward time saved by promoting one layer from
+            # full_layer to keep_mha (eliminates A2A recomputation for that
+            # layer).  Measured as the difference between the warmup step
+            # (all full_layer) and the calibrate step (last layer keep_mha).
+            #
+            # Note: t_bwd_warmup includes one-off optimizer-state allocation
+            # overhead (lazy init on first step).  This slightly inflates
+            # delta_t_bwd and biases the decision toward caching the edge
+            # index.  The effect is small for large models and is accepted
+            # as a reasonable approximation.
+            #
+            # gain_with_edge  = t_h2d + k_with  × delta_t_bwd
+            # gain_without    =          k_without × delta_t_bwd
+            # Cache edge iff gain_with_edge > gain_without_edge,
+            # i.e. t_h2d > (k_without - k_with) × delta_t_bwd.
+            # ----------------------------------------------------------------
+            delta_t_bwd = max(self._t_bwd_warmup - self._t_bwd_calibrate, 0.0)
+            gain_with = gain_without = 0.0
+            k_without_local = budget // m_layer if m_layer > 0 else 0
+            k_with_local = k_without_local  # default: no edge info
+            if self._edge_bytes > 0 and delta_t_bwd > 0.0 and m_layer > 0:
+                k_without_local = budget // m_layer
+                k_with_local = max(budget - self._edge_bytes, 0) // m_layer
+                gain_with = self._t_h2d + k_with_local * delta_t_bwd
+                gain_without = k_without_local * delta_t_bwd
+                self._cache_edge = gain_with > gain_without
+            else:
+                self._cache_edge = False
+            self._k_without = k_without_local
+            self._k_with = k_with_local
+
+            # Always start with the NO-CACHE (k_without) assignment.
+            # The training loop will call override_cache_decision() after
+            # synchronising across ranks, so that all ranks end up with
+            # identical _modes regardless of their individual measurements.
+            self._apply_n_keep(k_without_local)
             self._state = self._ACTIVE
 
-            n_keep = sum(1 for m in modes if m == "keep_mha")
-            self._last_n_keep = n_keep
             if is_r0:
-                m_mib = self._m_layer / (1024**2)
+                m_mib = self._m_layer / (1024 ** 2)
                 print(
                     f"[CommAwareCheckpointer] ACTIVE: "
                     f"M_layer={m_mib:.1f} MiB (live-measured), "
-                    f"keep_mha={n_keep}/{self.n_layers} layers "
+                    f"keep_mha(no-cache)={k_without_local}/{self.n_layers} layers "
+                    f"keep_mha(cache)={k_with_local}/{self.n_layers} layers "
                     f"(peak_warmup={self._peak_warmup/(1024**2):.0f} MiB, "
-                    f"budget={budget/(1024**2):.0f} MiB, "
-                    f"retained={n_keep * m_mib:.1f} MiB)"
+                    f"budget={budget/(1024**2):.0f} MiB)"
                 )
+                if self._edge_bytes > 0 and delta_t_bwd > 0.0:
+                    print(
+                        f"[CommAwareCheckpointer] local edge-cache recommendation: "
+                        f"{'CACHE' if self._cache_edge else 'NO-CACHE'} "
+                        f"(gain_with={gain_with*1000:.1f} ms "
+                        f"[t_h2d={self._t_h2d*1000:.1f} ms + "
+                        f"{k_with_local} layers × {delta_t_bwd*1000:.1f} ms] "
+                        f"vs gain_without={gain_without*1000:.1f} ms "
+                        f"[{k_without_local} layers × {delta_t_bwd*1000:.1f} ms], "
+                        f"edge={self._edge_bytes/(1024**2):.1f} MiB)"
+                    )
 
         # ACTIVE: no re-planning needed (stable after calibration).
+
+    def _apply_n_keep(self, n_keep: int) -> None:
+        """Set _modes with n_keep keep_mha layers from the last layer inward."""
+        n_keep = max(0, min(int(n_keep), self.n_layers))
+        modes = ["full_layer"] * self.n_layers
+        for i in range(self.n_layers - 1, self.n_layers - 1 - n_keep, -1):
+            modes[i] = "keep_mha"
+        self._modes = modes
+        self._last_n_keep = n_keep
+
+    def override_cache_decision(self, cache: bool) -> None:
+        """Apply the sync-confirmed edge-cache decision and update _modes.
+
+        Must be called by the training loop after all-reducing the per-rank
+        cache_edge recommendations.  Ensures every SP rank uses identical
+        checkpoint modes regardless of individual measurement noise.
+
+        Args:
+            cache: True if edge_index_global will be cached on GPU (use k_with
+                   layers of keep_mha); False otherwise (use k_without layers).
+        """
+        if self._state != self._ACTIVE:
+            return
+        n_keep = self._k_with if cache else self._k_without
+        self._apply_n_keep(n_keep)
+        self._cache_edge = cache
+        if self._is_rank0():
+            m_mib = self._m_layer / (1024 ** 2)
+            print(
+                f"[CommAwareCheckpointer] final decision after sync: "
+                f"{'CACHE' if cache else 'NO-CACHE'} → "
+                f"keep_mha={n_keep}/{self.n_layers} layers "
+                f"(retained={n_keep * m_mib:.1f} MiB)"
+            )
+
+    def set_edge_info(self, edge_bytes: int, t_h2d: float) -> None:
+        """Register edge_index_global size and measured H2D time for joint decision.
+
+        Must be called before the first training step when adaptive mode is used.
+        The GPU copy used to measure t_h2d must already be freed before calling
+        this, so that peak_warmup captures a clean baseline without edge bytes.
+        """
+        self._edge_bytes = max(0, int(edge_bytes))
+        self._t_h2d = max(0.0, float(t_h2d))
+
+    def is_active(self) -> bool:
+        """Return True once calibration is complete and ACTIVE mode is set."""
+        return self._state == self._ACTIVE
+
+    @property
+    def cache_edge(self) -> bool:
+        """Whether the joint decision recommends caching edge_index_global on GPU."""
+        return self._cache_edge
 
     def mode(self, layer_idx: int) -> str:
         return self._modes[layer_idx]
@@ -971,7 +1111,7 @@ class Graphormer(nn.Module):
             if hasattr(core_attn, "disable_hop_mass_tracking"):
                 core_attn.disable_hop_mass_tracking()
 
-    def set_activation_checkpoint(self, enabled: bool = True, mode: str | None = None) -> None:
+    def set_activation_checkpoint(self, enabled: bool = True, mode: str | None = None, deferred: bool = False) -> None:
         mode_aliases = {
             None: "none",
             "none": "none",
@@ -990,18 +1130,33 @@ class Graphormer(nn.Module):
         self.activation_checkpoint = enabled
         self.activation_checkpoint_mode = resolved_mode if enabled else "none"
         if self.activation_checkpoint_mode == "comm_aware":
-            self._comm_ckpt = _CommAwareCheckpointer(len(self.layers))
+            self._comm_ckpt = _CommAwareCheckpointer(len(self.layers), deferred=deferred)
         else:
             self._comm_ckpt = None
 
-    def comm_aware_notify_step_end(self, device) -> None:
+    def comm_aware_notify_budget_frozen(self) -> None:
+        """Signal that the edge budget is stable; start WARMUP calibration.
+
+        Delegates to _CommAwareCheckpointer.notify_budget_frozen().  A no-op
+        when the checkpointer is not in DEFERRED state (e.g. no adaptive edge
+        budget or calibration already in progress).
+        """
+        if self._comm_ckpt is not None:
+            self._comm_ckpt.notify_budget_frozen()
+
+    def comm_aware_notify_step_end(self, device, t_bwd: float = None) -> None:
         """Call from the training loop after backward + optimizer.step() + lr_scheduler.step().
 
         Advances the comm-aware checkpointer state machine.  This is a no-op
         when comm_aware mode is not active.
+
+        Args:
+            device: CUDA device string.
+            t_bwd:  Wall-clock seconds for the backward pass; used for the
+                    joint edge-cache / keep_mha decision during calibration.
         """
         if self._comm_ckpt is not None:
-            self._comm_ckpt.notify_step_end(device)
+            self._comm_ckpt.notify_step_end(device, t_bwd=t_bwd)
 
     def reset_hop_mass_stats(self) -> None:
         for layer in self.layers:
