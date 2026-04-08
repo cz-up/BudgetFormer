@@ -326,9 +326,13 @@ def main():
             f"  Sparse edges: real={int(_use_real_edges(args, adaptive_edge_budget_cfg))} "
             f"rw={int(_use_rw_edges(args, adaptive_edge_budget_cfg=adaptive_edge_budget_cfg))}"
         )
-        print(f"  Random-walk device: {rw_device}")
+        rw_device_line = f"  Random-walk device: {rw_device}"
+        if getattr(args, "random_walk_prefetch", False):
+            rw_device_line += " (forced by --random_walk_prefetch)"
+        print(rw_device_line)
         print(f"  CPU RW prefetch: {int(prefetch_cpu_rw)}")
         print(f"  CPU edge streaming: {int(bool(getattr(args, 'stream_edges_from_cpu', False)))}")
+        print(f"  Force edge broadcast: {int(bool(getattr(args, 'force_edge_broadcast', False)))}")
         print(f"  AMP dtype: {args.amp_dtype}")
         print(
             f"  Random edge blocks: {int(_random_block_sampling_enabled(args, adaptive_edge_budget_cfg))} "
@@ -361,6 +365,9 @@ def main():
     best_test = 0.0
     best_epoch = -1
     loss_ema = None
+    edge_broadcast_ms_sum = 0.0
+    edge_broadcast_bytes_sum = 0
+    edge_broadcast_epoch_count = 0
 
     cached_edge_index = None
     if not dynamic_edges:
@@ -495,6 +502,11 @@ def main():
         comm_profile = None
         if getattr(args, "profile_sp_comm", False):
             comm_profile = _aggregate_comm_profile(get_comm_profile_summary(reset=True))
+            edge_broadcast = comm_profile.get("edge_broadcast") if comm_profile else None
+            if edge_broadcast and edge_broadcast.get("kind", "timing") == "timing":
+                edge_broadcast_ms_sum += float(edge_broadcast["total_ms"])
+                edge_broadcast_bytes_sum += int(edge_broadcast["total_bytes"])
+                edge_broadcast_epoch_count += 1
         if args.rank == 0:
             print(
                 f"Epoch {epoch:04d} | loss={loss_val:.4f} (ema={loss_ema:.4f}) "
@@ -581,6 +593,16 @@ def main():
 
     if args.rank == 0:
         print(f"\n{'=' * 72}")
+        if getattr(args, "profile_sp_comm", False) and edge_broadcast_epoch_count > 0:
+            avg_broadcast_ms = edge_broadcast_ms_sum / edge_broadcast_epoch_count
+            avg_broadcast_mib = (edge_broadcast_bytes_sum / edge_broadcast_epoch_count) / (1024.0 ** 2)
+            naive_fanout_mib = avg_broadcast_mib * max(sp_world_size - 1, 0)
+            print(
+                "[comm-summary] edge_broadcast avg/epoch: "
+                f"{avg_broadcast_ms:.2f} ms, "
+                f"source_payload={avg_broadcast_mib:.2f} MiB, "
+                f"naive_fanout_payload={naive_fanout_mib:.2f} MiB"
+            )
         print(f"Done.  Best epoch={best_epoch}  Val={best_val:.2%}  Test={best_test:.2%}")
         if edge_budget_controller.enabled:
             print(f"Timing: bootstrap={total_bootstrap_time:.2f}s  adjustment={total_adjustment_time:.2f}s")

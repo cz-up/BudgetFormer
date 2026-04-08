@@ -100,6 +100,9 @@ def fix_edge_index(x, num_node):
 
 def resolve_random_walk_device(args, default_device) -> torch.device:
     """Resolve the device used for random-walk sampling."""
+    if bool(getattr(args, "random_walk_prefetch", False)):
+        return torch.device("cpu")
+
     spec = getattr(args, "random_walk_device", "same")
     if spec in (None, "", "same"):
         return torch.device(default_device)

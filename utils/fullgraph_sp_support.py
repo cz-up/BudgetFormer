@@ -1769,7 +1769,7 @@ def _build_and_broadcast_edges(args, edge_index_global, num_nodes, device, rw_de
     # Fallback: when edge_seed is None (un-seeded dynamic edges) the original
     # broadcast path is preserved to keep cross-rank consistency.
     # ---------------------------------------------------------------------------
-    if edge_seed is not None:
+    if edge_seed is not None and not bool(getattr(args, "force_edge_broadcast", False)):
         # Rank-local path: all ranks independently build the same edge_index.
         # fixed_random_seed handles both CPU and CUDA RNG (covers gpu rw_device).
         with fixed_random_seed(edge_seed):
