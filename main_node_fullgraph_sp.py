@@ -460,6 +460,12 @@ def main():
             adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
         )
 
+    use_epoch_seed = (
+        getattr(args, "stream_edges_from_cpu", False)
+        or prefetch_cpu_rw
+        or random_blocks_dynamic
+    )
+
     for epoch in range(1, args.epochs + 1):
         t_epoch = time.time()
         if getattr(args, "profile_sp_comm", False):
@@ -472,12 +478,6 @@ def main():
         if cached_edge_index is not None:
             edge_index_rw = cached_edge_index
         else:
-            use_epoch_seed = (
-                getattr(args, "stream_edges_from_cpu", False)
-                or
-                prefetch_cpu_rw
-                or random_blocks_dynamic
-            )
             if use_epoch_seed:
                 if epoch <= adaptive_edge_budget_cfg.static_seed_epochs:
                     edge_seed = args.seed
@@ -626,7 +626,6 @@ def main():
             del edge_index_rw
         if prefetched_cpu is not None:
             del prefetched_cpu
-        _cuda_empty_cache(args)
 
         epoch_time = time.time() - t_epoch
         cpu_rss = _get_process_rss_mib()
@@ -692,7 +691,6 @@ def main():
                     best_test = test_acc
                 print(f"  ↳ Best: epoch={best_epoch}  val={best_val:.2%}  test={best_test:.2%}")
             del accs
-            _cuda_empty_cache(args)
 
         t_adjust_start = time.time()
         _maybe_update_edge_budget(
