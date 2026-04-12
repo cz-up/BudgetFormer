@@ -2,6 +2,7 @@ import json
 import os
 import pickle
 
+import numpy as np
 import torch
 
 
@@ -52,12 +53,45 @@ def _normalize_split_dict(split_obj):
     }
 
 
-def _load_split_from_dir(dataset_path: str):
+def _normalize_split_obj(split_obj, split_id: int = 0):
+    normalized = _normalize_split_dict(split_obj)
+    if normalized is not None:
+        return normalized
+
+    if isinstance(split_obj, np.ndarray):
+        if split_obj.dtype == object:
+            split_seq = split_obj.tolist()
+        else:
+            split_seq = list(split_obj)
+    elif isinstance(split_obj, (list, tuple)):
+        split_seq = list(split_obj)
+    else:
+        return None
+
+    if not split_seq:
+        return None
+    if split_id < 0 or split_id >= len(split_seq):
+        raise ValueError(f"split_id={split_id} out of range for {len(split_seq)} stored splits")
+    return _normalize_split_dict(split_seq[split_id])
+
+
+def _load_split_from_dir(dataset_path: str, split_id: int = 0):
+    for fname in ("split_idx_all.pt", "official_splits.npy", "fixed_splits.npy", "snap-patents-splits.npy"):
+        fpath = os.path.join(dataset_path, fname)
+        if os.path.exists(fpath):
+            if fname.endswith(".npy"):
+                split_obj = np.load(fpath, allow_pickle=True)
+            else:
+                split_obj = _safe_torch_load(fpath)
+            normalized = _normalize_split_obj(split_obj, split_id=split_id)
+            if normalized is not None:
+                return normalized
+
     for fname in ("split_idx.pt", "split.pt"):
         fpath = os.path.join(dataset_path, fname)
         if os.path.exists(fpath):
             split_obj = _safe_torch_load(fpath)
-            normalized = _normalize_split_dict(split_obj)
+            normalized = _normalize_split_obj(split_obj, split_id=split_id)
             if normalized is not None:
                 return normalized
 
@@ -111,7 +145,7 @@ def _load_split_from_dir(dataset_path: str):
     return None
 
 
-def _load_pyg_default_split(dataset_name: str, root_dir: str):
+def _load_pyg_default_split(dataset_name: str, root_dir: str, split_id: int = 0):
     name = str(dataset_name)
     key = name.lower()
     data = None
@@ -135,13 +169,19 @@ def _load_pyg_default_split(dataset_name: str, root_dir: str):
     if not hasattr(data, "train_mask") or not hasattr(data, "val_mask") or not hasattr(data, "test_mask"):
         return None
     return {
-        "train": _mask_to_idx(data.train_mask),
-        "valid": _mask_to_idx(data.val_mask),
-        "test": _mask_to_idx(data.test_mask),
+        "train": _mask_to_idx(data.train_mask, split_id=split_id),
+        "valid": _mask_to_idx(data.val_mask, split_id=split_id),
+        "test": _mask_to_idx(data.test_mask, split_id=split_id),
     }
 
 
-def load_default_split(dataset_name: str, root_dir: str, dist_module=None, wait_for_rank0: bool = False):
+def load_default_split(
+    dataset_name: str,
+    root_dir: str,
+    dist_module=None,
+    wait_for_rank0: bool = False,
+    split_id: int = 0,
+):
     dataset_path = os.path.join(root_dir, dataset_name)
     should_wait = wait_for_rank0 and dist_module is not None and dist_module.is_initialized()
     is_rank0 = True if not should_wait else (dist_module.get_rank() == 0)
@@ -149,7 +189,7 @@ def load_default_split(dataset_name: str, root_dir: str, dist_module=None, wait_
     if should_wait and not is_rank0:
         dist_module.barrier()
 
-    split_idx = _load_split_from_dir(dataset_path)
+    split_idx = _load_split_from_dir(dataset_path, split_id=split_id)
     if split_idx is not None:
         if should_wait and is_rank0:
             dist_module.barrier()
@@ -170,7 +210,7 @@ def load_default_split(dataset_name: str, root_dir: str, dist_module=None, wait_
         return split_idx
 
     try:
-        split_idx = _load_pyg_default_split(name, root_dir)
+        split_idx = _load_pyg_default_split(name, root_dir, split_id=split_id)
     except Exception:
         split_idx = None
 

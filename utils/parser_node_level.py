@@ -3,8 +3,15 @@ def add_node_common_args(parser, defaults=None):
 
     parser.add_argument("--dataset_dir", type=str, default=defaults.get("dataset_dir", "./dataset/"))
     parser.add_argument("--dataset", type=str, default=defaults.get("dataset", "ogbn-arxiv"))
+    parser.add_argument(
+        "--split_id",
+        type=int,
+        default=defaults.get("split_id", 0),
+        help="split index for datasets providing multiple fixed/default splits",
+    )
 
-    parser.add_argument("--model", type=str, default=defaults.get("model", "graphormer"))
+    parser.add_argument("--model", type=str, default=defaults.get("model", "graphormer"),
+                        choices=["graphormer", "gt", "acm"])
     parser.add_argument("--n_layers", type=int, default=defaults.get("n_layers", 4))
     parser.add_argument("--num_heads", type=int, default=defaults.get("num_heads", 8))
     parser.add_argument("--hidden_dim", type=int, default=defaults.get("hidden_dim", 64))
@@ -332,10 +339,10 @@ def normalize_main_node_fullgraph_sp_args(args):
     _normalize_fixed_edge_budget_args(args)
     if str(getattr(args, "model", "")).lower() == "gt":
         args.attn_type = "sparse"
-    if args.model != "graphormer":
+    if args.model not in ("graphormer", "acm"):
         args.num_global_node = 0
     elif args.num_global_node not in (0, 1):
-        raise ValueError("main_node_fullgraph_sp.py currently supports at most one Graphormer virtual node.")
+        raise ValueError("main_node_fullgraph_sp.py currently supports at most one Graphormer-style virtual node.")
     return args
 
 

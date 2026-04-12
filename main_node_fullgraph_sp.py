@@ -219,7 +219,7 @@ def main():
     rank_end = rank_start + nodes_per_rank
     local_num_nodes = nodes_per_rank
 
-    if args.model == "graphormer" and args.num_global_node > 0:
+    if args.model in ("graphormer", "fagcn", "acm") and args.num_global_node > 0:
         sub_real_seq_len = nodes_per_rank + args.num_global_node
         global_token_indices = list(range(0, sp_world_size * sub_real_seq_len, sub_real_seq_len))
         set_global_token_indices(global_token_indices)

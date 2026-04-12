@@ -26,12 +26,18 @@ from gt_sp.utils import (
     random_split_idx,
 )
 from models.graphormer_dist_node_level import Graphormer
+from models.acm_dist_node_level import ACMGraphormer
 from models.gt_dist_node_level import GT
 from utils.lr import PolynomialDecayLR
 from utils.split_utils import load_default_split
 
 _STREAM_EDGE_CHUNK_EDGES = 1 << 19
 _MINHASH_SAMPLE_K_LIMIT = 8
+_GRAPHORMER_VARIANTS = {
+    "graphormer": Graphormer,
+    "acm": ACMGraphormer,
+}
+_GRAPHORMER_VIRTUAL_NODE_MODELS = frozenset(_GRAPHORMER_VARIANTS)
 
 
 def _resolve_device() -> str:
@@ -180,12 +186,13 @@ def _to_bidirected_edge_index(edge_index: torch.Tensor, num_nodes: int) -> torch
     return coalesce(edge_index_bi, num_nodes=num_nodes)
 
 
-def _load_default_split(dataset_name: str, root_dir: str, wait_for_rank0: bool = False):
+def _load_default_split(dataset_name: str, root_dir: str, wait_for_rank0: bool = False, split_id: int = 0):
     return load_default_split(
         dataset_name,
         root_dir,
         dist_module=dist,
         wait_for_rank0=wait_for_rank0,
+        split_id=split_id,
     )
 
 
@@ -202,14 +209,19 @@ def _load_data(args):
     if args.dataset == "pokec":
         y = torch.clamp(y, min=0)
 
-    split_idx = _load_default_split(args.dataset, args.dataset_dir, wait_for_rank0=True)
+    split_idx = _load_default_split(
+        args.dataset,
+        args.dataset_dir,
+        wait_for_rank0=True,
+        split_id=int(getattr(args, "split_id", 0)),
+    )
     if split_idx is None:
         if args.rank == 0:
             print("[split] No default split found, falling back to random 60/20/20 split.")
         split_idx = random_split_idx(y, 0.6, 0.2, 0.2, args.seed)
     else:
         if args.rank == 0:
-            print("[split] Loaded official dataset split.")
+            print(f"[split] Loaded dataset split (split_id={int(getattr(args, 'split_id', 0))}).")
 
     if args.rank == 0:
         print(args)
@@ -264,8 +276,9 @@ def _build_model(args, feature, y, device):
         attention_dropout_rate=args.attention_dropout_rate,
         ffn_dim=args.ffn_dim,
     )
-    if args.model == "graphormer":
-        model = Graphormer(
+    if args.model in _GRAPHORMER_VARIANTS:
+        model_cls = _GRAPHORMER_VARIANTS[args.model]
+        model = model_cls(
             **common,
             num_global_node=args.num_global_node,
         ).to(device)
@@ -750,7 +763,7 @@ def _assemble_edges_from_pools(
             merged = torch.zeros((2, 0), dtype=torch.long)
         else:
             merged = template.new_zeros((2, 0), dtype=torch.long)
-    if args.model == "graphormer" and args.num_global_node > 0:
+    if args.model in _GRAPHORMER_VIRTUAL_NODE_MODELS and args.num_global_node > 0:
         merged = fix_edge_index(merged, num_nodes)
         merged = adjust_edge_index_nomerge(merged, nodes_per_rank)
     return merged.contiguous()
@@ -1591,7 +1604,7 @@ def _build_merged_edges(args, edge_index_global, num_nodes, final_device, rw_dev
         merged_local = _merge_edge_index_list(parts)
         if merged_local is None:
             merged_local = edge_index_global.new_zeros((2, 0), dtype=torch.long).to(final_torch_device)
-        if args.model == "graphormer" and args.num_global_node > 0:
+        if args.model in _GRAPHORMER_VIRTUAL_NODE_MODELS and args.num_global_node > 0:
             merged_local = fix_edge_index(merged_local, num_nodes)
             merged_local = adjust_edge_index_nomerge(merged_local, nodes_per_rank)
         return merged_local
