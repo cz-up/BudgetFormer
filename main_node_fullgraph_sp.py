@@ -40,6 +40,7 @@ from utils.fullgraph_sp_support import (
     _adaptive_edge_budget_enabled,
     _autocast_context,
     _build_attention_edges,
+    _build_dst_csr,
     _build_model,
     _build_optimizer_bundle,
     _build_prefetched_cpu_edges,
@@ -209,6 +210,19 @@ def main():
     valid_size = int(valid_idx.numel()) if valid_idx is not None else 0
     adaptive_edge_budget_cfg = _resolve_adaptive_edge_budget_config(args, valid_size)
 
+    # Build CSR indexed by dst once for fast probe-node edge filtering.
+    # Replaces O(E) torch.isin scans in bootstrap and adaptive budget updates
+    # with O(probe_size × avg_degree) lookups.
+    edge_index_csr = None
+    if _adaptive_edge_budget_enabled(args) and sp_rank == sp_src_rank:
+        if args.rank == 0:
+            print("[dst-csr] Building dst-indexed CSR for probe edge filtering...")
+        _t_csr = time.time()
+        edge_index_csr = _build_dst_csr(edge_index_global, num_nodes)
+        if args.rank == 0:
+            print(f"[dst-csr] Built in {time.time() - _t_csr:.2f}s  "
+                  f"(E={edge_index_global.shape[1]:,}, N={num_nodes:,})")
+
     pad_num_nodes = ((num_nodes + sp_world_size - 1) // sp_world_size) * sp_world_size
     if pad_num_nodes > num_nodes:
         pad_rows = pad_num_nodes - num_nodes
@@ -219,7 +233,7 @@ def main():
     rank_end = rank_start + nodes_per_rank
     local_num_nodes = nodes_per_rank
 
-    if args.model in ("graphormer", "fagcn", "acm") and args.num_global_node > 0:
+    if args.model in ("graphormer", "acm") and args.num_global_node > 0:
         sub_real_seq_len = nodes_per_rank + args.num_global_node
         global_token_indices = list(range(0, sp_world_size * sub_real_seq_len, sub_real_seq_len))
         set_global_token_indices(global_token_indices)
@@ -291,6 +305,7 @@ def main():
             amp_dtype,
             sp_world_size,
             grad_reducer,
+            edge_index_csr=edge_index_csr,
         )
         total_bootstrap_time += (time.time() - t_bs_start)
         edge_budget_controller.set_state(initial_budget_state)
@@ -713,6 +728,7 @@ def main():
             local_num_nodes,
             amp_dtype,
             sp_world_size,
+            edge_index_csr=edge_index_csr,
         )
         total_adjustment_time += (time.time() - t_adjust_start)
 

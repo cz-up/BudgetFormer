@@ -913,11 +913,13 @@ class _CommAwareCheckpointer:
 
             if is_r0:
                 m_mib = self._m_layer / (1024 ** 2)
+                k_without_display = min(k_without_local, self.n_layers)
+                k_with_display = min(k_with_local, self.n_layers)
                 print(
                     f"[CommAwareCheckpointer] ACTIVE: "
                     f"M_layer={m_mib:.1f} MiB (live-measured), "
-                    f"keep_mha(no-cache)={k_without_local}/{self.n_layers} layers "
-                    f"keep_mha(cache)={k_with_local}/{self.n_layers} layers "
+                    f"keep_mha(no-cache)={k_without_display}/{self.n_layers} layers "
+                    f"keep_mha(cache)={k_with_display}/{self.n_layers} layers "
                     f"(peak_warmup={self._peak_warmup/(1024**2):.0f} MiB, "
                     f"budget={budget/(1024**2):.0f} MiB)"
                 )
@@ -927,9 +929,9 @@ class _CommAwareCheckpointer:
                         f"{'CACHE' if self._cache_edge else 'NO-CACHE'} "
                         f"(gain_with={gain_with*1000:.1f} ms "
                         f"[t_h2d={self._t_h2d*1000:.1f} ms + "
-                        f"{k_with_local} layers × {delta_t_bwd*1000:.1f} ms] "
+                        f"{k_with_display} layers × {delta_t_bwd*1000:.1f} ms] "
                         f"vs gain_without={gain_without*1000:.1f} ms "
-                        f"[{k_without_local} layers × {delta_t_bwd*1000:.1f} ms], "
+                        f"[{k_without_display} layers × {delta_t_bwd*1000:.1f} ms], "
                         f"edge={self._edge_bytes/(1024**2):.1f} MiB)"
                     )
 
@@ -962,11 +964,12 @@ class _CommAwareCheckpointer:
         self._cache_edge = cache
         if self._is_rank0():
             m_mib = self._m_layer / (1024 ** 2)
+            n_keep_display = min(n_keep, self.n_layers)
             print(
                 f"[CommAwareCheckpointer] final decision after sync: "
                 f"{'CACHE' if cache else 'NO-CACHE'} → "
-                f"keep_mha={n_keep}/{self.n_layers} layers "
-                f"(retained={n_keep * m_mib:.1f} MiB)"
+                f"keep_mha={n_keep_display}/{self.n_layers} layers "
+                f"(retained={n_keep_display * m_mib:.1f} MiB)"
             )
 
     def set_edge_info(self, edge_bytes: int, t_h2d: float) -> None:

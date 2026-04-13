@@ -679,6 +679,48 @@ def _filter_edge_index_by_dst(edge_index, dst_nodes):
     return edge_index[:, mask]
 
 
+@dataclass(frozen=True)
+class _DstEdgeCSR:
+    """CSR indexed by destination node for O(probe_size × avg_degree) edge filtering.
+
+    Replaces O(E) torch.isin scans when repeatedly querying a small probe set
+    against a large static edge_index (e.g. edge_index_global during bootstrap
+    and adaptive budget updates).
+    """
+    sorted_edge_index: torch.Tensor  # [2, E] sorted by dst, on CPU
+    row_ptr: torch.Tensor            # [num_nodes + 1] cumulative counts, on CPU
+
+
+def _build_dst_csr(edge_index: torch.Tensor, num_nodes: int) -> _DstEdgeCSR:
+    """Build a dst-indexed CSR from a COO edge_index.
+
+    One-time O(E log E) cost at startup; subsequent per-probe filtering is
+    O(probe_size × avg_degree) instead of O(E).
+    """
+    ei = edge_index.cpu().to(torch.long)
+    perm = torch.argsort(ei[1], stable=True)
+    sorted_ei = ei[:, perm].contiguous()
+    counts = torch.bincount(sorted_ei[1], minlength=num_nodes)
+    row_ptr = torch.zeros(num_nodes + 1, dtype=torch.long)
+    torch.cumsum(counts, dim=0, out=row_ptr[1:])
+    return _DstEdgeCSR(sorted_edge_index=sorted_ei, row_ptr=row_ptr)
+
+
+def _filter_by_dst_csr(csr: _DstEdgeCSR, dst_nodes: torch.Tensor) -> torch.Tensor:
+    """Return edges whose dst ∈ dst_nodes using a pre-built CSR (CPU output)."""
+    dst_nodes = dst_nodes.cpu().to(torch.long).view(-1)
+    num_nodes = int(csr.row_ptr.numel()) - 1
+    dst_nodes = dst_nodes[(dst_nodes >= 0) & (dst_nodes < num_nodes)]
+    if dst_nodes.numel() == 0:
+        return csr.sorted_edge_index.new_zeros((2, 0))
+    starts = csr.row_ptr[dst_nodes].tolist()
+    ends = csr.row_ptr[dst_nodes + 1].tolist()
+    parts = [csr.sorted_edge_index[:, s:e] for s, e in zip(starts, ends) if e > s]
+    if not parts:
+        return csr.sorted_edge_index.new_zeros((2, 0))
+    return torch.cat(parts, dim=1)
+
+
 def _build_probe_edge_pools(
     args,
     edge_index_global,
@@ -688,6 +730,7 @@ def _build_probe_edge_pools(
     edge_seed=None,
     adaptive_edge_budget_cfg=None,
     walk_length_override=None,
+    edge_index_csr=None,
 ):
     probe_idx_global = probe_idx_global.to(dtype=torch.long, device="cpu").view(-1)
     seed_ctx = (
@@ -698,7 +741,10 @@ def _build_probe_edge_pools(
     with seed_ctx:
         real_pool = None
         if _use_real_edges(args, adaptive_edge_budget_cfg):
-            real_pool = _filter_edge_index_by_dst(edge_index_global.cpu(), probe_idx_global)
+            if edge_index_csr is not None:
+                real_pool = _filter_by_dst_csr(edge_index_csr, probe_idx_global)
+            else:
+                real_pool = _filter_edge_index_by_dst(edge_index_global.cpu(), probe_idx_global)
             if real_pool is not None:
                 real_pool = real_pool.to(dtype=torch.long, device="cpu")
 
@@ -1193,6 +1239,7 @@ def _bootstrap_initial_edge_budget(
     amp_dtype,
     sp_world_size,
     grad_reducer,
+    edge_index_csr=None,
 ):
     if not controller.enabled:
         return None
@@ -1236,6 +1283,7 @@ def _bootstrap_initial_edge_budget(
                     probe_idx_global,
                     edge_seed=probe_seed,
                     adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
+                    edge_index_csr=edge_index_csr,
                 )
 
             candidate_specs = []
@@ -1382,6 +1430,7 @@ def _maybe_update_edge_budget(
     local_nodes,
     amp_dtype,
     sp_world_size,
+    edge_index_csr=None,
 ):
     if (
         (not controller.enabled)
@@ -1408,6 +1457,7 @@ def _maybe_update_edge_budget(
             edge_seed=probe_seed,
             adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
             walk_length_override=base_state.get("walk_length"),
+            edge_index_csr=edge_index_csr,
         )
     base_edges = _build_probe_attention_edges(
         args,
