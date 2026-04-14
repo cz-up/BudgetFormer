@@ -696,7 +696,10 @@ def main():
                 train_acc = accs.get("train", 0.0)
                 val_acc = accs.get("valid", 0.0)
                 test_acc = accs.get("test", 0.0)
-                print(f"  ↳ Eval ({eval_time:.2f}s) | Train={train_acc:.2%}  Val={val_acc:.2%}  Test={test_acc:.2%}")
+                _use_rocauc = str(getattr(args, "dataset", "")).lower() == "genius"
+                _fmt = (lambda v: f"{v:.4f}") if _use_rocauc else (lambda v: f"{v:.2%}")
+                _metric_name = "ROC-AUC" if _use_rocauc else "Acc"
+                print(f"  ↳ Eval ({eval_time:.2f}s) [{_metric_name}] | Train={_fmt(train_acc)}  Val={_fmt(val_acc)}  Test={_fmt(test_acc)}")
                 if val_acc > best_val:
                     best_val = val_acc
                     best_epoch = epoch
@@ -704,7 +707,7 @@ def main():
                         torch.save(model.state_dict(), os.path.join(args.model_dir, f"{args.dataset}_fg_sp.pkl"))
                 if test_acc > best_test:
                     best_test = test_acc
-                print(f"  ↳ Best: epoch={best_epoch}  val={best_val:.2%}  test={best_test:.2%}")
+                print(f"  ↳ Best: epoch={best_epoch}  val={_fmt(best_val)}  test={_fmt(best_test)}")
             del accs
 
         t_adjust_start = time.time()
@@ -774,7 +777,9 @@ def main():
                 f"source_payload={avg_broadcast_mib:.2f} MiB, "
                 f"naive_fanout_payload={naive_fanout_mib:.2f} MiB"
             )
-        print(f"Done.  Best epoch={best_epoch}  Val={best_val:.2%}  Test={best_test:.2%}")
+        _use_rocauc = str(getattr(args, "dataset", "")).lower() == "genius"
+        _fmt = (lambda v: f"{v:.4f}") if _use_rocauc else (lambda v: f"{v:.2%}")
+        print(f"Done.  Best epoch={best_epoch}  Val={_fmt(best_val)}  Test={_fmt(best_test)}")
         if edge_budget_controller.enabled:
             print(f"Timing: bootstrap={total_bootstrap_time:.2f}s  adjustment={total_adjustment_time:.2f}s")
         print(f"{'=' * 72}")

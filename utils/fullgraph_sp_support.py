@@ -95,8 +95,19 @@ def _get_process_peak_rss_mib() -> float:
     return usage / 1024.0
 
 
-def _cuda_empty_cache(args) -> None:
-    gc.collect()
+def _cuda_empty_cache(args, full: bool = True) -> None:
+    """Free the PyTorch CUDA caching allocator.
+
+    ``full=True``  (default): also runs gc.collect() before flushing.
+                  Use before large one-off allocations where an accurate
+                  free-memory reading is required (e.g. edge-index caching,
+                  H2D timing measurements).
+    ``full=False``: skips gc.collect().  Use after routine tensor deletions
+                  where the caching allocator will handle block reuse on its
+                  own and a full GC pause is undesirable.
+    """
+    if full:
+        gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
@@ -177,7 +188,6 @@ def _measure_edge_h2d_time(edge_index_global: torch.Tensor, device: str) -> floa
     torch.cuda.synchronize(device)
     t_h2d = time.perf_counter() - t0
     del _tmp
-    torch.cuda.empty_cache()
     return t_h2d
 
 
@@ -1118,7 +1128,6 @@ def _probe_loss_sp(args, model, x_local, local_y, local_probe_idx, edge_index_pr
     mean_loss = float(loss_sum.item() / max(int(count.item()), 1))
     mean_acc = float(acc_sum.item() / max(int(count.item()), 1))
     del out_local
-    _cuda_empty_cache(args)
     return mean_loss, mean_acc
 
 
@@ -1215,7 +1224,6 @@ def _train_one_epoch_with_budget(
     lr_scheduler.step()
 
     del edge_index, out_local, loss, local_y_eff, valid_train_mask, local_train_idx_eff
-    _cuda_empty_cache(args)
 
 
 def _bootstrap_initial_edge_budget(
@@ -1911,6 +1919,8 @@ def _eval_sp(args, model, x_local, y, split_idx, edge_index_global, num_nodes,
              device, rw_device, sp_group, sp_src_rank, sp_rank, sp_world_size,
              rank_start, rank_end, local_nodes, amp_dtype=None, cached_edge_index=None,
              edge_budget_state=None, adaptive_edge_budget_cfg=None):
+    use_rocauc = str(getattr(args, "dataset", "")).lower() == "genius"
+
     if cached_edge_index is None:
         with fixed_random_seed(args.seed):
             edge_index_eval = _build_attention_edges(
@@ -1928,46 +1938,58 @@ def _eval_sp(args, model, x_local, y, split_idx, edge_index_global, num_nodes,
     with torch.no_grad():
         with _autocast_context(device, amp_dtype):
             out_local = model(x_local, None, edge_index_eval, attn_type=args.attn_type)
-        pred_local = out_local.argmax(dim=1)
+        if use_rocauc:
+            # Gather class-1 probability for binary ROC AUC
+            score_local = out_local.softmax(dim=1)[:, 1].float().contiguous()
+        else:
+            score_local = out_local.argmax(dim=1)
 
     _restore_dropout(drop_states)
     if not was_training:
         model.eval()
 
     if sp_world_size > 1:
-        local_pred_len = torch.tensor([pred_local.size(0)], dtype=torch.long, device=device)
+        local_len = torch.tensor([score_local.size(0)], dtype=torch.long, device=device)
         len_list = [torch.zeros(1, dtype=torch.long, device=device) for _ in range(sp_world_size)]
-        dist.all_gather(len_list, local_pred_len, group=sp_group)
+        dist.all_gather(len_list, local_len, group=sp_group)
         pred_lens = [int(t.item()) for t in len_list]
         max_pred_len = max(pred_lens) if pred_lens else 0
 
-        if pred_local.size(0) < max_pred_len:
-            padded = torch.zeros(max_pred_len, dtype=torch.long, device=device)
-            padded[:pred_local.size(0)] = pred_local
-            pred_local = padded
+        if score_local.size(0) < max_pred_len:
+            padded = torch.zeros(max_pred_len, dtype=score_local.dtype, device=device)
+            padded[:score_local.size(0)] = score_local
+            score_local = padded
 
-        gather_list = [torch.zeros(max_pred_len, dtype=torch.long, device=device) for _ in range(sp_world_size)]
-        dist.all_gather(gather_list, pred_local, group=sp_group)
-        pred_chunks = [gather_list[i][:pred_lens[i]] for i in range(sp_world_size)]
-        pred_global = torch.cat(pred_chunks, dim=0)[:num_nodes].cpu()
+        gather_list = [torch.zeros(max_pred_len, dtype=score_local.dtype, device=device) for _ in range(sp_world_size)]
+        dist.all_gather(gather_list, score_local, group=sp_group)
+        score_chunks = [gather_list[i][:pred_lens[i]] for i in range(sp_world_size)]
+        score_global = torch.cat(score_chunks, dim=0)[:num_nodes].cpu()
     else:
-        pred_global = pred_local.cpu()
+        score_global = score_local.cpu()
 
     result = None
     if args.rank == 0:
         if y is None or split_idx is None:
             raise RuntimeError("Rank 0 requires full labels and split_idx for evaluation.")
-        valid_n = min(int(pred_global.size(0)), int(num_nodes))
-        pred_global = pred_global[:valid_n]
+        valid_n = min(int(score_global.size(0)), int(num_nodes))
+        score_global = score_global[:valid_n]
         y_cpu = y[:valid_n].cpu().view(-1)
-        accs = {}
-        for split_name, idx in split_idx.items():
-            idx_valid = idx[idx < valid_n]
-            correct = (pred_global[idx_valid] == y_cpu[idx_valid]).sum().item()
-            accs[split_name] = float(correct) / max(1, len(idx_valid))
-        result = accs
+        metrics = {}
+        if use_rocauc:
+            from sklearn.metrics import roc_auc_score
+            for split_name, idx in split_idx.items():
+                idx_valid = idx[idx < valid_n]
+                metrics[split_name] = float(roc_auc_score(
+                    y_cpu[idx_valid].numpy(), score_global[idx_valid].numpy()
+                ))
+        else:
+            for split_name, idx in split_idx.items():
+                idx_valid = idx[idx < valid_n]
+                correct = (score_global[idx_valid].long() == y_cpu[idx_valid]).sum().item()
+                metrics[split_name] = float(correct) / max(1, len(idx_valid))
+        result = metrics
 
-    del pred_local, pred_global, out_local, x_local
+    del score_local, score_global, out_local, x_local
     if cached_edge_index is None:
         del edge_index_eval
     _cuda_empty_cache(args)
