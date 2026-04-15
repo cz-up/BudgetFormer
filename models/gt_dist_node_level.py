@@ -512,7 +512,7 @@ class MultiHeadAttention(nn.Module):
     """Distributed multi-headed attention.
 
     """
-    def __init__(self, hidden_size, attention_dropout_rate, num_heads, overlap_comm=False):
+    def __init__(self, hidden_size, attention_dropout_rate, num_heads):
         super(MultiHeadAttention, self).__init__()
 
         self.num_heads = num_heads
@@ -524,7 +524,10 @@ class MultiHeadAttention(nn.Module):
         local_attn = CoreAttention(
             hidden_size, attention_dropout_rate, num_heads)
         if sequence_parallel_is_initialized():
-            self.dist_attn = DistributedAttentionNodeLevel(local_attn, get_sequence_parallel_group(), overlap_comm=overlap_comm)
+            self.dist_attn = DistributedAttentionNodeLevel(
+                local_attn,
+                get_sequence_parallel_group(),
+            )
         else:
             self.dist_attn = local_attn
 
@@ -613,11 +616,11 @@ class MultiHeadAttention(nn.Module):
 
 class EncoderLayer(nn.Module):
     def __init__(
-        self, hidden_size, ffn_size, dropout_rate, attention_dropout_rate, num_heads, overlap_comm=False,
+        self, hidden_size, ffn_size, dropout_rate, attention_dropout_rate, num_heads,
     ):
         super(EncoderLayer, self).__init__()
         self.self_attention = MultiHeadAttention(
-            hidden_size, attention_dropout_rate, num_heads, overlap_comm=overlap_comm,
+            hidden_size, attention_dropout_rate, num_heads,
         )
         self.self_attention_dropout = nn.Dropout(dropout_rate)
         self.O = nn.Linear(hidden_size, hidden_size)
@@ -700,7 +703,6 @@ class GT(nn.Module):
         attention_dropout_rate,
         ffn_dim,
         num_global_node,
-        overlap_comm=False,
     ):
         super().__init__()
         self.node_encoder = nn.Linear(input_dim, hidden_dim)
@@ -709,7 +711,7 @@ class GT(nn.Module):
 
         encoders = [
             EncoderLayer(
-                hidden_dim, ffn_dim, dropout_rate, attention_dropout_rate, num_heads, overlap_comm=overlap_comm,
+                hidden_dim, ffn_dim, dropout_rate, attention_dropout_rate, num_heads,
             )
             for _ in range(n_layers)
         ]

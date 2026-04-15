@@ -114,8 +114,8 @@ def initialize_sequence_parallel(
     global _SEQUENCE_PARALLEL_WORLD_SIZE
     global _SEQUENCE_PARALLEL_RANK
     global _SEQUENCE_LENGTH
-    global _SEQUENCE_LENGTH_PER_RANK 
-    
+    global _SEQUENCE_LENGTH_PER_RANK
+
     # Build the sequence parallel groups.
     _SEQUENCE_LENGTH = seq_length
     assert _SEQUENCE_PARALLEL_GROUP is None, \
@@ -140,7 +140,7 @@ def get_sequence_parallel_group():
         'sequence parallel group is not initialized'
     return _SEQUENCE_PARALLEL_GROUP
 
-            
+
 def get_sequence_parallel_world_size():
     """Return world size for the sequence parallel group."""
     if _SEQUENCE_PARALLEL_WORLD_SIZE is not None:

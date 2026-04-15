@@ -5,7 +5,6 @@ import random
 import resource
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Optional
 
@@ -31,7 +30,6 @@ from models.gt_dist_node_level import GT
 from utils.lr import PolynomialDecayLR
 from utils.split_utils import load_default_split
 
-_STREAM_EDGE_CHUNK_EDGES = 1 << 19
 _MINHASH_SAMPLE_K_LIMIT = 8
 _GRAPHORMER_VARIANTS = {
     "graphormer": Graphormer,
@@ -59,6 +57,20 @@ def _resolve_amp_dtype(args):
     if amp_mode == "fp16":
         return torch.float16
     raise ValueError(f"Unsupported amp dtype: {amp_mode}")
+
+
+def _resolve_real_edge_sampling_device(final_device, rw_device) -> torch.device:
+    """Choose the device used to sample real edges before the final merge.
+
+    When training runs on CUDA but random walks are explicitly placed on CPU,
+    keep real-edge sampling on CPU as well so that only the sampled subset is
+    transferred to the training GPU.
+    """
+    final_torch_device = torch.device(final_device)
+    rw_torch_device = torch.device(rw_device)
+    if final_torch_device.type == "cuda" and rw_torch_device.type == "cpu":
+        return torch.device("cpu")
+    return final_torch_device
 
 
 def _autocast_context(device: str, amp_dtype):
@@ -323,15 +335,6 @@ class _AdaptiveEdgeBudgetConfig:
     bootstrap_search_epochs: int
     bootstrap_n_layers: int
     static_seed_epochs: int
-
-
-def _pin_cpu_tensor(tensor):
-    if tensor.device.type == "cpu" and torch.cuda.is_available():
-        try:
-            return tensor.pin_memory()
-        except RuntimeError:
-            return tensor
-    return tensor
 
 
 def _random_block_sampling_enabled(args, adaptive_edge_budget_cfg=None) -> bool:
@@ -626,7 +629,8 @@ def _resolve_real_edges_for_state(
     if not _use_real_edges_for_state(args, edge_budget_state, adaptive_edge_budget_cfg):
         return None
 
-    real_edges = edge_index_global.to(device)
+    build_device = torch.device(device)
+    real_edges = edge_index_global if edge_index_global.device == build_device else edge_index_global.to(build_device)
     if not _random_block_sampling_enabled(args, adaptive_edge_budget_cfg):
         return real_edges
 
@@ -642,7 +646,7 @@ def _resolve_real_edges_for_state(
                 real_budget,
                 _edge_block_seed(args, edge_seed, 17),
             ),
-            device=device,
+            device=build_device,
         )
     return real_edges
 
@@ -872,7 +876,7 @@ def _build_probe_attention_edges(
     else:
         merged_cpu = None
 
-    return _broadcast_prefetched_edges(merged_cpu, device, sp_group, sp_src_rank, sp_rank)
+    return _broadcast_edges(merged_cpu, device, sp_group, sp_src_rank, sp_rank)
 
 
 
@@ -1574,53 +1578,22 @@ def _fixed_torch_cpu_seed(seed: int):
         torch.random.set_rng_state(torch_state)
 
 
-class _CpuRandomWalkEdgePrefetcher:
-    def __init__(self, enabled: bool) -> None:
-        self._executor = ThreadPoolExecutor(max_workers=1) if enabled else None
-        self._future = None
-        self._epoch = None
-
-    @property
-    def enabled(self) -> bool:
-        return self._executor is not None
-
-    def submit(self, epoch: int, fn) -> None:
-        if self._executor is None or epoch <= 0 or self._future is not None:
-            return
-        self._epoch = int(epoch)
-        self._future = self._executor.submit(fn)
-
-    def pop(self, epoch: int):
-        if self._future is None or self._epoch != int(epoch):
-            return None
-        result = self._future.result()
-        self._future = None
-        self._epoch = None
-        return result
-
-    def close(self) -> None:
-        if self._future is not None:
-            self._future.result()
-            self._future = None
-            self._epoch = None
-        if self._executor is not None:
-            self._executor.shutdown(wait=True)
-            self._executor = None
-
-
 def _build_merged_edges(args, edge_index_global, num_nodes, final_device, rw_device, nodes_per_rank,
                         edge_seed=None, edge_budget_state=None, adaptive_edge_budget_cfg=None,
                         walk_length_override=None):
     parts = []
     final_torch_device = torch.device(final_device)
+    real_edge_sampling_device = _resolve_real_edge_sampling_device(final_torch_device, rw_device)
     real_edges = _resolve_real_edges_for_state(
         args,
         edge_index_global,
-        final_torch_device,
+        real_edge_sampling_device,
         edge_seed=edge_seed,
         edge_budget_state=edge_budget_state,
         adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
     )
+    if real_edges is not None and real_edges.device != final_torch_device:
+        real_edges = real_edges.to(final_torch_device)
     record_scalar("edge_real_edges", int(real_edges.size(1)) if real_edges is not None else 0, reduce="max")
     rw_heads = None
     if _use_rw_edges(args, edge_budget_state, adaptive_edge_budget_cfg):
@@ -1683,88 +1656,7 @@ def _resolve_walk_length(args, edge_budget_state=None, walk_length_override=None
     return max(1, int(getattr(args, "head_hop_walk_length", 4)))
 
 
-def _pack_streaming_edges(merged_cpu):
-    if merged_cpu is None:
-        merged_cpu = torch.zeros((2, 0), dtype=torch.long)
-    edge_cpu = merged_cpu[:2].to(device="cpu", dtype=torch.long).contiguous()
-    index_dtype = torch.int64
-    if edge_cpu.numel() == 0:
-        index_dtype = torch.int32
-    else:
-        max_index = int(edge_cpu.max().item())
-        if max_index <= torch.iinfo(torch.int32).max:
-            index_dtype = torch.int32
-
-    src_cpu = edge_cpu[0].to(dtype=index_dtype).contiguous()
-    dst_cpu = edge_cpu[1].to(dtype=index_dtype).contiguous()
-    num_edges = int(src_cpu.numel())
-    if num_edges <= 0:
-        offsets = torch.zeros(1, dtype=torch.long)
-    else:
-        offsets = torch.arange(0, num_edges, _STREAM_EDGE_CHUNK_EDGES, dtype=torch.long)
-        if int(offsets[-1].item()) != num_edges:
-            offsets = torch.cat([offsets, offsets.new_tensor([num_edges])], dim=0)
-        else:
-            offsets = offsets.clone()
-
-    return {
-        "mode": "cpu_stream",
-        "src": _pin_cpu_tensor(src_cpu),
-        "dst": _pin_cpu_tensor(dst_cpu),
-        "offsets": _pin_cpu_tensor(offsets.contiguous()),
-    }
-
-
-def _build_streaming_edges(args, edge_index_global, num_nodes, rw_device, nodes_per_rank,
-                           edge_seed=None, edge_budget_state=None, adaptive_edge_budget_cfg=None,
-                           walk_length_override=None):
-    seed_ctx = fixed_random_seed(edge_seed) if edge_seed is not None else contextlib.nullcontext()
-    with seed_ctx:
-        merged_cpu = profile_call(
-            "edge_build_local",
-            lambda: _build_merged_edges(
-                args,
-                edge_index_global,
-                num_nodes,
-                "cpu",
-                rw_device,
-                nodes_per_rank,
-                edge_seed=edge_seed,
-                edge_budget_state=edge_budget_state,
-                adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
-                walk_length_override=walk_length_override,
-            ),
-            device=None,
-        )
-    return _pack_streaming_edges(merged_cpu)
-
-def _build_prefetched_cpu_edges(args, edge_index_global, num_nodes, rw_device, nodes_per_rank, edge_seed,
-                                edge_budget_state=None, adaptive_edge_budget_cfg=None):
-    if getattr(args, "stream_edges_from_cpu", False):
-        return _build_streaming_edges(
-            args,
-            edge_index_global,
-            num_nodes,
-            rw_device,
-            nodes_per_rank,
-            edge_seed=edge_seed,
-            edge_budget_state=edge_budget_state,
-            adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
-        )
-    seed_ctx = _fixed_torch_cpu_seed(edge_seed) if edge_seed is not None else contextlib.nullcontext()
-    with seed_ctx:
-        merged_cpu = _build_merged_edges(
-            args, edge_index_global, num_nodes, "cpu", rw_device, nodes_per_rank,
-            edge_seed=edge_seed,
-        edge_budget_state=edge_budget_state,
-        adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
-    )
-    if merged_cpu.device.type == "cpu":
-        merged_cpu = _pin_cpu_tensor(merged_cpu.contiguous())
-    return merged_cpu
-
-
-def _broadcast_prefetched_edges(merged_cpu, device, sp_group, sp_src_rank, sp_rank):
+def _broadcast_edges(merged_cpu, device, sp_group, sp_src_rank, sp_rank):
     if sp_rank == sp_src_rank:
         merged = merged_cpu.to(device=device, dtype=torch.long, non_blocking=(merged_cpu.device.type == "cpu"))
         size_t = torch.tensor([merged.shape[1]], device=device, dtype=torch.long)
@@ -1872,18 +1764,6 @@ def _build_attention_edges(args, edge_index_global, num_nodes, device, rw_device
                            sp_src_rank, sp_rank, nodes_per_rank, edge_seed=None,
                            edge_budget_state=None, adaptive_edge_budget_cfg=None,
                            walk_length_override=None):
-    if getattr(args, "stream_edges_from_cpu", False):
-        return _build_streaming_edges(
-            args,
-            edge_index_global,
-            num_nodes,
-            rw_device,
-            nodes_per_rank,
-            edge_seed=edge_seed,
-            edge_budget_state=edge_budget_state,
-            adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
-            walk_length_override=walk_length_override,
-        )
     return _build_and_broadcast_edges(
         args,
         edge_index_global,

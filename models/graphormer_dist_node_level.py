@@ -154,39 +154,7 @@ class CoreAttention(nn.Module):
             attn_bias = attn_bias.unsqueeze(2).repeat(1, 1, batch_size, 1, 1)
             attn_bias = attn_bias.view(batch_size * node_num, batch_size * node_num, -1)
 
-        if isinstance(edge_index, dict):
-            if edge_index.get("mode") != "cpu_stream":
-                raise ValueError(f"Unsupported sparse edge payload mode: {edge_index.get('mode')}")
-
-            src_cpu = edge_index["src"]
-            dst_cpu = edge_index["dst"]
-            offsets = edge_index["offsets"]
-            offsets_list = offsets.tolist()
-            wV = v.new_zeros(v.size(0), num_heads, self.hidden_size_per_attention_head)
-            Z = v.new_zeros(v.size(0), num_heads, 1)
-            non_blocking = src_cpu.device.type == "cpu"
-
-            for start, end in zip(offsets_list[:-1], offsets_list[1:]):
-                if end <= start:
-                    continue
-                src = src_cpu[start:end].to(device=k.device, dtype=torch.long, non_blocking=non_blocking)
-                dst = dst_cpu[start:end].to(device=k.device, dtype=torch.long, non_blocking=non_blocking)
-                src_k = k[src]
-                dst_q = q[dst]
-                score = torch.mul(src_k, dst_q)
-                score = score / self.scale
-                score = score.sum(-1, keepdim=True).clamp(-5, 5)
-
-                if attn_bias is not None:
-                    score = score + attn_bias[src, dst, :].unsqueeze(-1)
-
-                score = torch.exp(score)
-                msg = v[src] * score
-                scatter(msg, dst, dim=0, out=wV, reduce='add')
-                scatter(score, dst, dim=0, out=Z, reduce='add')
-
-            x = wV / (Z + 1e-6)
-        elif isinstance(edge_index, list):
+        if isinstance(edge_index, list):
             wV = None
             Z = None
             groups = max(1, len(edge_index))
@@ -515,6 +483,89 @@ class CoreAttention(nn.Module):
                 if needed > self.hop_mass_max:
                     self.hop_mass_max = needed
 
+    # ------------------------------------------------------------------
+    # Two-phase sparse attention for communication-computation overlap.
+    # Phase 1 (sparse_score_phase): depends only on Q and K
+    # Phase 2 (sparse_aggregate_phase): depends on V and the scores
+    # ------------------------------------------------------------------
+
+    def sparse_score_phase(self, k, q, edge_index, attn_bias):
+        """Compute sparse attention scores using only K and Q.
+
+        Supports only the plain-tensor edge_index path. This matches the
+        conditions enforced by DistributedAttentionNoMerge._can_overlap().
+        """
+        batch_size, node_num = k.size(0), k.size(1)
+        if self.training:
+            num_heads = self.num_attention_heads_per_partition
+        else:
+            num_heads = self.num_heads
+
+        edge_hops = None
+        if isinstance(edge_index, torch.Tensor) and edge_index.dim() == 2 and edge_index.size(0) == 3:
+            edge_hops = edge_index[2]
+            edge_index = edge_index[:2]
+
+        if not isinstance(edge_index, torch.Tensor) or edge_index.dim() != 2:
+            raise ValueError("sparse_score_phase only supports plain tensor edge_index.")
+
+        q_flat = q.view(-1, num_heads, self.hidden_size_per_attention_head)
+        k_flat = k.view(-1, num_heads, self.hidden_size_per_attention_head)
+
+        if self._shuffle:
+            destinations = edge_index[1, :].clone()
+            shuffled_indices = torch.randperm(destinations.size(0), device=destinations.device)
+            shuffled_destinations = destinations[shuffled_indices]
+            edge_index = torch.stack([edge_index[0, :], shuffled_destinations])
+
+        src_idx = edge_index[0].to(torch.long)
+        dst_idx = edge_index[1].to(torch.long)
+        src = k_flat[src_idx]
+        dest = q_flat[dst_idx]
+        score = torch.mul(src, dest)
+        score = score / self.scale
+        score = score.sum(-1, keepdim=True).clamp(-5, 5)
+
+        if attn_bias is not None:
+            attn_bias = attn_bias.unsqueeze(2).repeat(1, 1, batch_size, 1, 1)
+            attn_bias = attn_bias.view(batch_size * node_num, batch_size * node_num, -1)
+            score = score + attn_bias[src_idx, dst_idx, :].unsqueeze(-1)
+
+        score = torch.exp(score)
+
+        return {
+            "score": score,
+            "edge_index": edge_index,
+            "edge_hops": edge_hops,
+            "num_heads": num_heads,
+            "total_nodes": q_flat.size(0),
+        }
+
+    def sparse_aggregate_phase(self, score_ctx, v):
+        """Apply precomputed scores to V and scatter-aggregate."""
+        score = score_ctx["score"]
+        edge_index = score_ctx["edge_index"]
+        edge_hops = score_ctx["edge_hops"]
+        num_heads = score_ctx["num_heads"]
+        total_nodes = score_ctx["total_nodes"]
+
+        v_flat = v.view(-1, num_heads, self.hidden_size_per_attention_head)
+        src_idx = edge_index[0].to(torch.long)
+        dst_idx = edge_index[1].to(torch.long)
+
+        msg = v_flat[src_idx] * score
+        wV = msg.new_zeros(total_nodes, num_heads, self.hidden_size_per_attention_head)
+        scatter(msg, dst_idx, dim=0, out=wV, reduce='add')
+
+        Z = score.new_zeros(total_nodes, num_heads, 1)
+        scatter(score, dst_idx, dim=0, out=Z, reduce='add')
+
+        if edge_hops is not None:
+            self._accumulate_sparse_hop_mass(edge_index, edge_hops, score, Z)
+
+        x = wV / (Z + 1e-6)
+        return x
+
 
 
     def forward(self, q, k, v, attn_bias=None, edge_index=None, attn_type=None):
@@ -558,7 +609,10 @@ class MultiHeadAttention(nn.Module):
         local_attn = CoreAttention(
             hidden_size, attention_dropout_rate, num_heads, attn_bias_dim)
         if sequence_parallel_is_initialized():
-            self.dist_attn = DistributedAttentionNoMerge(local_attn, get_sequence_parallel_group())
+            self.dist_attn = DistributedAttentionNoMerge(
+                local_attn,
+                get_sequence_parallel_group(),
+            )
         else:
             self.dist_attn = local_attn
 
@@ -603,12 +657,24 @@ class EncoderLayer(nn.Module):
     Transformer layer takes input with size [b, s, h] and returns an
     output of the same size.
     """
-    def __init__(self, hidden_size, ffn_size, dropout_rate, attention_dropout_rate, num_heads, attn_bias_dim):
+    def __init__(
+        self,
+        hidden_size,
+        ffn_size,
+        dropout_rate,
+        attention_dropout_rate,
+        num_heads,
+        attn_bias_dim,
+    ):
         super(EncoderLayer, self).__init__()
   
         self.self_attention_norm = nn.LayerNorm(hidden_size)
         self.self_attention = MultiHeadAttention(
-            hidden_size, attention_dropout_rate, num_heads, attn_bias_dim)
+            hidden_size,
+            attention_dropout_rate,
+            num_heads,
+            attn_bias_dim,
+        )
         self.self_attention_dropout = nn.Dropout(dropout_rate)
         
         self.ffn_norm = nn.LayerNorm(hidden_size)
@@ -1019,8 +1085,17 @@ class Graphormer(nn.Module):
         self.num_heads = num_heads
         self.node_encoder = nn.Linear(input_dim, hidden_dim)
         self.input_dropout = nn.Dropout(input_dropout_rate)
-        encoders = [EncoderLayer(hidden_dim, ffn_dim, dropout_rate, attention_dropout_rate, num_heads, attn_bias_dim)
-                    for _ in range(n_layers)]
+        encoders = [
+            EncoderLayer(
+                hidden_dim,
+                ffn_dim,
+                dropout_rate,
+                attention_dropout_rate,
+                num_heads,
+                attn_bias_dim,
+            )
+            for _ in range(n_layers)
+        ]
         self.layers = nn.ModuleList(encoders)
         self.n_layers = n_layers
         self.final_ln = nn.LayerNorm(hidden_dim)

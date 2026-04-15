@@ -56,10 +56,12 @@ def add_node_common_args(parser, defaults=None):
         help="head hop random walks per node",
     )
     parser.add_argument(
+        "--edge_build_device",
         "--random_walk_device",
+        dest="edge_build_device",
         type=str,
-        default=defaults.get("random_walk_device", "same"),
-        help="device for random-walk subgraph construction: same|cpu|cuda|cuda:N",
+        default=defaults.get("edge_build_device", defaults.get("random_walk_device", "same")),
+        help="device for edge construction/sampling: same|cpu|cuda|cuda:N",
     )
     parser.add_argument("--rank", type=int, default=defaults.get("rank"))
     parser.add_argument("--local-rank", "--local_rank", type=int, default=defaults.get("local_rank"))
@@ -210,18 +212,6 @@ def add_node_fullgraph_sp_args(parser, defaults=None):
         action="store_true",
         default=defaults.get("profile_sp_comm", False),
         help="profile SeqAllToAll and full-graph edge broadcast communication time",
-    )
-    parser.add_argument(
-        "--stream_edges_from_cpu",
-        action="store_true",
-        default=defaults.get("stream_edges_from_cpu", False),
-        help="keep full-graph sparse edges on CPU and stream fixed-size edge chunks to GPU",
-    )
-    parser.add_argument(
-        "--random_walk_prefetch",
-        action="store_true",
-        default=defaults.get("random_walk_prefetch", False),
-        help="prefetch next epoch's CPU random-walk edges in a background thread (full-graph SP)",
     )
     parser.add_argument(
         "--random_edge_blocks",

@@ -98,32 +98,34 @@ def fix_edge_index(x, num_node):
     return x
 
 
-def resolve_random_walk_device(args, default_device) -> torch.device:
-    """Resolve the device used for random-walk sampling."""
-    if bool(getattr(args, "random_walk_prefetch", False)):
-        return torch.device("cpu")
-
-    spec = getattr(args, "random_walk_device", "same")
+def resolve_edge_build_device(args, default_device) -> torch.device:
+    """Resolve the device used for edge construction and sampling."""
+    spec = getattr(args, "edge_build_device", getattr(args, "random_walk_device", "same"))
     if spec in (None, "", "same"):
         return torch.device(default_device)
 
     try:
-        rw_device = torch.device(spec)
+        build_device = torch.device(spec)
     except (TypeError, RuntimeError) as exc:
         raise ValueError(
-            f"Invalid --random_walk_device={spec!r}; expected same/cpu/cuda/cuda:N."
+            f"Invalid --edge_build_device={spec!r}; expected same/cpu/cuda/cuda:N."
         ) from exc
 
-    if rw_device.type == "cuda":
+    if build_device.type == "cuda":
         if not torch.cuda.is_available():
-            raise ValueError("--random_walk_device requests CUDA, but CUDA is not available.")
-        if rw_device.index is None:
+            raise ValueError("--edge_build_device requests CUDA, but CUDA is not available.")
+        if build_device.index is None:
             default_dev = torch.device(default_device)
             if default_dev.type == "cuda" and default_dev.index is not None:
                 return torch.device(f"cuda:{default_dev.index}")
             return torch.device(f"cuda:{torch.cuda.current_device()}")
 
-    return rw_device
+    return build_device
+
+
+def resolve_random_walk_device(args, default_device) -> torch.device:
+    """Backward-compatible alias for older call sites."""
+    return resolve_edge_build_device(args, default_device)
 
 
 def get_seed_batch_size(args) -> int:
@@ -992,7 +994,7 @@ def get_batch_blockize(
                 edge_index=edge_index,
                 seed_nodes=idx_batch,
                 num_nodes=N,
-                device=resolve_random_walk_device(args, device if device is not None else edge_index.device),
+                device=resolve_edge_build_device(args, device if device is not None else edge_index.device),
                 walk_length=getattr(args, "head_hop_walk_length", 4),
                 walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
             )
@@ -1077,7 +1079,7 @@ def get_batch_blockize(
             edge_index_i_heads = _merge_edge_index_list(edge_parts)
         else:
             rw_base = induced_edge_index_i_raw
-            rw_dev = resolve_random_walk_device(args, dev if dev is not None else rw_base.device)
+            rw_dev = resolve_edge_build_device(args, dev if dev is not None else rw_base.device)
             if rw_base.device != rw_dev:
                 rw_base = rw_base.to(rw_dev)
             try:
@@ -1108,7 +1110,7 @@ def get_batch_blockize(
         edge_index_i_heads = rw_edge_index_i_raw
     else:
         rw_base = induced_edge_index_i_raw
-        rw_dev = resolve_random_walk_device(args, dev if dev is not None else rw_base.device)
+        rw_dev = resolve_edge_build_device(args, dev if dev is not None else rw_base.device)
         if rw_base.device != rw_dev:
             rw_base = rw_base.to(rw_dev)
         try:

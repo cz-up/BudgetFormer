@@ -33,19 +33,16 @@ from gt_sp.initialize import (
     set_last_batch_global_token_indices,
 )
 from gt_sp.reducer import build_gradient_reducer, sync_params_and_buffers
-from gt_sp.utils import resolve_random_walk_device
+from gt_sp.utils import resolve_edge_build_device
 from utils.fullgraph_sp_support import (
     _AdaptiveEdgeBudgetController,
-    _CpuRandomWalkEdgePrefetcher,
     _adaptive_edge_budget_enabled,
     _autocast_context,
     _build_attention_edges,
     _build_dst_csr,
     _build_model,
     _build_optimizer_bundle,
-    _build_prefetched_cpu_edges,
     _bootstrap_initial_edge_budget,
-    _broadcast_prefetched_edges,
     _cuda_empty_cache,
     _eval_sp,
     _measure_edge_h2d_time,
@@ -59,6 +56,7 @@ from utils.fullgraph_sp_support import (
     _resolve_adaptive_edge_budget_config,
     _resolve_amp_dtype,
     _resolve_device,
+    _resolve_real_edge_sampling_device,
     _select_probe_nodes,
     _set_seed,
     _use_real_edges,
@@ -180,10 +178,6 @@ def main():
     )
     add_node_fullgraph_sp_args(parser)
     args = normalize_main_node_fullgraph_sp_args(parser.parse_args())
-    if getattr(args, "stream_edges_from_cpu", False) and args.attn_type != "sparse":
-        raise ValueError("--stream_edges_from_cpu currently requires --attn_type sparse.")
-    if _adaptive_edge_budget_enabled(args) and args.random_walk_prefetch:
-        raise ValueError("--adaptive_edge_budget is not compatible with --random_walk_prefetch.")
     fixed_edge_budget_state = _fixed_edge_budget_state_from_args(args)
     if _adaptive_edge_budget_enabled(args) and fixed_edge_budget_state is not None:
         raise ValueError("--fixed_real_edges_per_query/--fixed_rw_edges_per_query are not compatible with --adaptive_edge_budget.")
@@ -198,7 +192,7 @@ def main():
 
     device = _resolve_device()
     amp_dtype = _resolve_amp_dtype(args)
-    rw_device = resolve_random_walk_device(args, device)
+    rw_device = resolve_edge_build_device(args, device)
     _set_seed(args.seed)
     enable_comm_profiler(bool(getattr(args, "profile_sp_comm", False)))
 
@@ -324,14 +318,8 @@ def main():
         )
     )
     dynamic_edges = _use_rw_edges(args, adaptive_edge_budget_cfg=adaptive_edge_budget_cfg) or random_blocks_dynamic
-    prefetch_cpu_rw = (
-        dynamic_edges
-        and not getattr(args, "stream_edges_from_cpu", False)
-        and getattr(args, "random_walk_prefetch", False)
-        and rw_device.type == "cpu"
-        and device.startswith("cuda")
-    )
-    edge_prefetcher = _CpuRandomWalkEdgePrefetcher(prefetch_cpu_rw and sp_rank == sp_src_rank)
+    real_edge_sampling_device = _resolve_real_edge_sampling_device(device, rw_device)
+    cpu_real_edge_sampling = real_edge_sampling_device.type == "cpu" and device.startswith("cuda")
 
     # ------------------------------------------------------------------
     # Edge-index GPU cache decision.
@@ -350,11 +338,17 @@ def main():
     _adaptive_edge_decision_done = True  # True = no deferred work needed
 
     _cuda_empty_cache(args)
-    if not _is_adaptive_ckpt:
+    if cpu_real_edge_sampling:
+        if args.rank == 0:
+            print(
+                "[edge-cache] Disabled: edge_build_device=cpu keeps real-edge sampling on CPU, "
+                "so edge_index_global will not be cached on GPU."
+            )
+    elif not _is_adaptive_ckpt:
         # ---- Non-adaptive: simple memory-check path ----------------------
         _ei_gpu, _ei_cached_local = _try_cache_edge_index_on_gpu(
-            edge_index_global, device, rank=args.rank
-        )
+                edge_index_global, device, rank=args.rank
+            )
         if sp_world_size > 1 and dist.is_initialized():
             _can_cache_t = torch.tensor(
                 [int(_ei_cached_local)], device=device, dtype=torch.long
@@ -409,12 +403,8 @@ def main():
             f"  Sparse edges: real={int(_use_real_edges(args, adaptive_edge_budget_cfg))} "
             f"rw={int(_use_rw_edges(args, adaptive_edge_budget_cfg=adaptive_edge_budget_cfg))}"
         )
-        rw_device_line = f"  Random-walk device: {rw_device}"
-        if getattr(args, "random_walk_prefetch", False):
-            rw_device_line += " (forced by --random_walk_prefetch)"
-        print(rw_device_line)
-        print(f"  CPU RW prefetch: {int(prefetch_cpu_rw)}")
-        print(f"  CPU edge streaming: {int(bool(getattr(args, 'stream_edges_from_cpu', False)))}")
+        print(f"  Edge build device: {rw_device}")
+        print(f"  Real-edge sampling device: {real_edge_sampling_device}")
         print(f"  Force edge broadcast: {int(bool(getattr(args, 'force_edge_broadcast', False)))}")
         print(f"  Edge index GPU cached: {int(edge_index_gpu_cached)}")
         print(f"  AMP dtype: {args.amp_dtype}")
@@ -449,6 +439,8 @@ def main():
     best_test = 0.0
     best_epoch = -1
     loss_ema = None
+    epoch_wall_time_sum = 0.0
+    epoch_wall_time_count = 0
     edge_broadcast_ms_sum = 0.0
     edge_broadcast_bytes_sum = 0
     edge_broadcast_epoch_count = 0
@@ -476,9 +468,7 @@ def main():
         )
 
     use_epoch_seed = (
-        getattr(args, "stream_edges_from_cpu", False)
-        or prefetch_cpu_rw
-        or random_blocks_dynamic
+        random_blocks_dynamic
     )
 
     for epoch in range(1, args.epochs + 1):
@@ -489,7 +479,6 @@ def main():
         optimizer.zero_grad(set_to_none=True)
 
         t_rw = time.time()
-        prefetched_cpu = None
         if cached_edge_index is not None:
             edge_index_rw = cached_edge_index
         else:
@@ -500,42 +489,20 @@ def main():
                     edge_seed = args.seed + epoch
             else:
                 edge_seed = None
-            if edge_prefetcher.enabled:
-                prefetched_cpu = edge_prefetcher.pop(epoch)
-            if prefetched_cpu is not None:
-                edge_index_rw = _broadcast_prefetched_edges(prefetched_cpu, device, sp_group, sp_src_rank, sp_rank)
-            else:
-                edge_index_rw = _build_attention_edges(
-                    args,
-                    edge_index_global,
-                    num_nodes,
-                    device,
-                    rw_device,
-                    sp_group,
-                    sp_src_rank,
-                    sp_rank,
-                    local_num_nodes,
-                    edge_seed=edge_seed,
-                    edge_budget_state=edge_budget_controller.current_state(),
-                    adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
-                )
-            if edge_prefetcher.enabled and epoch < args.epochs:
-                next_epoch = epoch + 1
-                next_seed = args.seed + next_epoch
-                next_budget_state = dict(edge_budget_controller.current_state())
-                edge_prefetcher.submit(
-                    next_epoch,
-                    lambda next_seed=next_seed, next_budget_state=next_budget_state: _build_prefetched_cpu_edges(
-                        args,
-                        edge_index_global,
-                        num_nodes,
-                        rw_device,
-                        local_num_nodes,
-                        next_seed,
-                        edge_budget_state=next_budget_state,
-                        adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
-                    ),
-                )
+            edge_index_rw = _build_attention_edges(
+                args,
+                edge_index_global,
+                num_nodes,
+                device,
+                rw_device,
+                sp_group,
+                sp_src_rank,
+                sp_rank,
+                local_num_nodes,
+                edge_seed=edge_seed,
+                edge_budget_state=edge_budget_controller.current_state(),
+                adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
+            )
         rw_time = time.time() - t_rw
 
         t_fwd = time.time()
@@ -639,10 +606,7 @@ def main():
         del out_local, loss, local_y_eff, valid_train_mask, local_train_idx_eff
         if cached_edge_index is None:
             del edge_index_rw
-        if prefetched_cpu is not None:
-            del prefetched_cpu
 
-        epoch_time = time.time() - t_epoch
         cpu_rss = _get_process_rss_mib()
         cpu_rss_peak = _get_process_peak_rss_mib()
         comm_profile = None
@@ -653,18 +617,6 @@ def main():
                 edge_broadcast_ms_sum += float(edge_broadcast["total_ms"])
                 edge_broadcast_bytes_sum += int(edge_broadcast["total_bytes"])
                 edge_broadcast_epoch_count += 1
-        if args.rank == 0:
-            print(
-                f"Epoch {epoch:04d} | loss={loss_val:.4f} (ema={loss_ema:.4f}) "
-                f"| t={epoch_time:.2f}s "
-                f"(rw={rw_time:.2f}s fwd={fwd_time:.2f}s bwd={bwd_time:.2f}s) "
-                f"| cpu_rss={cpu_rss:.1f}/{cpu_rss_peak:.1f} MiB"
-            )
-            if comm_profile:
-                for line in _format_comm_profile(comm_profile, rw_time + fwd_time + bwd_time):
-                    print(line)
-                for line in _format_edge_cardinality(comm_profile):
-                    print(line)
 
         if epoch % args.eval_every == 0:
             t_eval = time.time()
@@ -763,7 +715,29 @@ def main():
         if sp_world_size > 1:
             dist.barrier(group=sp_group)
 
-    edge_prefetcher.close()
+        epoch_wall_time = time.time() - t_epoch
+        if sp_world_size > 1 and dist.is_initialized():
+            epoch_wall_time_t = torch.tensor(
+                [epoch_wall_time], device=device, dtype=torch.float64
+            )
+            dist.all_reduce(epoch_wall_time_t, op=dist.ReduceOp.MAX, group=sp_group)
+            epoch_wall_time = float(epoch_wall_time_t.item())
+        if epoch > 1:
+            epoch_wall_time_sum += epoch_wall_time
+            epoch_wall_time_count += 1
+
+        if args.rank == 0:
+            print(
+                f"Epoch {epoch:04d} | loss={loss_val:.4f} (ema={loss_ema:.4f}) "
+                f"| t={epoch_wall_time:.2f}s "
+                f"(rw={rw_time:.2f}s fwd={fwd_time:.2f}s bwd={bwd_time:.2f}s) "
+                f"| cpu_rss={cpu_rss:.1f}/{cpu_rss_peak:.1f} MiB"
+            )
+            if comm_profile:
+                for line in _format_comm_profile(comm_profile, rw_time + fwd_time + bwd_time):
+                    print(line)
+                for line in _format_edge_cardinality(comm_profile):
+                    print(line)
 
     if args.rank == 0:
         print(f"\n{'=' * 72}")
@@ -780,6 +754,13 @@ def main():
         _use_rocauc = str(getattr(args, "dataset", "")).lower() == "genius"
         _fmt = (lambda v: f"{v:.4f}") if _use_rocauc else (lambda v: f"{v:.2%}")
         print(f"Done.  Best epoch={best_epoch}  Val={_fmt(best_val)}  Test={_fmt(best_test)}")
+        if epoch_wall_time_count > 0:
+            print(
+                f"Avg epoch wall time (excluding epoch 1): "
+                f"{epoch_wall_time_sum / epoch_wall_time_count:.2f}s"
+            )
+        else:
+            print("Avg epoch wall time (excluding epoch 1): n/a")
         if edge_budget_controller.enabled:
             print(f"Timing: bootstrap={total_bootstrap_time:.2f}s  adjustment={total_adjustment_time:.2f}s")
         print(f"{'=' * 72}")
