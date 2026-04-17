@@ -164,6 +164,26 @@ def load_dataset(dataset_name, root="./dataset", split_id: int = 0):
         val_idx = _mask_to_index(pyg_data.val_mask, split_id=split_id)
         test_idx = _mask_to_index(pyg_data.test_mask, split_id=split_id)
         
+    elif dataset_name == 'snap-patents':
+        import os
+        data_path = os.path.join(root, dataset_name)
+        features = torch.load(f"{data_path}/x.pt", map_location="cpu", weights_only=False)
+        labels = torch.load(f"{data_path}/y.pt", map_location="cpu", weights_only=False).long().view(-1)
+        edge_index = torch.load(f"{data_path}/edge_index.pt", map_location="cpu", weights_only=False)
+        num_nodes = features.shape[0]
+
+        src = edge_index[0].to(torch.long)
+        dst = edge_index[1].to(torch.long)
+        g = dgl.graph((src, dst), num_nodes=num_nodes)
+
+        num_classes = int(labels.max().item()) + 1
+
+        from utils.split_utils import load_default_split
+        split_idx = load_default_split(dataset_name, root, split_id=split_id)
+        train_idx = split_idx['train']
+        val_idx = split_idx['valid']
+        test_idx = split_idx['test']
+
     else:
         raise ValueError(f"Dataset {dataset_name} not supported.")
         
@@ -189,7 +209,7 @@ def main():
     parser = argparse.ArgumentParser(description='GNN Node Classification using DGL')
     parser.add_argument('--dataset', type=str, default='ogbn-arxiv',
                         choices=['cora', 'citeseer', 'pubmed', 'reddit', 'ogbn-arxiv', 'ogbn-products', 
-                                 'roman-empire', 'amazon-ratings', 'minesweeper', 'tolokers', 'questions'],
+                                 'roman-empire', 'amazon-ratings', 'minesweeper', 'tolokers', 'questions', 'snap-patents'],
                         help='Dataset name')
     parser.add_argument('--dataset_dir', type=str, default='./dataset/')
     parser.add_argument('--split_id', type=int, default=0,
@@ -210,6 +230,12 @@ def main():
     parser.add_argument('--fan_out', type=str, default='15,10,5', help='Fan out per layer (comma separated)')
     parser.add_argument('--num_workers', type=int, default=0, help='Number of dataloader workers')
     args = parser.parse_args()
+
+    print("=" * 40)
+    print("Training Arguments:")
+    for k, v in vars(args).items():
+        print(f"  {k}: {v}")
+    print("=" * 40)
 
     device = torch.device(f'cuda:{args.device}' if args.device >= 0 and torch.cuda.is_available() else 'cpu')
     print(f"Training on device: {device}")
@@ -362,6 +388,13 @@ def main():
     print(f"\nOptimization Finished!")
     print(f"Highest Validation Accuracy: {best_val_acc:.4f}")
     print(f"Best Test Accuracy: {best_test_acc:.4f}")
+
+    if torch.cuda.is_available():
+        peak_alloc = torch.cuda.max_memory_allocated()
+        peak_reserved = torch.cuda.max_memory_reserved()
+        alloc_mib = peak_alloc / (1024 ** 2)
+        reserved_mib = peak_reserved / (1024 ** 2)
+        print(f"Peak GPU memory (MiB): allocated={alloc_mib:.2f}, reserved={reserved_mib:.2f}")
 
 
 if __name__ == '__main__':
