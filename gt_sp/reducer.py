@@ -5,6 +5,7 @@ from gt_sp.initialize import (
     get_sequence_parallel_group,
     get_sequence_parallel_src_rank,
 )
+from gt_sp.comm_profiler import profile_call
 
 
 def sync_params_and_buffers(model):
@@ -124,7 +125,17 @@ class GradientReducer:
                 continue
             bucket.flat[start:end].copy_(grad.reshape(-1))
         bucket.flat.div_(self.world_size)
-        dist.all_reduce(bucket.flat, op=dist.ReduceOp.SUM, group=self.group)
+        payload_bytes = int(bucket.flat.numel() * bucket.flat.element_size())
+
+        def _collective():
+            dist.all_reduce(bucket.flat, op=dist.ReduceOp.SUM, group=self.group)
+
+        profile_call(
+            "grad_all_reduce",
+            _collective,
+            device=bucket.flat.device,
+            payload_bytes=payload_bytes,
+        )
 
     def _scatter_bucket(self, bucket: _GradBucket) -> None:
         for param, (start, end) in zip(bucket.params, bucket.ranges):

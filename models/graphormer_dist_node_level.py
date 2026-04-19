@@ -1061,6 +1061,562 @@ class _CommAwareCheckpointer:
         return self._modes[layer_idx]
 
 
+class _MultiTierResourceManager:
+    """Profile-driven multi-tier scheduler for SP graph transformers.
+
+    The ACTIVE plan is expressed only in per-layer actions plus topology
+    caching:
+      - recompute
+      - offload (per-layer save_on_cpu)
+      - keep_mha
+      - retain (normal/full retain)
+
+    multi_tier no longer uses a training-loop-wide save_on_cpu wrap in ACTIVE.
+    If the initial recompute warmup OOMs, the manager falls back to a uniform
+    per-layer offload retry so training can continue.
+    """
+
+    # Tier identifiers — must match Graphormer.forward() branch labels.
+    T0_RECOMPUTE = "recompute"
+    T1_KEEP_MHA  = "keep_mha"
+    T2_OFFLOAD   = "offload"
+    T4_RETAIN    = "retain"
+
+    # State machine values.
+    _DEFERRED = -1
+    _WARMUP_RECOMPUTE = 0
+    _CALIBRATE_OFFLOAD = 1
+    _CALIBRATE_MHA = 2
+    _CALIBRATE_RETAIN = 3
+    _FALLBACK_OFFLOAD = 4
+    _ACTIVE = 5
+
+    def __init__(self, n_layers: int, safety_margin: float = 0.15, deferred: bool = False):
+        self.n_layers = int(n_layers)
+        self.safety_margin = float(safety_margin)
+        self._state = self._DEFERRED if deferred else self._WARMUP_RECOMPUTE
+        self._modes: list = [self.T0_RECOMPUTE] * self.n_layers
+
+        # --- Profile measurements ---
+        self._fwd_live_warmup: int = 0
+        self._fwd_live_offload: int = 0
+        self._fwd_live_mha: int = 0
+        self._fwd_live_retain: int = 0
+
+        self._peak_warmup: int = 0
+        self._peak_fallback_offload: int = 0
+
+        self._t_bwd_recompute: float = 0.0
+        self._t_bwd_offload: float = 0.0
+        self._t_bwd_mha: float = 0.0
+        self._t_bwd_retain: float = 0.0
+
+        self._g_layer_offload: int = 0
+        self._g_layer_mha: int = 0
+        self._g_layer_retain: int = 0
+
+        self._cpu_probe_start: int = 0
+        self._cpu_rss_warmup: int = 0
+        self._cpu_rss_offload: int = 0
+        self._cpu_bytes_offload: int = 0
+
+        # --- Edge/topology info ---
+        self._edge_bytes: int = 0
+        self._t_h2d_edge: float = 0.0
+
+        # --- Final plan ---
+        self._cache_edge: bool = False
+        self._recompute_oom: bool = False
+
+    # ------------------------------------------------------------------
+    # Utilities
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_rank0() -> bool:
+        try:
+            import torch.distributed as _dist
+            return (not _dist.is_initialized()) or _dist.get_rank() == 0
+        except Exception:
+            return True
+
+    @staticmethod
+    def _available_cpu_bytes() -> int:
+        try:
+            import psutil
+            return int(psutil.virtual_memory().available)
+        except Exception:
+            return 16 * (1024 ** 3)  # 16 GiB conservative default
+
+    @staticmethod
+    def _process_rss_bytes() -> int:
+        try:
+            import psutil
+            return int(psutil.Process().memory_info().rss)
+        except Exception:
+            return 0
+
+    def _build_suffix_plan(self, k_offload: int, k_keep_mha: int, k_retain: int) -> list[str]:
+        tiers = [self.T0_RECOMPUTE] * self.n_layers
+        cursor = self.n_layers
+        for _ in range(int(k_retain)):
+            cursor -= 1
+            tiers[cursor] = self.T4_RETAIN
+        for _ in range(int(k_keep_mha)):
+            cursor -= 1
+            tiers[cursor] = self.T1_KEEP_MHA
+        for _ in range(int(k_offload)):
+            cursor -= 1
+            tiers[cursor] = self.T2_OFFLOAD
+        return tiers
+
+    @staticmethod
+    def _count_tiers(modes: list[str]) -> dict[str, int]:
+        counts = {}
+        for mode in modes:
+            counts[mode] = counts.get(mode, 0) + 1
+        return counts
+
+    @staticmethod
+    def _mode_to_code(mode: str) -> int:
+        mapping = {
+            _MultiTierResourceManager.T0_RECOMPUTE: 0,
+            _MultiTierResourceManager.T1_KEEP_MHA: 1,
+            _MultiTierResourceManager.T2_OFFLOAD: 2,
+            _MultiTierResourceManager.T4_RETAIN: 3,
+        }
+        return mapping[mode]
+
+    @staticmethod
+    def _code_to_mode(code: int) -> str:
+        mapping = {
+            0: _MultiTierResourceManager.T0_RECOMPUTE,
+            1: _MultiTierResourceManager.T1_KEEP_MHA,
+            2: _MultiTierResourceManager.T2_OFFLOAD,
+            3: _MultiTierResourceManager.T4_RETAIN,
+        }
+        return mapping[int(code)]
+
+    def _apply_plan(self, cache_topology: bool, tiers: list[str]) -> None:
+        self._cache_edge = bool(cache_topology)
+        self._modes = list(tiers)
+        self._state = self._ACTIVE
+
+    # ------------------------------------------------------------------
+    # Public API for training loop
+    # ------------------------------------------------------------------
+
+    def notify_budget_frozen(self) -> None:
+        """Signal that edge budget is stable; begin profiling."""
+        if self._state != self._DEFERRED:
+            return
+        self._state = self._WARMUP_RECOMPUTE
+        if self._is_rank0():
+            print("[MultiTierManager] Edge budget frozen. Starting WARMUP_RECOMPUTE.")
+
+    def notify_recompute_oom(self) -> None:
+        """Call from the OOM fallback path when WARMUP_RECOMPUTE step OOMs."""
+        if self._state != self._WARMUP_RECOMPUTE:
+            return
+        self._recompute_oom = True
+        self._state = self._FALLBACK_OFFLOAD
+        self._modes = [self.T2_OFFLOAD] * self.n_layers
+        if self._is_rank0():
+            print("[MultiTierManager] RECOMPUTE OOM → pivoting to uniform OFFLOAD fallback.")
+
+    def global_offload_requested(self) -> bool:
+        """multi_tier no longer requests a training-loop-wide save_on_cpu wrap."""
+        return False
+
+    def plan(self, device) -> None:
+        """Set per-layer modes and reset peak stats at the start of each forward."""
+        if not torch.cuda.is_available():
+            return
+        if self._state == self._DEFERRED:
+            self._modes = [self.T0_RECOMPUTE] * self.n_layers
+            return
+        if self._state == self._WARMUP_RECOMPUTE:
+            self._modes = [self.T0_RECOMPUTE] * self.n_layers
+            if self._is_rank0():
+                print(f"[MultiTierManager] WARMUP_RECOMPUTE: all {self.n_layers} layers → recompute")
+        elif self._state == self._CALIBRATE_OFFLOAD:
+            modes = [self.T0_RECOMPUTE] * self.n_layers
+            modes[-1] = self.T2_OFFLOAD
+            self._modes = modes
+            if self._is_rank0():
+                print("[MultiTierManager] CALIBRATE_OFFLOAD: last layer → offload, rest → recompute")
+        elif self._state == self._CALIBRATE_MHA:
+            modes = [self.T0_RECOMPUTE] * self.n_layers
+            modes[-1] = self.T1_KEEP_MHA
+            self._modes = modes
+            if self._is_rank0():
+                print("[MultiTierManager] CALIBRATE_MHA: last layer → keep_mha, rest → recompute")
+        elif self._state == self._CALIBRATE_RETAIN:
+            modes = [self.T0_RECOMPUTE] * self.n_layers
+            modes[-1] = self.T4_RETAIN
+            self._modes = modes
+            if self._is_rank0():
+                print("[MultiTierManager] CALIBRATE_RETAIN: last layer → retain, rest → recompute")
+        elif self._state == self._FALLBACK_OFFLOAD:
+            self._modes = [self.T2_OFFLOAD] * self.n_layers
+            if self._is_rank0():
+                print(f"[MultiTierManager] FALLBACK_OFFLOAD: all {self.n_layers} layers → offload")
+        # ACTIVE: modes already set by _apply_plan(); no-op.
+        if self._state != self._ACTIVE:
+            torch.cuda.reset_peak_memory_stats(device)
+            self._cpu_probe_start = self._process_rss_bytes()
+
+    def record_post_forward_memory(self, device) -> None:
+        """Snapshot live GPU memory after encoder forward, before backward.
+
+        Must be called by Graphormer.forward() after the layer loop.  Records
+        the live activation footprint before backward allocations, enabling
+        accurate per-tier memory measurement.
+        """
+        if not torch.cuda.is_available():
+            return
+        live = torch.cuda.memory_allocated(device)
+        if self._state == self._WARMUP_RECOMPUTE:
+            self._fwd_live_warmup = live
+        elif self._state == self._CALIBRATE_OFFLOAD:
+            self._fwd_live_offload = live
+        elif self._state == self._CALIBRATE_MHA:
+            self._fwd_live_mha = live
+        elif self._state == self._CALIBRATE_RETAIN:
+            self._fwd_live_retain = live
+
+    def notify_step_end(self, device, t_bwd: float = None) -> None:
+        """Advance the state machine after backward + optimizer.step().
+
+        Must be called after optimizer.step() so optimizer state (lazily
+        initialised on the first step) is included in peak measurements.
+        """
+        if not torch.cuda.is_available():
+            return
+        if self._state in (self._DEFERRED, self._ACTIVE):
+            return
+        is_r0 = self._is_rank0()
+        total_gpu = torch.cuda.get_device_properties(device).total_memory
+        cpu_rss_after = max(self._cpu_probe_start, self._process_rss_bytes())
+
+        if self._state == self._WARMUP_RECOMPUTE:
+            self._peak_warmup = torch.cuda.max_memory_allocated(device)
+            self._cpu_rss_warmup = cpu_rss_after
+            if t_bwd is not None:
+                self._t_bwd_recompute = float(t_bwd)
+            self._state = self._CALIBRATE_OFFLOAD
+            if is_r0:
+                print(
+                    f"[MultiTierManager] WARMUP_RECOMPUTE done: "
+                    f"peak={self._peak_warmup/(1024**2):.0f} MiB  "
+                    f"T_bwd={self._t_bwd_recompute*1000:.0f} ms  "
+                    f"(GPU total={total_gpu/(1024**2):.0f} MiB)"
+                )
+
+        elif self._state == self._CALIBRATE_OFFLOAD:
+            if t_bwd is not None:
+                self._t_bwd_offload = float(t_bwd)
+            self._g_layer_offload = self._fwd_live_offload - self._fwd_live_warmup
+            self._cpu_rss_offload = cpu_rss_after
+            self._cpu_bytes_offload = max(self._cpu_rss_offload - self._cpu_rss_warmup, 0)
+            self._state = self._CALIBRATE_MHA
+            if is_r0:
+                print(
+                    f"[MultiTierManager] CALIBRATE_OFFLOAD done: "
+                    f"G_layer^offload={self._g_layer_offload/(1024**2):+.1f} MiB  "
+                    f"CPU^offload≈{self._cpu_bytes_offload/(1024**2):.1f} MiB  "
+                    f"T_bwd={self._t_bwd_offload*1000:.0f} ms"
+                )
+
+        elif self._state == self._CALIBRATE_MHA:
+            if t_bwd is not None:
+                self._t_bwd_mha = float(t_bwd)
+            g_mha = self._fwd_live_mha - self._fwd_live_warmup
+            if g_mha <= 0:
+                g_mha = max(int(self._peak_warmup * 0.10), 1)
+                if is_r0:
+                    print(
+                        f"[MultiTierManager] WARNING: G_layer^mha non-positive; "
+                        f"fallback={g_mha/(1024**2):.1f} MiB"
+                    )
+            self._g_layer_mha = g_mha
+            self._state = self._CALIBRATE_RETAIN
+            if is_r0:
+                print(
+                    f"[MultiTierManager] CALIBRATE_MHA done: "
+                    f"G_layer^mha={self._g_layer_mha/(1024**2):.1f} MiB  "
+                    f"T_bwd={self._t_bwd_mha*1000:.0f} ms"
+                )
+
+        elif self._state == self._CALIBRATE_RETAIN:
+            if t_bwd is not None:
+                self._t_bwd_retain = float(t_bwd)
+            g_retain = self._fwd_live_retain - self._fwd_live_warmup
+            if g_retain <= 0:
+                g_retain = max(int(self._g_layer_mha * 2), 1)
+                if is_r0:
+                    print(
+                        f"[MultiTierManager] WARNING: G_layer^retain non-positive; "
+                        f"fallback={g_retain/(1024**2):.1f} MiB"
+                    )
+            self._g_layer_retain = g_retain
+            if is_r0:
+                print(
+                    f"[MultiTierManager] CALIBRATE_RETAIN done: "
+                    f"G_layer^retain={self._g_layer_retain/(1024**2):.1f} MiB  "
+                    f"T_bwd={self._t_bwd_retain*1000:.0f} ms"
+                )
+            self._run_active_plan(total_gpu)
+
+        elif self._state == self._FALLBACK_OFFLOAD:
+            if t_bwd is not None:
+                self._t_bwd_offload = float(t_bwd)
+            self._peak_fallback_offload = torch.cuda.max_memory_allocated(device)
+            self._cpu_rss_offload = cpu_rss_after
+            self._cpu_bytes_offload = max(self._cpu_rss_offload - self._cpu_rss_warmup, 0)
+            if is_r0:
+                print(
+                    f"[MultiTierManager] FALLBACK_OFFLOAD done: "
+                    f"peak={self._peak_fallback_offload/(1024**2):.0f} MiB  "
+                    f"T_bwd={self._t_bwd_offload*1000:.0f} ms  "
+                    f"CPU^offload≈{self._cpu_bytes_offload/(1024**2):.1f} MiB"
+                )
+            self._run_fallback_plan(total_gpu)
+
+    # ------------------------------------------------------------------
+    # Planner
+    # ------------------------------------------------------------------
+
+    def _run_active_plan(self, total_gpu: int, cpu_budget: int | None = None) -> None:
+        """Enumerate topology-cache and suffix-structured R/O/K/N plans."""
+        if self.n_layers <= 0:
+            self._modes = []
+            self._cache_edge = False
+            self._state = self._ACTIVE
+            return
+
+        gpu_budget = max(int(total_gpu * (1.0 - self.safety_margin)), self._peak_warmup)
+        if cpu_budget is None:
+            cpu_budget = int(self._available_cpu_bytes() * (1.0 - self.safety_margin))
+
+        l_count = self.n_layers
+        t_r = self._t_bwd_recompute / l_count if self._t_bwd_recompute > 0 else 0.0
+        t_o = (
+            max(t_r + (self._t_bwd_offload - self._t_bwd_recompute), 1e-9)
+            if self._t_bwd_offload > 0
+            else float("inf")
+        )
+        t_k = max(t_r + (self._t_bwd_mha - self._t_bwd_recompute), 1e-9)
+        t_n = max(t_r + (self._t_bwd_retain - self._t_bwd_recompute), 1e-9)
+
+        g_o = self._g_layer_offload
+        g_k = max(self._g_layer_mha, 1)
+        g_n = max(self._g_layer_retain, g_k)
+        c_o = max(self._cpu_bytes_offload, 0)
+
+        best_time = float("inf")
+        best_cache = False
+        best_tiers = [self.T0_RECOMPUTE] * l_count
+
+        for cache_topology in (False, True):
+            edge_peak = self._edge_bytes if cache_topology else 0
+            edge_time = 0.0 if cache_topology else self._t_h2d_edge
+            if self._peak_warmup + edge_peak > gpu_budget:
+                continue
+
+            for k_retain in range(l_count + 1):
+                for k_keep_mha in range(l_count - k_retain + 1):
+                    max_offload = l_count - k_retain - k_keep_mha
+                    for k_offload in range(max_offload + 1):
+                        k_recompute = l_count - k_retain - k_keep_mha - k_offload
+                        peak_est = (
+                            self._peak_warmup
+                            + edge_peak
+                            + k_offload * g_o
+                            + k_keep_mha * g_k
+                            + k_retain * g_n
+                        )
+                        if peak_est > gpu_budget:
+                            continue
+
+                        cpu_est = k_offload * c_o
+                        if cpu_est > cpu_budget:
+                            continue
+
+                        t_est = (
+                            k_recompute * t_r
+                            + k_offload * t_o
+                            + k_keep_mha * t_k
+                            + k_retain * t_n
+                            + edge_time
+                        )
+                        if t_est >= best_time:
+                            continue
+
+                        best_time = t_est
+                        best_cache = cache_topology
+                        best_tiers = self._build_suffix_plan(
+                            k_offload=k_offload,
+                            k_keep_mha=k_keep_mha,
+                            k_retain=k_retain,
+                        )
+
+        self._apply_plan(best_cache, best_tiers)
+
+        if self._is_rank0():
+            print(
+                f"[MultiTierManager] ACTIVE plan: cache_topology={best_cache}  "
+                f"tiers={self._count_tiers(best_tiers)}  "
+                f"est_T_bwd={best_time*1000:.0f} ms"
+            )
+
+    def _run_fallback_plan(self, total_gpu: int) -> None:
+        """Uniform-offload fallback after recompute warmup OOM."""
+        gpu_budget = max(
+            int(total_gpu * (1.0 - self.safety_margin)),
+            self._peak_fallback_offload,
+        )
+        cache_topology = (
+            self._peak_fallback_offload + self._edge_bytes <= gpu_budget
+            and self._t_h2d_edge > 0.0
+        )
+        self._apply_plan(cache_topology, [self.T2_OFFLOAD] * self.n_layers)
+
+        if self._is_rank0():
+            print(
+                f"[MultiTierManager] ACTIVE fallback plan: cache_topology={cache_topology}  "
+                f"tiers={self._count_tiers(self._modes)}  "
+                f"est_T_bwd={self._t_bwd_offload*1000:.0f} ms"
+            )
+
+    def sync_active_plan(self, device, total_gpu: int, group=None, src_rank: int = 0) -> None:
+        """Synchronise profile stats, then broadcast one global ACTIVE plan.
+
+        All SP ranks must execute the same layer-wise plan, otherwise backward
+        collectives (e.g. A2A) can diverge and deadlock. We therefore aggregate
+        probe statistics with worst-case reductions, let one source rank build
+        a single plan, then broadcast the encoded plan to every rank.
+        """
+        if self._state != self._ACTIVE:
+            return
+
+        try:
+            import torch.distributed as _dist
+        except Exception:
+            return
+
+        if group is None or (not _dist.is_initialized()):
+            return
+
+        stats_max = torch.tensor(
+            [
+                float(self._peak_warmup),
+                float(self._peak_fallback_offload),
+                float(self._t_bwd_recompute),
+                float(self._t_bwd_offload),
+                float(self._t_bwd_mha),
+                float(self._t_bwd_retain),
+                float(self._g_layer_offload),
+                float(self._g_layer_mha),
+                float(self._g_layer_retain),
+                float(self._cpu_bytes_offload),
+                float(self._edge_bytes),
+                float(self._t_h2d_edge),
+                float(int(self._recompute_oom)),
+            ],
+            device=device,
+            dtype=torch.float64,
+        )
+        _dist.all_reduce(stats_max, op=_dist.ReduceOp.MAX, group=group)
+
+        cpu_avail_t = torch.tensor(
+            [float(self._available_cpu_bytes())],
+            device=device,
+            dtype=torch.float64,
+        )
+        _dist.all_reduce(cpu_avail_t, op=_dist.ReduceOp.MIN, group=group)
+        cpu_budget = int(float(cpu_avail_t.item()) * (1.0 - self.safety_margin))
+
+        self._peak_warmup = int(stats_max[0].item())
+        self._peak_fallback_offload = int(stats_max[1].item())
+        self._t_bwd_recompute = float(stats_max[2].item())
+        self._t_bwd_offload = float(stats_max[3].item())
+        self._t_bwd_mha = float(stats_max[4].item())
+        self._t_bwd_retain = float(stats_max[5].item())
+        self._g_layer_offload = int(stats_max[6].item())
+        self._g_layer_mha = int(stats_max[7].item())
+        self._g_layer_retain = int(stats_max[8].item())
+        self._cpu_bytes_offload = int(stats_max[9].item())
+        self._edge_bytes = int(stats_max[10].item())
+        self._t_h2d_edge = float(stats_max[11].item())
+        self._recompute_oom = bool(int(stats_max[12].item()))
+
+        if _dist.get_rank() == src_rank:
+            if self._recompute_oom:
+                self._run_fallback_plan(total_gpu)
+            else:
+                self._run_active_plan(total_gpu, cpu_budget=cpu_budget)
+
+        plan_tensor = torch.zeros(self.n_layers + 1, device=device, dtype=torch.int64)
+        if _dist.get_rank() == src_rank:
+            plan_tensor[0] = int(self._cache_edge)
+            for idx, mode in enumerate(self._modes):
+                plan_tensor[idx + 1] = self._mode_to_code(mode)
+        _dist.broadcast(plan_tensor, src=src_rank, group=group)
+
+        cache_topology = bool(int(plan_tensor[0].item()))
+        tiers = [self._code_to_mode(code.item()) for code in plan_tensor[1:]]
+        self._apply_plan(cache_topology, tiers)
+
+        if self._is_rank0():
+            print(
+                f"[MultiTierManager] Synced plan: cache_topology={cache_topology}  "
+                f"tiers={self._count_tiers(tiers)}"
+            )
+
+    # ------------------------------------------------------------------
+    # Existing API surface (compatibility with training loop)
+    # ------------------------------------------------------------------
+
+    def force_uniform_tier(self, tier: str) -> None:
+        """Force all layers to a single tier.  Called by OOM fallback path."""
+        tier = str(tier)
+        if tier not in (self.T0_RECOMPUTE, self.T2_OFFLOAD, self.T4_RETAIN):
+            raise ValueError(f"Unsupported multi_tier tier: {tier!r}")
+        self._modes = [tier] * self.n_layers
+        if self._is_rank0():
+            print(f"[MultiTierManager] All {self.n_layers} layers → {tier!r}")
+
+    def current_uniform_tier(self):
+        if not self._modes:
+            return None
+        first = self._modes[0]
+        return first if all(m == first for m in self._modes) else None
+
+    def mode(self, layer_idx: int) -> str:
+        return self._modes[layer_idx]
+
+    def is_active(self) -> bool:
+        return self._state == self._ACTIVE
+
+    @property
+    def cache_edge(self) -> bool:
+        return self._cache_edge
+
+    def override_cache_decision(self, cache: bool) -> None:
+        """Apply the cross-rank-synced topology cache decision."""
+        if self._state != self._ACTIVE:
+            return
+        self._cache_edge = cache
+        if self._is_rank0():
+            print(f"[MultiTierManager] Topology cache (post-sync): {cache}")
+
+    def set_edge_info(self, edge_bytes: int, t_h2d: float) -> None:
+        """Register edge_index size and H2D time for joint topology decision."""
+        self._edge_bytes  = max(0, int(edge_bytes))
+        self._t_h2d_edge  = max(0.0, float(t_h2d))
+
+
 class Graphormer(nn.Module):
     """Graphormer for node-level task: one node - one token
         global token index: 0
@@ -1110,7 +1666,7 @@ class Graphormer(nn.Module):
         self.attn_bias_proj = nn.Linear(attn_bias_dim, num_heads, bias=False)
         self.activation_checkpoint = False
         self.activation_checkpoint_mode = "none"
-        self._comm_ckpt: _CommAwareCheckpointer | None = None
+        self._comm_ckpt = None  # _CommAwareCheckpointer | _MultiTierResourceManager | None
         self.apply(lambda module: init_params(module, n_layers=n_layers))
 
     @staticmethod
@@ -1198,17 +1754,20 @@ class Graphormer(nn.Module):
             "ffn_only": "ffn_only",
             "adaptive": "comm_aware",
             "comm_aware": "comm_aware",
+            "multi_tier": "multi_tier",
         }
         resolved_mode = mode_aliases.get(mode)
         if resolved_mode is None:
             raise ValueError(
-                f"activation_checkpoint_mode must be 'all', 'ffn_only', or 'adaptive', got {mode!r}"
+                f"activation_checkpoint_mode must be 'all', 'ffn_only', 'adaptive', or 'multi_tier', got {mode!r}"
             )
         enabled = bool(enabled) and resolved_mode != "none"
         self.activation_checkpoint = enabled
         self.activation_checkpoint_mode = resolved_mode if enabled else "none"
         if self.activation_checkpoint_mode == "comm_aware":
             self._comm_ckpt = _CommAwareCheckpointer(len(self.layers), deferred=deferred)
+        elif self.activation_checkpoint_mode == "multi_tier":
+            self._comm_ckpt = _MultiTierResourceManager(len(self.layers), deferred=deferred)
         else:
             self._comm_ckpt = None
 
@@ -1310,7 +1869,7 @@ class Graphormer(nn.Module):
         # no-op (ACTIVE). Modes are set by notify_step_end() after each optimizer
         # step, where the true peak — including optimizer state and all transient
         # allocations — has been fully recorded.
-        if use_ckpt and ckpt_mode == "comm_aware" and self._comm_ckpt is not None:
+        if use_ckpt and ckpt_mode in ("comm_aware", "multi_tier") and self._comm_ckpt is not None:
             self._comm_ckpt.plan(output.device)
 
         for i, enc_layer in enumerate(self.layers):
@@ -1318,13 +1877,22 @@ class Graphormer(nn.Module):
                 output = enc_layer(output, attn_bias=graph_attn_bias, edge_index=edge_index, attn_type=attn_type)
                 continue
 
-            # Resolve per-layer mode: comm_aware assigns each layer independently.
-            if ckpt_mode == "comm_aware" and self._comm_ckpt is not None:
+            # Resolve per-layer mode: comm_aware / multi_tier assign each layer independently.
+            if ckpt_mode in ("comm_aware", "multi_tier") and self._comm_ckpt is not None:
                 layer_mode = self._comm_ckpt.mode(i)
             else:
                 layer_mode = ckpt_mode  # "layer" or "ffn_only" applies uniformly
 
-            if layer_mode in ("keep_mha", "ffn_only"):
+            if layer_mode == "offload":
+                # multi_tier T2: whole layer saved activations go to pinned CPU.
+                def _full_offload(h, layer=enc_layer):
+                    return layer(h, attn_bias=graph_attn_bias, edge_index=edge_index, attn_type=attn_type)
+                with torch.autograd.graph.save_on_cpu(pin_memory=True):
+                    output = _full_offload(output)
+            elif layer_mode == "retain":
+                # multi_tier T4: no checkpointing, no offload — full GPU retention.
+                output = enc_layer(output, attn_bias=graph_attn_bias, edge_index=edge_index, attn_type=attn_type)
+            elif layer_mode in ("keep_mha", "ffn_only"):
                 # MHA runs without checkpointing: autograd retains post-A2A Q/K/V
                 # and sparse-attention outputs, so backward never re-executes any
                 # A2A collective or the graph-edge scatter-gather.
@@ -1341,7 +1909,7 @@ class Graphormer(nn.Module):
                     return h + y
                 output = checkpoint(_ffn, output)
             else:
-                # "full_layer" / "layer": original behaviour.
+                # "full_layer" / "layer" / "recompute": original whole-layer ckpt.
                 def _full(h, layer=enc_layer):
                     return layer(h, attn_bias=graph_attn_bias, edge_index=edge_index, attn_type=attn_type)
                 output = checkpoint(_full, output)
@@ -1349,7 +1917,7 @@ class Graphormer(nn.Module):
         # Snapshot live memory right after the encoder loop, before backward.
         # All keep_mha autograd tensors are live here; this is the measurement
         # point for M_layer calibration.
-        if use_ckpt and ckpt_mode == "comm_aware" and self._comm_ckpt is not None:
+        if use_ckpt and ckpt_mode in ("comm_aware", "multi_tier") and self._comm_ckpt is not None:
             self._comm_ckpt.record_post_forward_memory(output.device)
 
         output = self.final_ln(output)

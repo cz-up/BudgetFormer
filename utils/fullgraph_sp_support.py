@@ -307,9 +307,10 @@ def _build_model(args, feature, y, device):
         _ckpt_mode = getattr(args, "activation_checkpoint_mode", None)
         # Defer checkpoint calibration when adaptive_edge_budget is also active:
         # peak_warmup measured before the budget stabilises is too small and
-        # produces wrong keep_mha layer counts.
+        # produces wrong keep_mha layer counts.  multi_tier always starts
+        # DEFERRED since its WARMUP/CALIBRATE phases use the same signal.
         _ckpt_deferred = (
-            _ckpt_mode == "adaptive"
+            _ckpt_mode in ("adaptive", "multi_tier")
             and _adaptive_edge_budget_enabled(args)
         )
         model.set_activation_checkpoint(mode=_ckpt_mode, deferred=_ckpt_deferred)
@@ -1617,8 +1618,6 @@ def _build_merged_edges(args, edge_index_global, num_nodes, final_device, rw_dev
         )
         if isinstance(rw_heads, list):
             rw_heads = _merge_edge_index_list(rw_heads)
-        if rw_heads is not None and rw_heads.device != final_torch_device:
-            rw_heads = rw_heads.to(final_torch_device)
     rw_heads = _resolve_rw_edges_for_state(
         args,
         rw_heads,
@@ -1626,6 +1625,8 @@ def _build_merged_edges(args, edge_index_global, num_nodes, final_device, rw_dev
         edge_budget_state=edge_budget_state,
         adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
     )
+    if rw_heads is not None and rw_heads.device != final_torch_device:
+        rw_heads = rw_heads.to(final_torch_device)
     record_scalar("edge_rw_edges", int(rw_heads.size(1)) if rw_heads is not None else 0, reduce="max")
     if real_edges is not None:
         parts.append(real_edges)

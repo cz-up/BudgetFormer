@@ -189,7 +189,7 @@ def add_node_fullgraph_sp_args(parser, defaults=None):
         "--activation_checkpoint_mode",
         type=str,
         default=defaults.get("activation_checkpoint_mode"),
-        choices=["all", "ffn_only", "adaptive"],
+        choices=["all", "ffn_only", "adaptive", "multi_tier"],
         help=(
             "activation checkpoint mode: "
             "'all' checkpoints the full EncoderLayer; "
@@ -197,7 +197,11 @@ def add_node_fullgraph_sp_args(parser, defaults=None):
             "eliminate A2A recomputation from backward (faster backward, higher peak memory); "
             "'adaptive' dynamically decides per layer at each forward pass — layers are "
             "assigned 'keep_mha' greedily from the last layer inward until GPU free memory "
-            "is exhausted, adapting to runtime memory pressure from edge sampling etc."
+            "is exhausted, adapting to runtime memory pressure from edge sampling etc.; "
+            "'multi_tier' uses a four-tier scheduler (recompute / offload to pinned CPU / "
+            "ffn-only checkpoint / retain on GPU) with fail-fast-recover fallback: starts "
+            "uniformly at recompute while edge budget is still exploring, and switches to "
+            "CPU offload on GPU OOM."
         ),
     )
     parser.add_argument(
@@ -208,10 +212,23 @@ def add_node_fullgraph_sp_args(parser, defaults=None):
         help="mixed precision dtype for model forward: none|bf16|fp16",
     )
     parser.add_argument(
+        "--activation_cpu_offload",
+        action="store_true",
+        default=defaults.get("activation_cpu_offload", False),
+        help=(
+            "offload activations saved for backward to pinned CPU memory during forward and "
+            "stream them back during backward (torch.autograd.graph.save_on_cpu); trades CPU "
+            "RAM + PCIe traffic for reduced peak GPU memory"
+        ),
+    )
+    parser.add_argument(
         "--profile_sp_comm",
         action="store_true",
         default=defaults.get("profile_sp_comm", False),
-        help="profile SeqAllToAll and full-graph edge broadcast communication time",
+        help=(
+            "profile SeqAllToAll and full-graph edge broadcast communication time; "
+            "also enable CUDA-synchronized rw/fwd/bwd/opt step timers for accurate wall time"
+        ),
     )
     parser.add_argument(
         "--random_edge_blocks",
@@ -341,7 +358,7 @@ def _normalize_checkpoint_args(args):
     if checkpoint_mode is None:
         return
     checkpoint_mode = str(checkpoint_mode).lower()
-    if checkpoint_mode not in {"all", "ffn_only", "adaptive"}:
+    if checkpoint_mode not in {"all", "ffn_only", "adaptive", "multi_tier"}:
         raise ValueError(f"Unsupported activation_checkpoint_mode: {checkpoint_mode}")
     args.activation_checkpoint_mode = checkpoint_mode
 

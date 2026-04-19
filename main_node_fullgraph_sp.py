@@ -10,6 +10,8 @@ Architecture:
 """
 
 import argparse
+import contextlib
+import gc
 import os
 import time
 
@@ -76,6 +78,7 @@ def _format_comm_profile(summary, train_time_s: float):
     ordered = (
         "seq_all_to_all_fwd",
         "seq_all_to_all_bwd",
+        "grad_all_reduce",
         "edge_broadcast",
         "edge_build_local",
         "edge_real_sample",
@@ -163,6 +166,20 @@ def _aggregate_comm_profile(summary):
     return merged
 
 
+def _should_sync_step_timers(profile_sp_comm: bool, device: str) -> bool:
+    return bool(profile_sp_comm) and torch.cuda.is_available() and torch.device(device).type == "cuda"
+
+
+def _time_step_block(fn, *, device: str, synchronize_cuda: bool = False):
+    if synchronize_cuda:
+        torch.cuda.synchronize(device)
+    t0 = time.perf_counter()
+    result = fn()
+    if synchronize_cuda:
+        torch.cuda.synchronize(device)
+    return result, time.perf_counter() - t0
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Full-Graph Node-Level Training with Sequence Parallel."
@@ -194,7 +211,9 @@ def main():
     amp_dtype = _resolve_amp_dtype(args)
     rw_device = resolve_edge_build_device(args, device)
     _set_seed(args.seed)
-    enable_comm_profiler(bool(getattr(args, "profile_sp_comm", False)))
+    profile_sp_comm = bool(getattr(args, "profile_sp_comm", False))
+    precise_step_timing = _should_sync_step_timers(profile_sp_comm, device)
+    enable_comm_profiler(profile_sp_comm)
 
     if args.rank == 0:
         os.makedirs(args.model_dir, exist_ok=True)
@@ -334,6 +353,7 @@ def main():
     #   GPU memory ≥ edge_bytes, else fall back to broadcast path.
     # ------------------------------------------------------------------
     _is_adaptive_ckpt = getattr(args, "activation_checkpoint_mode", None) == "adaptive"
+    _is_multi_tier = getattr(args, "activation_checkpoint_mode", None) == "multi_tier"
     edge_index_gpu_cached = False
     _adaptive_edge_decision_done = True  # True = no deferred work needed
 
@@ -343,6 +363,25 @@ def main():
             print(
                 "[edge-cache] Disabled: edge_build_device=cpu keeps real-edge sampling on CPU, "
                 "so edge_index_global will not be cached on GPU."
+            )
+    elif _is_multi_tier:
+        # ---- multi_tier: measure t_h2d, register with planner, defer --------
+        # The _MultiTierResourceManager jointly decides topology cache vs
+        # per-layer tier allocation after profiling.  We must not cache here:
+        # an early cache would consume HBM before the planner can account for
+        # it, making its budget estimate incorrect.
+        _t_h2d = _measure_edge_h2d_time(edge_index_global, device)
+        _edge_bytes_for_cache = edge_index_global.numel() * edge_index_global.element_size()
+        _mt_ckpt_pre = getattr(model, "_comm_ckpt", None)
+        if _mt_ckpt_pre is not None:
+            _mt_ckpt_pre.set_edge_info(_edge_bytes_for_cache, _t_h2d)
+        if not getattr(args, "force_edge_broadcast", False):
+            args.force_edge_broadcast = True
+        if args.rank == 0:
+            print(
+                f"[edge-cache] multi_tier mode: t_h2d={_t_h2d * 1000:.1f} ms, "
+                f"edge={_edge_bytes_for_cache / (1024 ** 2):.1f} MiB. "
+                "Cache decision deferred to after planner calibration."
             )
     elif not _is_adaptive_ckpt:
         # ---- Non-adaptive: simple memory-check path ----------------------
@@ -380,7 +419,7 @@ def main():
                         "force_edge_broadcast enabled to avoid per-epoch H2D transfers."
                     )
     else:
-        # ---- Adaptive: measure t_h2d, register with checkpointer, defer --
+        # ---- Adaptive (comm_aware): measure t_h2d, register, defer ----------
         _t_h2d = _measure_edge_h2d_time(edge_index_global, device)
         _edge_bytes_for_cache = edge_index_global.numel() * edge_index_global.element_size()
         _comm_ckpt = getattr(model, "_comm_ckpt", None)
@@ -408,6 +447,7 @@ def main():
         print(f"  Force edge broadcast: {int(bool(getattr(args, 'force_edge_broadcast', False)))}")
         print(f"  Edge index GPU cached: {int(edge_index_gpu_cached)}")
         print(f"  AMP dtype: {args.amp_dtype}")
+        print(f"  Activation CPU offload: {int(bool(getattr(args, 'activation_cpu_offload', False)))}")
         print(
             f"  Random edge blocks: {int(_random_block_sampling_enabled(args, adaptive_edge_budget_cfg))} "
             f"(max_total={adaptive_edge_budget_cfg.max_total_edges_per_query})"
@@ -444,11 +484,13 @@ def main():
     edge_broadcast_ms_sum = 0.0
     edge_broadcast_bytes_sum = 0
     edge_broadcast_epoch_count = 0
-    # For adaptive checkpoint + adaptive edge budget: track whether we have
-    # already notified the checkpointer that the edge budget is frozen.
+    # Track whether we have applied the post-ACTIVE topology decision.
+    _multi_tier_decision_done = not _is_multi_tier  # True = no deferred work needed
+    # For adaptive/multi_tier checkpoint + adaptive edge budget: track whether we
+    # have already notified the checkpointer that the edge budget is frozen.
     # For all other cases (no deferred calibration), treat as already done.
     _budget_frozen_notified = not (
-        _is_adaptive_ckpt and _adaptive_edge_budget_enabled(args)
+        (_is_adaptive_ckpt or _is_multi_tier) and _adaptive_edge_budget_enabled(args)
     )
 
     cached_edge_index = None
@@ -473,15 +515,14 @@ def main():
 
     for epoch in range(1, args.epochs + 1):
         t_epoch = time.time()
-        if getattr(args, "profile_sp_comm", False):
+        if profile_sp_comm:
             reset_comm_profiler()
         model.train()
         optimizer.zero_grad(set_to_none=True)
 
-        t_rw = time.time()
-        if cached_edge_index is not None:
-            edge_index_rw = cached_edge_index
-        else:
+        def _build_edges_for_epoch():
+            if cached_edge_index is not None:
+                return cached_edge_index
             if use_epoch_seed:
                 if epoch <= adaptive_edge_budget_cfg.static_seed_epochs:
                     edge_seed = args.seed
@@ -489,7 +530,7 @@ def main():
                     edge_seed = args.seed + epoch
             else:
                 edge_seed = None
-            edge_index_rw = _build_attention_edges(
+            return _build_attention_edges(
                 args,
                 edge_index_global,
                 num_nodes,
@@ -503,39 +544,157 @@ def main():
                 edge_budget_state=edge_budget_controller.current_state(),
                 adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
             )
-        rw_time = time.time() - t_rw
+        edge_index_rw, rw_time = _time_step_block(
+            _build_edges_for_epoch,
+            device=device,
+            synchronize_cuda=precise_step_timing,
+        )
 
-        t_fwd = time.time()
-        with _autocast_context(device, amp_dtype):
-            out_local = model(x_local, None, edge_index_rw, attn_type=args.attn_type)
-            out_rows = int(out_local.size(0))
-            local_y_eff = local_y[:out_rows]
-            valid_train_mask = (local_train_idx >= 0) & (local_train_idx < out_rows)
-            local_train_idx_eff = local_train_idx[valid_train_mask]
-            if local_train_idx_eff.numel() > 0:
-                loss = F.nll_loss(
-                    out_local.index_select(0, local_train_idx_eff),
-                    local_y_eff.index_select(0, local_train_idx_eff).long(),
-                )
-            else:
-                loss = out_local.sum() * 0.0
-        fwd_time = time.time() - t_fwd
+        def _forward_step():
+            # multi_tier now expresses offload only as a per-layer action inside
+            # Graphormer.forward(); the training loop keeps global save_on_cpu
+            # for non-multi_tier modes only.
+            _global_offload_enabled = (
+                bool(getattr(args, "activation_cpu_offload", False))
+                and not _is_multi_tier
+            )
+            offload_ctx = (
+                torch.autograd.graph.save_on_cpu(pin_memory=True)
+                if _global_offload_enabled
+                else contextlib.nullcontext()
+            )
+            with _autocast_context(device, amp_dtype), offload_ctx:
+                out_local = model(x_local, None, edge_index_rw, attn_type=args.attn_type)
+                out_rows = int(out_local.size(0))
+                local_y_eff = local_y[:out_rows]
+                valid_train_mask = (local_train_idx >= 0) & (local_train_idx < out_rows)
+                local_train_idx_eff = local_train_idx[valid_train_mask]
+                if local_train_idx_eff.numel() > 0:
+                    loss = F.nll_loss(
+                        out_local.index_select(0, local_train_idx_eff),
+                        local_y_eff.index_select(0, local_train_idx_eff).long(),
+                    )
+                else:
+                    loss = out_local.sum() * 0.0
+            return out_local, out_rows, local_y_eff, valid_train_mask, local_train_idx_eff, loss
 
-        t_bwd = time.time()
-        grad_reducer.prepare_backward()
-        if scaler.is_enabled():
-            scaler.scale(loss).backward()
-        else:
-            loss.backward()
-        grad_reducer.finalize_backward()
-        bwd_time = time.time() - t_bwd
+        def _run_fwd_bwd_opt():
+            fwd_result, fwd_t = _time_step_block(
+                _forward_step,
+                device=device,
+                synchronize_cuda=precise_step_timing,
+            )
+            (
+                out_local_,
+                out_rows_,
+                local_y_eff_,
+                valid_train_mask_,
+                local_train_idx_eff_,
+                loss_,
+            ) = fwd_result
 
-        if scaler.is_enabled():
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            optimizer.step()
-        lr_scheduler.step()
+            def _autograd_backward_step():
+                grad_reducer.prepare_backward()
+                if scaler.is_enabled():
+                    scaler.scale(loss_).backward()
+                else:
+                    loss_.backward()
+            _, autograd_bwd_t = _time_step_block(
+                _autograd_backward_step,
+                device=device,
+                synchronize_cuda=precise_step_timing,
+            )
+
+            _, grad_sync_t = _time_step_block(
+                lambda: grad_reducer.finalize_backward(),
+                device=device,
+                synchronize_cuda=precise_step_timing,
+            )
+            bwd_t = autograd_bwd_t + grad_sync_t
+
+            def _optimizer_step():
+                if scaler.is_enabled():
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+                lr_scheduler.step()
+            _, opt_t = _time_step_block(
+                _optimizer_step,
+                device=device,
+                synchronize_cuda=precise_step_timing,
+            )
+            return (
+                out_local_,
+                out_rows_,
+                local_y_eff_,
+                valid_train_mask_,
+                local_train_idx_eff_,
+                loss_,
+                fwd_t,
+                bwd_t,
+                opt_t,
+            )
+
+        def _sp_any_oom(local_flag: bool) -> bool:
+            if sp_world_size > 1 and dist.is_initialized():
+                t = torch.tensor([int(local_flag)], device=device, dtype=torch.long)
+                dist.all_reduce(t, op=dist.ReduceOp.MAX, group=sp_group)
+                return bool(t.item())
+            return bool(local_flag)
+
+        def _multi_tier_manager():
+            mgr = getattr(model, "_comm_ckpt", None)
+            if mgr is None:
+                return None
+            if getattr(args, "activation_checkpoint_mode", None) != "multi_tier":
+                return None
+            return mgr
+
+        _attempt = 0
+        while True:
+            local_oom = False
+            try:
+                (
+                    out_local,
+                    out_rows,
+                    local_y_eff,
+                    valid_train_mask,
+                    local_train_idx_eff,
+                    loss,
+                    fwd_time,
+                    bwd_time,
+                    opt_time,
+                ) = _run_fwd_bwd_opt()
+            except torch.cuda.OutOfMemoryError:
+                local_oom = True
+            # Every rank must vote on OOM status even if it didn't OOM locally,
+            # otherwise non-OOM ranks move on and the collective in the retry
+            # attempt deadlocks.
+            if _sp_any_oom(local_oom):
+                mgr = _multi_tier_manager()
+                if mgr is None or _attempt >= 1 or mgr.current_uniform_tier() != mgr.T0_RECOMPUTE:
+                    # No fallback available: already tried OFFLOAD, or not in
+                    # multi_tier mode at all.  Re-raise on the rank that OOMed,
+                    # and raise a clean abort on the others.
+                    if local_oom:
+                        raise
+                    raise RuntimeError(
+                        "multi_tier fallback exhausted: peer rank reported OOM "
+                        "after tier switch to OFFLOAD; aborting."
+                    )
+                optimizer.zero_grad(set_to_none=True)
+                torch.cuda.empty_cache()
+                gc.collect()
+                # Notify the planner so it pivots to the uniform offload
+                # fallback path for the retry step.
+                mgr.notify_recompute_oom()
+                mgr.force_uniform_tier(mgr.T2_OFFLOAD)
+                _attempt += 1
+                if args.rank == 0:
+                    print("[multi_tier] GPU OOM on RECOMPUTE tier; switching to OFFLOAD and retrying step.")
+                continue
+            break  # no OOM → proceed
 
         # Notify comm-aware checkpointer that this step is complete.
         # Must happen after optimizer.step() so that optimizer state (lazily
@@ -600,6 +759,55 @@ def main():
                         )
                 _cuda_empty_cache(args)
 
+        # multi_tier: apply the topology-cache decision once ACTIVE.
+        # Runs exactly once, after the planner finishes its last probe step.
+        # Mirrors the adaptive-checkpoint sync pattern above but serves the
+        # _MultiTierResourceManager instead of _CommAwareCheckpointer.
+        if _is_multi_tier and not _multi_tier_decision_done:
+            _mt_ckpt = getattr(model, "_comm_ckpt", None)
+            if _mt_ckpt is not None and _mt_ckpt.is_active():
+                _multi_tier_decision_done = True
+                if sp_world_size > 1 and dist.is_initialized():
+                    _mt_ckpt.sync_active_plan(
+                        device=device,
+                        total_gpu=torch.cuda.get_device_properties(device).total_memory,
+                        group=sp_group,
+                        src_rank=sp_src_rank,
+                    )
+                _mt_should_cache = int(_mt_ckpt.cache_edge)
+                if _mt_should_cache:
+                    _cuda_empty_cache(args)
+                    _ei_mt, _ei_mt_ok = _try_cache_edge_index_on_gpu(
+                        edge_index_global, device, rank=args.rank
+                    )
+                    if _ei_mt_ok:
+                        edge_index_global = _ei_mt
+                        edge_index_gpu_cached = True
+                        if args.rank == 0:
+                            _mib = (
+                                edge_index_global.numel()
+                                * edge_index_global.element_size()
+                                / (1024 ** 2)
+                            )
+                            print(
+                                f"[multi_tier] edge_index_global cached on GPU "
+                                f"({_mib:.1f} MiB). Rank-local build active."
+                            )
+                    else:
+                        if not getattr(args, "force_edge_broadcast", False):
+                            args.force_edge_broadcast = True
+                        if args.rank == 0:
+                            print(
+                                "[multi_tier] OOM caching edge_index; "
+                                "falling back to broadcast path."
+                            )
+                else:
+                    if not getattr(args, "force_edge_broadcast", False):
+                        args.force_edge_broadcast = True
+                    if args.rank == 0:
+                        print("[multi_tier] Topology decision: no cache; force_edge_broadcast enabled.")
+                _cuda_empty_cache(args)
+
         loss_val = loss.item()
         loss_ema = loss_val if loss_ema is None else 0.9 * loss_ema + 0.1 * loss_val
 
@@ -610,7 +818,7 @@ def main():
         cpu_rss = _get_process_rss_mib()
         cpu_rss_peak = _get_process_peak_rss_mib()
         comm_profile = None
-        if getattr(args, "profile_sp_comm", False):
+        if profile_sp_comm:
             comm_profile = _aggregate_comm_profile(get_comm_profile_summary(reset=True))
             edge_broadcast = comm_profile.get("edge_broadcast") if comm_profile else None
             if edge_broadcast and edge_broadcast.get("kind", "timing") == "timing":
@@ -727,10 +935,16 @@ def main():
             epoch_wall_time_count += 1
 
         if args.rank == 0:
+            timer_fields = f"rw={rw_time:.2f}s fwd={fwd_time:.2f}s bwd={bwd_time:.2f}s"
+            if profile_sp_comm:
+                timer_fields += (
+                    f" (autograd={autograd_bwd_time:.2f}s grad_sync={grad_sync_time:.2f}s)"
+                    f" opt={opt_time:.2f}s"
+                )
             print(
                 f"Epoch {epoch:04d} | loss={loss_val:.4f} (ema={loss_ema:.4f}) "
                 f"| t={epoch_wall_time:.2f}s "
-                f"(rw={rw_time:.2f}s fwd={fwd_time:.2f}s bwd={bwd_time:.2f}s) "
+                f"({timer_fields}) "
                 f"| cpu_rss={cpu_rss:.1f}/{cpu_rss_peak:.1f} MiB"
             )
             if comm_profile:
@@ -741,7 +955,7 @@ def main():
 
     if args.rank == 0:
         print(f"\n{'=' * 72}")
-        if getattr(args, "profile_sp_comm", False) and edge_broadcast_epoch_count > 0:
+        if profile_sp_comm and edge_broadcast_epoch_count > 0:
             avg_broadcast_ms = edge_broadcast_ms_sum / edge_broadcast_epoch_count
             avg_broadcast_mib = (edge_broadcast_bytes_sum / edge_broadcast_epoch_count) / (1024.0 ** 2)
             naive_fanout_mib = avg_broadcast_mib * max(sp_world_size - 1, 0)
