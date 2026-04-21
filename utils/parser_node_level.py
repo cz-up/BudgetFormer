@@ -285,12 +285,6 @@ def add_node_fullgraph_sp_args(parser, defaults=None):
         help="advanced override; 0 uses a short automatic pre-training search (default 2 rounds) to select the initial (real, rw) budget, <0 disables it",
     )
     parser.add_argument(
-        "--adaptive_edge_budget_bootstrap_n_layers",
-        type=int,
-        default=defaults.get("adaptive_edge_budget_bootstrap_n_layers", 0),
-        help="advanced override; >0 uses a temporary N-layer proxy model during bootstrap budget search, <=0 keeps the full model",
-    )
-    parser.add_argument(
         "--adaptive_edge_budget_static_seed_epochs",
         type=int,
         default=defaults.get("adaptive_edge_budget_static_seed_epochs", 0),

@@ -10,7 +10,7 @@ import dgl
 from typing import List, Optional
 from torch import Tensor
 from torch_sparse import SparseTensor
-from torch_geometric.utils import remove_self_loops, subgraph, add_self_loops
+from torch_geometric.utils import coalesce, remove_self_loops, subgraph, add_self_loops
 from gt_sp.initialize import (
     sequence_parallel_is_initialized,
     get_sequence_parallel_group,
@@ -27,6 +27,11 @@ from gt_sp.initialize import (
 )
 
 _RANDOM_WALK_GRAPH_CACHE = {}
+
+
+def clear_random_walk_graph_cache() -> None:
+    """Evict cached random-walk graph structures after graph storage changes."""
+    _RANDOM_WALK_GRAPH_CACHE.clear()
 
 
 def _compute_local_spd_bias(edge_index: Tensor, n_nodes: int, max_dist: int) -> Tensor:
@@ -501,16 +506,12 @@ def _merge_edge_index_list(edge_list: List[Tensor]) -> Tensor:
     tensors = [e for e in edge_list if e is not None and e.numel() > 0]
     if not tensors:
         return edge_list[0] if edge_list else None
+    if len(tensors) == 1:
+        return tensors[0]
     device = tensors[0].device
     edge_index = torch.cat(tensors, dim=1).to(torch.long)
-    src = edge_index[0]
-    dst = edge_index[1]
-    num_nodes = int(max(src.max().item(), dst.max().item())) + 1
-    ids = src * num_nodes + dst
-    ids_unique = torch.unique(ids)
-    src_u = ids_unique // num_nodes
-    dst_u = ids_unique % num_nodes
-    return torch.stack([src_u, dst_u], dim=0).to(device)
+    num_nodes = int(max(edge_index[0].max().item(), edge_index[1].max().item())) + 1
+    return coalesce(edge_index, num_nodes=num_nodes).to(device)
 
 
 def _get_random_walk_graph(edge_index: Tensor, num_nodes: int, device) -> tuple[Tensor, Tensor, Tensor]:

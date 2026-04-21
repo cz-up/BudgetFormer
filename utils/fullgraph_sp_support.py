@@ -31,11 +31,31 @@ from utils.lr import PolynomialDecayLR
 from utils.split_utils import load_default_split
 
 _MINHASH_SAMPLE_K_LIMIT = 8
+
+# Deterministic merged-edge cache.  When edge_seed is fixed across calls (e.g.
+# during static-seed epochs or bootstrap), the full walk+merge computation
+# produces an identical CPU tensor every time.  We cache it here to avoid
+# re-running the expensive build; the value is always stored on CPU so that
+# GPU-resident entries from the rank-local path don't pin HBM permanently.
+# Size is bounded (FIFO, capacity=8) to prevent unbounded growth when seeds
+# change every epoch after the static-seed phase.
+_MERGED_EDGE_CACHE: dict = {}
+
 _GRAPHORMER_VARIANTS = {
     "graphormer": Graphormer,
     "acm": ACMGraphormer,
 }
 _GRAPHORMER_VIRTUAL_NODE_MODELS = frozenset(_GRAPHORMER_VARIANTS)
+EDGE_POLICY_GPU_PERSIST = "gpu_persist"
+EDGE_POLICY_GPU_EPHEMERAL = "gpu_ephemeral"
+EDGE_POLICY_CPU_BROADCAST = "cpu_broadcast"
+_EDGE_POLICY_CHOICES = frozenset(
+    {
+        EDGE_POLICY_GPU_PERSIST,
+        EDGE_POLICY_GPU_EPHEMERAL,
+        EDGE_POLICY_CPU_BROADCAST,
+    }
+)
 
 
 def _resolve_device() -> str:
@@ -71,6 +91,65 @@ def _resolve_real_edge_sampling_device(final_device, rw_device) -> torch.device:
     if final_torch_device.type == "cuda" and rw_torch_device.type == "cpu":
         return torch.device("cpu")
     return final_torch_device
+
+
+def _resolve_edge_policy(args, edge_index_global: Optional[torch.Tensor] = None, edge_policy: Optional[str] = None) -> str:
+    policy = edge_policy
+    if policy is None:
+        policy = getattr(args, "_runtime_edge_policy", None)
+    if policy is None:
+        if edge_index_global is not None and edge_index_global.device.type == "cuda":
+            policy = EDGE_POLICY_GPU_PERSIST
+        else:
+            policy = EDGE_POLICY_GPU_EPHEMERAL
+    policy = str(policy)
+    if policy not in _EDGE_POLICY_CHOICES:
+        raise ValueError(f"Unsupported edge policy: {policy!r}")
+    return policy
+
+
+def _edge_policy_build_devices(edge_policy: str, device: str, rw_device) -> tuple[torch.device, torch.device]:
+    policy = str(edge_policy)
+    if policy not in _EDGE_POLICY_CHOICES:
+        raise ValueError(f"Unsupported edge policy: {policy!r}")
+    if policy == EDGE_POLICY_CPU_BROADCAST:
+        return torch.device("cpu"), torch.device("cpu")
+    return torch.device(device), torch.device(rw_device)
+
+
+def _edge_policy_force_broadcast(args, edge_policy: str, force_broadcast: Optional[bool] = None) -> bool:
+    if force_broadcast is not None:
+        return bool(force_broadcast)
+    return (
+        bool(getattr(args, "force_edge_broadcast", False))
+        or bool(getattr(args, "_runtime_force_edge_broadcast", False))
+        or edge_policy == EDGE_POLICY_CPU_BROADCAST
+    )
+
+
+def _budget_phase_probe_rw_device(rw_device) -> str:
+    return "cpu"
+
+
+@contextlib.contextmanager
+def _budget_phase_cpu_edge_baseline(args):
+    prev_policy = getattr(args, "_runtime_edge_policy", None)
+    prev_force = getattr(args, "_runtime_force_edge_broadcast", None)
+    args._runtime_edge_policy = EDGE_POLICY_CPU_BROADCAST
+    args._runtime_force_edge_broadcast = True
+    try:
+        yield
+    finally:
+        if prev_policy is None:
+            if hasattr(args, "_runtime_edge_policy"):
+                delattr(args, "_runtime_edge_policy")
+        else:
+            args._runtime_edge_policy = prev_policy
+        if prev_force is None:
+            if hasattr(args, "_runtime_force_edge_broadcast"):
+                delattr(args, "_runtime_force_edge_broadcast")
+        else:
+            args._runtime_force_edge_broadcast = prev_force
 
 
 def _autocast_context(device: str, amp_dtype):
@@ -313,7 +392,10 @@ def _build_model(args, feature, y, device):
             _ckpt_mode in ("adaptive", "multi_tier")
             and _adaptive_edge_budget_enabled(args)
         )
-        model.set_activation_checkpoint(mode=_ckpt_mode, deferred=_ckpt_deferred)
+        model.set_activation_checkpoint(
+            mode=_ckpt_mode,
+            deferred=_ckpt_deferred,
+        )
     elif args.model == "gt":
         model = GT(
             **common,
@@ -334,7 +416,6 @@ class _AdaptiveEdgeBudgetConfig:
     gain_threshold: float
     max_total_edges_per_query: int
     bootstrap_search_epochs: int
-    bootstrap_n_layers: int
     static_seed_epochs: int
 
 
@@ -453,9 +534,6 @@ def _resolve_adaptive_edge_budget_config(args, valid_size: int) -> _AdaptiveEdge
             bootstrap_search_epochs = 0
     bootstrap_search_epochs = max(0, bootstrap_search_epochs)
 
-    bootstrap_n_layers = int(getattr(args, "adaptive_edge_budget_bootstrap_n_layers", 0))
-    bootstrap_n_layers = max(0, bootstrap_n_layers)
-
     static_seed_epochs = int(getattr(args, "adaptive_edge_budget_static_seed_epochs", 0))
     if enabled:
         if static_seed_epochs == 0:
@@ -473,7 +551,6 @@ def _resolve_adaptive_edge_budget_config(args, valid_size: int) -> _AdaptiveEdge
         gain_threshold=float(getattr(args, "adaptive_edge_budget_gain_threshold", 0.0)),
         max_total_edges_per_query=max(0, int(getattr(args, "max_total_edges_per_query", 0))),
         bootstrap_search_epochs=bootstrap_search_epochs,
-        bootstrap_n_layers=bootstrap_n_layers,
         static_seed_epochs=static_seed_epochs,
     )
 
@@ -631,7 +708,16 @@ def _resolve_real_edges_for_state(
         return None
 
     build_device = torch.device(device)
-    real_edges = edge_index_global if edge_index_global.device == build_device else edge_index_global.to(build_device)
+    if edge_index_global.device == build_device:
+        real_edges = edge_index_global
+    else:
+        payload_bytes = int(edge_index_global.numel() * edge_index_global.element_size())
+        real_edges = profile_call(
+            "edge_full_h2d",
+            lambda: edge_index_global.to(build_device),
+            device=build_device,
+            payload_bytes=payload_bytes,
+        )
     if not _random_block_sampling_enabled(args, adaptive_edge_budget_cfg):
         return real_edges
 
@@ -728,12 +814,18 @@ def _filter_by_dst_csr(csr: _DstEdgeCSR, dst_nodes: torch.Tensor) -> torch.Tenso
     dst_nodes = dst_nodes[(dst_nodes >= 0) & (dst_nodes < num_nodes)]
     if dst_nodes.numel() == 0:
         return csr.sorted_edge_index.new_zeros((2, 0))
-    starts = csr.row_ptr[dst_nodes].tolist()
-    ends = csr.row_ptr[dst_nodes + 1].tolist()
-    parts = [csr.sorted_edge_index[:, s:e] for s, e in zip(starts, ends) if e > s]
-    if not parts:
+    ptr_starts = csr.row_ptr[dst_nodes]
+    counts = csr.row_ptr[dst_nodes + 1] - ptr_starts
+    total = int(counts.sum().item())
+    if total == 0:
         return csr.sorted_edge_index.new_zeros((2, 0))
-    return torch.cat(parts, dim=1)
+    # Build flat edge indices without Python loops.
+    # For each segment i with length counts[i], produce ptr_starts[i]+0, +1, ..., +counts[i]-1.
+    base = torch.repeat_interleave(ptr_starts, counts)
+    cum_starts = torch.zeros(dst_nodes.numel(), dtype=torch.long)
+    cum_starts[1:] = counts[:-1].cumsum(0)
+    local_offset = torch.arange(total, dtype=torch.long) - torch.repeat_interleave(cum_starts, counts)
+    return csr.sorted_edge_index[:, base + local_offset]
 
 
 def _build_probe_edge_pools(
@@ -1026,50 +1118,6 @@ def _clone_model_state_to_cpu(model):
     }
 
 
-@contextlib.contextmanager
-def _temporary_bootstrap_layer_subset(
-    args,
-    config: _AdaptiveEdgeBudgetConfig,
-    model,
-    sp_group,
-    sp_world_size,
-    grad_reducer,
-):
-    target_n_layers = int(config.bootstrap_n_layers)
-    model_layers = getattr(model, "layers", None)
-    if target_n_layers <= 0 or model_layers is None:
-        yield model, grad_reducer, None
-        return
-
-    full_n_layers = len(model_layers)
-    if target_n_layers >= full_n_layers:
-        yield model, grad_reducer, None
-        return
-
-    original_layers = model.layers
-    original_n_layers = getattr(model, "n_layers", None)
-    original_ckpt_mode = getattr(model, "activation_checkpoint_mode", None)
-
-    try:
-        model.layers = torch.nn.ModuleList(list(original_layers[:target_n_layers]))
-        if original_n_layers is not None:
-            model.n_layers = target_n_layers
-        if hasattr(model, "set_activation_checkpoint"):
-            model.set_activation_checkpoint(mode=getattr(args, "activation_checkpoint_mode", None))
-        bootstrap_grad_reducer = build_gradient_reducer(
-            model,
-            process_group=sp_group,
-            world_size=sp_world_size,
-        )
-        yield model, bootstrap_grad_reducer, full_n_layers
-    finally:
-        model.layers = original_layers
-        if original_n_layers is not None:
-            model.n_layers = original_n_layers
-        if hasattr(model, "set_activation_checkpoint"):
-            model.set_activation_checkpoint(mode=original_ckpt_mode)
-
-
 def _select_probe_nodes(split_idx, probe_size: int, seed: int):
     probe_size = max(0, int(probe_size))
     if probe_size <= 0:
@@ -1183,22 +1231,22 @@ def _train_one_epoch_with_budget(
 ):
     model.train()
     optimizer.zero_grad(set_to_none=True)
-
-    edge_index = _build_attention_edges(
-        args,
-        edge_index_global,
-        num_nodes,
-        device,
-        rw_device,
-        sp_group,
-        sp_src_rank,
-        sp_rank,
-        local_nodes,
-        edge_seed=edge_seed,
-        edge_budget_state=budget_state,
-        adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
-        walk_length_override=walk_length_override,
-    )
+    with _budget_phase_cpu_edge_baseline(args):
+        edge_index = _build_attention_edges(
+            args,
+            edge_index_global,
+            num_nodes,
+            device,
+            rw_device,
+            sp_group,
+            sp_src_rank,
+            sp_rank,
+            local_nodes,
+            edge_seed=edge_seed,
+            edge_budget_state=budget_state,
+            adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
+            walk_length_override=walk_length_override,
+        )
 
     with _autocast_context(device, amp_dtype):
         out_local = model(x_local, None, edge_index, attn_type=args.attn_type)
@@ -1266,93 +1314,64 @@ def _bootstrap_initial_edge_budget(
 
     full_initial_model_state = _clone_model_state_to_cpu(model)
     try:
-        with _temporary_bootstrap_layer_subset(
-            args,
-            adaptive_edge_budget_cfg,
-            model,
-            sp_group,
-            sp_world_size,
-            grad_reducer,
-        ) as (bootstrap_model, bootstrap_grad_reducer, full_n_layers):
-            if args.rank == 0 and full_n_layers is not None:
-                print(
-                    "  ↳ BootstrapBudgetSearch "
-                    f"temporary_model_layers={len(bootstrap_model.layers)}/{full_n_layers}"
-                )
+        bootstrap_model = model
+        bootstrap_grad_reducer = grad_reducer
+        candidate_states = _auto_initial_budget_candidates(edge_index_global, num_nodes, adaptive_edge_budget_cfg)
+        if not candidate_states:
+            return None
 
-            candidate_states = _auto_initial_budget_candidates(edge_index_global, num_nodes, adaptive_edge_budget_cfg)
-            if not candidate_states:
-                return None
+        initial_model_state = _clone_model_state_to_cpu(bootstrap_model)
+        probe_seed = int(getattr(args, "seed", 0))
+        probe_edge_pools = None
+        if sp_rank == sp_src_rank:
+            probe_edge_pools = _build_probe_edge_pools(
+                args,
+                edge_index_global,
+                num_nodes,
+                _budget_phase_probe_rw_device(rw_device),
+                probe_idx_global,
+                edge_seed=probe_seed,
+                adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
+                edge_index_csr=edge_index_csr,
+            )
 
-            initial_model_state = _clone_model_state_to_cpu(bootstrap_model)
-            probe_seed = int(getattr(args, "seed", 0))
-            probe_edge_pools = None
-            if sp_rank == sp_src_rank:
-                probe_edge_pools = _build_probe_edge_pools(
+        candidate_specs = []
+        for candidate_state in candidate_states:
+            candidate_specs.append(
+                {
+                    "budget_state": dict(candidate_state),
+                    "full_state": dict(candidate_state),
+                    "probe_edge_pools": probe_edge_pools,
+                    "model_state": initial_model_state,
+                    "trained_epochs": 0,
+                    "loss": float("inf"),
+                    "edge_count": float("inf"),
+                }
+            )
+
+        n_epochs = max(1, int(adaptive_edge_budget_cfg.bootstrap_search_epochs))
+
+        def _fmt_summary(state, loss, trained_epochs):
+            return f"({state['real_edges_per_query']},{state['rw_edges_per_query']})@{loss:.4f}[e={trained_epochs}]"
+
+        # Flat search: train every candidate for the same n_epochs, then pick by loss.
+        all_summaries = []
+        for spec in candidate_specs:
+            _set_seed(int(getattr(args, "seed", 0)))
+            bootstrap_model.load_state_dict(initial_model_state, strict=True)
+            optimizer, lr_scheduler, scaler = _build_optimizer_bundle(args, bootstrap_model, device, amp_dtype)
+
+            for _ in range(n_epochs):
+                _train_one_epoch_with_budget(
                     args,
-                    edge_index_global,
-                    num_nodes,
-                    rw_device,
-                    probe_idx_global,
-                    edge_seed=probe_seed,
-                    adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
-                    edge_index_csr=edge_index_csr,
-                )
-
-            candidate_specs = []
-            for candidate_state in candidate_states:
-                candidate_specs.append(
-                    {
-                        "budget_state": dict(candidate_state),
-                        "full_state": dict(candidate_state),
-                        "probe_edge_pools": probe_edge_pools,
-                        "model_state": initial_model_state,
-                        "trained_epochs": 0,
-                        "loss": float("inf"),
-                        "edge_count": float("inf"),
-                    }
-                )
-
-            n_epochs = max(1, int(adaptive_edge_budget_cfg.bootstrap_search_epochs))
-
-            def _fmt_summary(state, loss, trained_epochs):
-                return f"({state['real_edges_per_query']},{state['rw_edges_per_query']})@{loss:.4f}[e={trained_epochs}]"
-
-            # Flat search: train every candidate for the same n_epochs, then pick by loss.
-            all_summaries = []
-            for spec in candidate_specs:
-                _set_seed(int(getattr(args, "seed", 0)))
-                bootstrap_model.load_state_dict(initial_model_state, strict=True)
-                optimizer, lr_scheduler, scaler = _build_optimizer_bundle(args, bootstrap_model, device, amp_dtype)
-
-                for _ in range(n_epochs):
-                    _train_one_epoch_with_budget(
-                        args,
-                        adaptive_edge_budget_cfg,
-                        bootstrap_model,
-                        optimizer,
-                        lr_scheduler,
-                        scaler,
-                        x_local,
-                        local_y,
-                        local_train_idx,
-                        edge_index_global,
-                        num_nodes,
-                        device,
-                        rw_device,
-                        sp_group,
-                        sp_src_rank,
-                        sp_rank,
-                        local_nodes,
-                        amp_dtype,
-                        sp_world_size,
-                        bootstrap_grad_reducer,
-                        spec["budget_state"],
-                        probe_seed,
-                    )
-
-                probe_edges = _build_probe_attention_edges(
-                    args,
+                    adaptive_edge_budget_cfg,
+                    bootstrap_model,
+                    optimizer,
+                    lr_scheduler,
+                    scaler,
+                    x_local,
+                    local_y,
+                    local_train_idx,
                     edge_index_global,
                     num_nodes,
                     device,
@@ -1361,64 +1380,81 @@ def _bootstrap_initial_edge_budget(
                     sp_src_rank,
                     sp_rank,
                     local_nodes,
-                    probe_idx_global,
-                    edge_seed=probe_seed,
-                    edge_budget_state=spec["budget_state"],
-                    adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
-                    edge_pools=spec["probe_edge_pools"],
-                )
-                candidate_loss, _ = _probe_loss_sp(
-                    args,
-                    bootstrap_model,
-                    x_local,
-                    local_y,
-                    local_probe_idx,
-                    probe_edges,
-                    device,
                     amp_dtype,
-                    sp_group,
                     sp_world_size,
-                )
-                candidate_edge_count = _edge_count(probe_edges)
-                spec["loss"] = float(candidate_loss)
-                spec["edge_count"] = int(candidate_edge_count)
-                spec["trained_epochs"] = n_epochs
-                all_summaries.append((spec, float(candidate_loss), int(candidate_edge_count)))
-                del probe_edges, optimizer, lr_scheduler, scaler
-
-            if not all_summaries:
-                return None
-
-            all_summaries.sort(key=lambda item: (float(item[1]), int(item[2])))
-            best_spec, best_loss, best_edge_count = all_summaries[0]
-            best_state = dict(best_spec["full_state"])
-
-            bootstrap_model.load_state_dict(initial_model_state, strict=True)
-            _set_seed(int(getattr(args, "seed", 0)))
-
-            if args.rank == 0:
-                formatted_candidates = ", ".join(
-                    _fmt_summary(spec["full_state"], spec["loss"], spec["trained_epochs"])
-                    for spec, _, _ in all_summaries
-                )
-                print(
-                    "  ↳ BootstrapBudgetSearch "
-                    f"strategy=flat "
-                    f"epochs={n_epochs} "
-                    f"walk_length={_resolve_walk_length(args)} "
-                    f"candidates=[{formatted_candidates}] "
-                    f"chosen=({best_state['real_edges_per_query']},{best_state['rw_edges_per_query']}) "
-                    f"probe_loss={best_loss:.4f} probe_edges={best_edge_count}"
+                    bootstrap_grad_reducer,
+                    spec["budget_state"],
+                    probe_seed,
                 )
 
-            if args.rank == 0:
-                print(
-                    "  ↳ BudgetCtrl [ThresholdFixed] "
-                    f"rel_gain_threshold remains {controller.gain_threshold:.8e} from args."
-                )
+            probe_edges = _build_probe_attention_edges(
+                args,
+                edge_index_global,
+                num_nodes,
+                device,
+                _budget_phase_probe_rw_device(rw_device),
+                sp_group,
+                sp_src_rank,
+                sp_rank,
+                local_nodes,
+                probe_idx_global,
+                edge_seed=probe_seed,
+                edge_budget_state=spec["budget_state"],
+                adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
+                edge_pools=spec["probe_edge_pools"],
+            )
+            candidate_loss, _ = _probe_loss_sp(
+                args,
+                bootstrap_model,
+                x_local,
+                local_y,
+                local_probe_idx,
+                probe_edges,
+                device,
+                amp_dtype,
+                sp_group,
+                sp_world_size,
+            )
+            candidate_edge_count = _edge_count(probe_edges)
+            spec["loss"] = float(candidate_loss)
+            spec["edge_count"] = int(candidate_edge_count)
+            spec["trained_epochs"] = n_epochs
+            all_summaries.append((spec, float(candidate_loss), int(candidate_edge_count)))
+            del probe_edges, optimizer, lr_scheduler, scaler
 
-            controller.bootstrap_baseline_loss = float(best_loss)
-            return best_state
+        if not all_summaries:
+            return None
+
+        all_summaries.sort(key=lambda item: (float(item[1]), int(item[2])))
+        best_spec, best_loss, best_edge_count = all_summaries[0]
+        best_state = dict(best_spec["full_state"])
+
+        bootstrap_model.load_state_dict(initial_model_state, strict=True)
+        _set_seed(int(getattr(args, "seed", 0)))
+
+        if args.rank == 0:
+            formatted_candidates = ", ".join(
+                _fmt_summary(spec["full_state"], spec["loss"], spec["trained_epochs"])
+                for spec, _, _ in all_summaries
+            )
+            print(
+                "  ↳ BootstrapBudgetSearch "
+                f"strategy=flat "
+                f"epochs={n_epochs} "
+                f"walk_length={_resolve_walk_length(args)} "
+                f"candidates=[{formatted_candidates}] "
+                f"chosen=({best_state['real_edges_per_query']},{best_state['rw_edges_per_query']}) "
+                f"probe_loss={best_loss:.4f} probe_edges={best_edge_count}"
+            )
+
+        if args.rank == 0:
+            print(
+                "  ↳ BudgetCtrl [ThresholdFixed] "
+                f"rel_gain_threshold remains {controller.gain_threshold:.8e} from args."
+            )
+
+        controller.bootstrap_baseline_loss = float(best_loss)
+        return best_state
     finally:
         model.load_state_dict(full_initial_model_state, strict=True)
 
@@ -1465,7 +1501,7 @@ def _maybe_update_edge_budget(
             args,
             edge_index_global,
             num_nodes,
-            rw_device,
+            _budget_phase_probe_rw_device(rw_device),
             probe_idx_global,
             edge_seed=probe_seed,
             adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
@@ -1477,7 +1513,7 @@ def _maybe_update_edge_budget(
         edge_index_global,
         num_nodes,
         device,
-        rw_device,
+        _budget_phase_probe_rw_device(rw_device),
         sp_group,
         sp_src_rank,
         sp_rank,
@@ -1508,7 +1544,7 @@ def _maybe_update_edge_budget(
             edge_index_global,
             num_nodes,
             device,
-            rw_device,
+            _budget_phase_probe_rw_device(rw_device),
             sp_group,
             sp_src_rank,
             sp_rank,
@@ -1678,10 +1714,57 @@ def _broadcast_edges(merged_cpu, device, sp_group, sp_src_rank, sp_rank):
     return merged
 
 
+def _make_merged_edge_cache_key(
+    args,
+    edge_index_global: torch.Tensor,
+    num_nodes: int,
+    rw_build_device,
+    resolved_policy: str,
+    nodes_per_rank: int,
+    edge_seed: int,
+    edge_budget_state,
+    adaptive_edge_budget_cfg,
+    walk_length_override,
+) -> tuple:
+    """Build a hashable cache key that fully determines the merged edge output."""
+    real_budget = _get_real_edge_budget(args, edge_budget_state, adaptive_edge_budget_cfg)
+    rw_budget = _get_rw_edge_budget(args, edge_budget_state, adaptive_edge_budget_cfg)
+    walk_length = _resolve_walk_length(args, edge_budget_state, walk_length_override)
+    return (
+        int(edge_seed),
+        int(real_budget),
+        int(rw_budget),
+        int(walk_length),
+        int(getattr(args, "head_hop_walks_per_node", 2)),
+        str(rw_build_device),
+        str(resolved_policy),
+        int(nodes_per_rank),
+        int(num_nodes),
+        id(edge_index_global),
+        int(getattr(args, "num_heads", 1)),
+        str(getattr(args, "model", "")),
+        int(getattr(args, "num_global_node", 0)),
+    )
+
+
+def _store_merged_edge_cache(key: tuple, merged: torch.Tensor) -> None:
+    """Insert *merged* (stored as CPU tensor) into the bounded FIFO cache."""
+    cpu_tensor = merged if merged.device.type == "cpu" else merged.detach().cpu()
+    if len(_MERGED_EDGE_CACHE) >= 8:
+        _MERGED_EDGE_CACHE.pop(next(iter(_MERGED_EDGE_CACHE)))
+    _MERGED_EDGE_CACHE[key] = cpu_tensor
+
+
+def clear_merged_edge_cache() -> None:
+    """Evict all entries; call when edge_index_global is replaced on GPU."""
+    _MERGED_EDGE_CACHE.clear()
+
+
 def _build_and_broadcast_edges(args, edge_index_global, num_nodes, device, rw_device, sp_group,
                                sp_src_rank, sp_rank, nodes_per_rank, edge_seed=None,
                                edge_budget_state=None, adaptive_edge_budget_cfg=None,
-                               walk_length_override=None):
+                               walk_length_override=None, edge_policy=None,
+                               force_broadcast=None):
     # ---------------------------------------------------------------------------
     # O3 Optimization: Rank-Local Edge Construction (eliminates edge broadcast).
     #
@@ -1698,9 +1781,32 @@ def _build_and_broadcast_edges(args, edge_index_global, num_nodes, device, rw_de
     # Fallback: when edge_seed is None (un-seeded dynamic edges) the original
     # broadcast path is preserved to keep cross-rank consistency.
     # ---------------------------------------------------------------------------
-    if edge_seed is not None and not bool(getattr(args, "force_edge_broadcast", False)):
+    resolved_policy = _resolve_edge_policy(args, edge_index_global=edge_index_global, edge_policy=edge_policy)
+    final_build_device, rw_build_device = _edge_policy_build_devices(resolved_policy, device, rw_device)
+    resolved_force_broadcast = _edge_policy_force_broadcast(args, resolved_policy, force_broadcast)
+
+    if edge_seed is not None and not resolved_force_broadcast:
         # Rank-local path: all ranks independently build the same edge_index.
         # fixed_random_seed handles both CPU and CUDA RNG (covers gpu rw_device).
+        #
+        # Cache: when the same (seed, budget, walk, graph, policy) key recurs
+        # (e.g. during static-seed epochs or bootstrap), skip the expensive
+        # walk+merge and return the stored CPU tensor moved to the target device.
+        cache_key = _make_merged_edge_cache_key(
+            args, edge_index_global, num_nodes, rw_build_device, resolved_policy,
+            nodes_per_rank, edge_seed, edge_budget_state, adaptive_edge_budget_cfg,
+            walk_length_override,
+        )
+        if cache_key in _MERGED_EDGE_CACHE:
+            profile_call("edge_build_local", lambda: None, device=device, payload_bytes=0)
+            profile_call("edge_broadcast", lambda: None, device=device, payload_bytes=0)
+            cached = _MERGED_EDGE_CACHE[cache_key]
+            target = torch.device(final_build_device)
+            if cached.device == target:
+                return cached
+            return cached.to(device=target, dtype=torch.long,
+                             non_blocking=(cached.device.type == "cpu"))
+
         with fixed_random_seed(edge_seed):
             merged = profile_call(
                 "edge_build_local",
@@ -1708,8 +1814,8 @@ def _build_and_broadcast_edges(args, edge_index_global, num_nodes, device, rw_de
                     args,
                     edge_index_global,
                     num_nodes,
-                    device,
-                    rw_device,
+                    final_build_device,
+                    rw_build_device,
                     nodes_per_rank,
                     edge_seed=edge_seed,
                     edge_budget_state=edge_budget_state,
@@ -1718,30 +1824,53 @@ def _build_and_broadcast_edges(args, edge_index_global, num_nodes, device, rw_de
                 ),
                 device=device,
             )
+        _store_merged_edge_cache(cache_key, merged)
         # Record a zero-byte entry so the comm profiler stats remain consistent.
         profile_call("edge_broadcast", lambda: None, device=device, payload_bytes=0)
         return merged
 
     # ---------------------------------------------------------------------------
-    # Fallback: original broadcast path when edge_seed is None.
+    # Fallback: original broadcast path when edge_seed is None or force_broadcast.
+    # Cache is applied on src_rank only (non-src ranks never build).
     # ---------------------------------------------------------------------------
     if sp_rank == sp_src_rank:
-        merged = profile_call(
-            "edge_build_local",
-            lambda: _build_merged_edges(
-                args,
-                edge_index_global,
-                num_nodes,
-                device,
-                rw_device,
-                nodes_per_rank,
-                edge_seed=edge_seed,
-                edge_budget_state=edge_budget_state,
-                adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
-                walk_length_override=walk_length_override,
-            ),
-            device=device,
+        _bcast_cache_key = (
+            _make_merged_edge_cache_key(
+                args, edge_index_global, num_nodes, rw_build_device, resolved_policy,
+                nodes_per_rank, edge_seed, edge_budget_state, adaptive_edge_budget_cfg,
+                walk_length_override,
+            ) if edge_seed is not None else None
         )
+        if _bcast_cache_key is not None and _bcast_cache_key in _MERGED_EDGE_CACHE:
+            profile_call("edge_build_local", lambda: None, device=device, payload_bytes=0)
+            merged = _MERGED_EDGE_CACHE[_bcast_cache_key].to(
+                device=device, dtype=torch.long, non_blocking=True
+            )
+        else:
+            merged = profile_call(
+                "edge_build_local",
+                lambda: _build_merged_edges(
+                    args,
+                    edge_index_global,
+                    num_nodes,
+                    final_build_device,
+                    rw_build_device,
+                    nodes_per_rank,
+                    edge_seed=edge_seed,
+                    edge_budget_state=edge_budget_state,
+                    adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
+                    walk_length_override=walk_length_override,
+                ),
+                device=device,
+            )
+            if merged.device.type != torch.device(device).type or merged.device != torch.device(device):
+                merged = merged.to(
+                    device=device,
+                    dtype=torch.long,
+                    non_blocking=(merged.device.type == "cpu"),
+                )
+            if _bcast_cache_key is not None:
+                _store_merged_edge_cache(_bcast_cache_key, merged)
         size_t = torch.tensor([merged.shape[1]], device=device, dtype=torch.long)
     else:
         size_t = torch.empty(1, device=device, dtype=torch.long)
@@ -1764,7 +1893,8 @@ def _build_and_broadcast_edges(args, edge_index_global, num_nodes, device, rw_de
 def _build_attention_edges(args, edge_index_global, num_nodes, device, rw_device, sp_group,
                            sp_src_rank, sp_rank, nodes_per_rank, edge_seed=None,
                            edge_budget_state=None, adaptive_edge_budget_cfg=None,
-                           walk_length_override=None):
+                           walk_length_override=None, edge_policy=None,
+                           force_broadcast=None):
     return _build_and_broadcast_edges(
         args,
         edge_index_global,
@@ -1779,6 +1909,8 @@ def _build_attention_edges(args, edge_index_global, num_nodes, device, rw_device
         edge_budget_state=edge_budget_state,
         adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
         walk_length_override=walk_length_override,
+        edge_policy=edge_policy,
+        force_broadcast=force_broadcast,
     )
 
 
