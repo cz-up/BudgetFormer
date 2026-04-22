@@ -27,11 +27,16 @@ from gt_sp.initialize import (
 )
 
 _RANDOM_WALK_GRAPH_CACHE = {}
+# DGL graph objects built from the coalesced CSR, keyed by (rowptr.data_ptr, col.data_ptr).
+# Cached separately so _run_random_walk can look them up without changing the 3-tuple
+# returned by _get_random_walk_graph.
+_DGL_GRAPH_CACHE: dict = {}
 
 
 def clear_random_walk_graph_cache() -> None:
     """Evict cached random-walk graph structures after graph storage changes."""
     _RANDOM_WALK_GRAPH_CACHE.clear()
+    _DGL_GRAPH_CACHE.clear()
 
 
 def _compute_local_spd_bias(edge_index: Tensor, n_nodes: int, max_dist: int) -> Tensor:
@@ -162,6 +167,23 @@ def fixed_random_seed(seed: int):
         torch.random.set_rng_state(torch_state)
         if cuda_states is not None:
             torch.cuda.set_rng_state_all(cuda_states)
+
+
+@contextlib.contextmanager
+def fixed_random_seed_cpu(seed: int):
+    """Temporarily set CPU-side RNG seeds without touching CUDA RNG state."""
+    py_state = random.getstate()
+    np_state = np.random.get_state()
+    torch_state = torch.random.get_rng_state()
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    try:
+        yield
+    finally:
+        random.setstate(py_state)
+        np.random.set_state(np_state)
+        torch.random.set_rng_state(torch_state)
 
 
 def adjust_edge_index_nomerge(edge_index, sub_seq_len):
@@ -742,6 +764,28 @@ def build_head_hop_edges(
 
 
 def _run_random_walk(edge_index: Tensor, rowptr: Tensor, col: Tensor, starts: Tensor, walk_length: int) -> Tensor:
+    # DGL path: better CPU parallelism (OpenMP) for CPU-resident graphs.
+    # Only used on CPU; GPU walks stay on torch_cluster.
+    if rowptr.device.type == "cpu":
+        try:
+            import dgl as _dgl
+            key = (int(rowptr.data_ptr()), int(col.data_ptr()))
+            g = _DGL_GRAPH_CACHE.get(key)
+            if g is None:
+                num_nodes = int(rowptr.numel()) - 1
+                # Reconstruct COO from coalesced CSR so the graph topology
+                # exactly matches what _get_random_walk_graph built (no duplicates).
+                src = torch.repeat_interleave(
+                    torch.arange(num_nodes, dtype=torch.long),
+                    rowptr[1:] - rowptr[:-1],
+                )
+                g = _dgl.graph((src, col.long()), num_nodes=num_nodes, device="cpu")
+                _DGL_GRAPH_CACHE[key] = g
+            traces, _ = _dgl.sampling.random_walk(g, starts.long(), length=walk_length)
+            return traces
+        except Exception:
+            pass  # fall through to torch_cluster
+
     try:
         from torch_cluster import random_walk
     except Exception as exc:

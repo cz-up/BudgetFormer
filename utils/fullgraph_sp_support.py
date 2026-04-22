@@ -20,6 +20,7 @@ from gt_sp.utils import (
     _merge_edge_index_list,
     adjust_edge_index_nomerge,
     build_head_hop_edges,
+    fixed_random_seed_cpu,
     fix_edge_index,
     fixed_random_seed,
     random_split_idx,
@@ -40,6 +41,11 @@ _MINHASH_SAMPLE_K_LIMIT = 8
 # Size is bounded (FIFO, capacity=8) to prevent unbounded growth when seeds
 # change every epoch after the static-seed phase.
 _MERGED_EDGE_CACHE: dict = {}
+# CPU real-edge sampling repeatedly touches the full graph with only the
+# sampling budget and seed changing.  Cache per-dst counts so we can skip
+# minhash work for low-degree query nodes whose full in-edge set is already
+# within budget.
+_EDGE_DST_STATS_CACHE: dict = {}
 
 _GRAPHORMER_VARIANTS = {
     "graphormer": Graphormer,
@@ -56,6 +62,63 @@ _EDGE_POLICY_CHOICES = frozenset(
         EDGE_POLICY_CPU_BROADCAST,
     }
 )
+
+
+def _make_edge_dst_stats_cache_key(edge_index: torch.Tensor) -> tuple:
+    dev = edge_index.device
+    return (
+        int(edge_index.data_ptr()),
+        int(edge_index.size(1)),
+        dev.type,
+        dev.index,
+    )
+
+
+def _get_edge_dst_stats(edge_index: torch.Tensor) -> Optional[dict]:
+    if edge_index is None or edge_index.numel() == 0 or edge_index.device.type != "cpu":
+        return None
+
+    key = _make_edge_dst_stats_cache_key(edge_index)
+    cached = _EDGE_DST_STATS_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    dst = edge_index[1].to(torch.long)
+    num_groups = int(dst.max().item()) + 1 if dst.numel() > 0 else 0
+    counts = torch.bincount(dst, minlength=num_groups) if num_groups > 0 else dst.new_zeros((0,))
+    cached = {
+        "counts": counts,
+        "max_count": int(counts.max().item()) if counts.numel() > 0 else 0,
+        "heavy_group_maps": {},
+    }
+    if len(_EDGE_DST_STATS_CACHE) >= 2:
+        _EDGE_DST_STATS_CACHE.pop(next(iter(_EDGE_DST_STATS_CACHE)))
+    _EDGE_DST_STATS_CACHE[key] = cached
+    return cached
+
+
+def _get_heavy_group_map(dst_stats: Optional[dict], max_edges_per_query: int) -> Optional[torch.Tensor]:
+    if dst_stats is None:
+        return None
+
+    k = int(max_edges_per_query)
+    cached = dst_stats["heavy_group_maps"].get(k)
+    if cached is not None:
+        return cached
+
+    counts = dst_stats["counts"]
+    group_map = torch.full((counts.numel(),), -1, dtype=torch.long, device=counts.device)
+    heavy_nodes = torch.nonzero(counts > k, as_tuple=False).view(-1)
+    if heavy_nodes.numel() > 0:
+        group_map[heavy_nodes] = torch.arange(
+            heavy_nodes.numel(),
+            dtype=torch.long,
+            device=counts.device,
+        )
+    if len(dst_stats["heavy_group_maps"]) >= 4:
+        dst_stats["heavy_group_maps"].pop(next(iter(dst_stats["heavy_group_maps"])))
+    dst_stats["heavy_group_maps"][k] = group_map
+    return group_map
 
 
 def _resolve_device() -> str:
@@ -586,14 +649,10 @@ def _sample_edges_per_query_random_sort(edge_index, max_edges_per_query: int, se
     return edge_index[:, perm[keep]]
 
 
-def _sample_edges_per_query_random_minhash(edge_index, max_edges_per_query: int, seed: int):
+def _sample_edges_per_query_random_minhash_mask(src, dst, max_edges_per_query: int, seed: int):
     max_edges_per_query = int(max_edges_per_query)
-    src = edge_index[0].to(torch.long)
-    dst = edge_index[1].to(torch.long)
     if src.numel() <= max_edges_per_query:
-        return edge_index
-    if not hasattr(torch.Tensor, "scatter_reduce_"):
-        return _sample_edges_per_query_random_sort(edge_index, max_edges_per_query, seed)
+        return torch.ones(src.numel(), dtype=torch.bool, device=src.device)
 
     scale = 1 << 31
     rand_key = torch.remainder(
@@ -602,7 +661,7 @@ def _sample_edges_per_query_random_minhash(edge_index, max_edges_per_query: int,
     ).to(torch.long)
     num_groups = int(dst.max().item()) + 1
     if num_groups <= 0:
-        return edge_index
+        return torch.ones(src.numel(), dtype=torch.bool, device=src.device)
 
     edge_count = int(dst.numel())
     active = torch.ones(edge_count, dtype=torch.bool, device=dst.device)
@@ -628,16 +687,78 @@ def _sample_edges_per_query_random_minhash(edge_index, max_edges_per_query: int,
         keep_mask |= chosen
         active &= ~chosen
 
+    return keep_mask
+
+
+def _sample_edges_per_query_random_minhash(
+    edge_index,
+    max_edges_per_query: int,
+    seed: int,
+    *,
+    dst_stats: Optional[dict] = None,
+):
+    max_edges_per_query = int(max_edges_per_query)
+    src = edge_index[0].to(torch.long)
+    dst = edge_index[1].to(torch.long)
+    if src.numel() <= max_edges_per_query:
+        return edge_index
+    if not hasattr(torch.Tensor, "scatter_reduce_"):
+        return _sample_edges_per_query_random_sort(edge_index, max_edges_per_query, seed)
+
+    if (
+        dst_stats is not None
+        and dst.device.type == "cpu"
+        and dst_stats.get("counts") is not None
+        and int(dst_stats["counts"].numel()) > 0
+    ):
+        if int(dst_stats.get("max_count", 0)) <= max_edges_per_query:
+            return edge_index
+
+        edge_counts = dst_stats["counts"].index_select(0, dst)
+        keep_mask = edge_counts <= max_edges_per_query
+        if bool(keep_mask.all().item()):
+            return edge_index
+
+        heavy_mask = ~keep_mask
+        heavy_group_map = _get_heavy_group_map(dst_stats, max_edges_per_query)
+        if heavy_group_map is not None and heavy_group_map.numel() > 0:
+            heavy_keep = _sample_edges_per_query_random_minhash_mask(
+                src[heavy_mask],
+                heavy_group_map.index_select(0, dst[heavy_mask]),
+                max_edges_per_query,
+                seed,
+            )
+            keep_mask = keep_mask.clone()
+            keep_mask[heavy_mask] = heavy_keep
+            return edge_index[:, keep_mask]
+
+    keep_mask = _sample_edges_per_query_random_minhash_mask(
+        src,
+        dst,
+        max_edges_per_query,
+        seed,
+    )
     return edge_index[:, keep_mask]
 
 
-def _sample_edges_per_query_random(edge_index, max_edges_per_query: int, seed: int):
+def _sample_edges_per_query_random(
+    edge_index,
+    max_edges_per_query: int,
+    seed: int,
+    *,
+    dst_stats: Optional[dict] = None,
+):
     if edge_index is None or edge_index.numel() == 0 or int(max_edges_per_query) <= 0:
         return edge_index
 
     max_edges_per_query = int(max_edges_per_query)
     if max_edges_per_query <= _MINHASH_SAMPLE_K_LIMIT:
-        return _sample_edges_per_query_random_minhash(edge_index, max_edges_per_query, seed)
+        return _sample_edges_per_query_random_minhash(
+            edge_index,
+            max_edges_per_query,
+            seed,
+            dst_stats=dst_stats,
+        )
     return _sample_edges_per_query_random_sort(edge_index, max_edges_per_query, seed)
 
 
@@ -725,6 +846,10 @@ def _resolve_real_edges_for_state(
     if real_budget <= 0:
         return None
 
+    dst_stats = None
+    if build_device.type == "cpu" and real_edges.device.type == "cpu":
+        dst_stats = _get_edge_dst_stats(real_edges)
+
     if _random_block_sampling_enabled(args, adaptive_edge_budget_cfg):
         real_edges = profile_call(
             "edge_real_sample",
@@ -732,6 +857,7 @@ def _resolve_real_edges_for_state(
                 real_edges,
                 real_budget,
                 _edge_block_seed(args, edge_seed, 17),
+                dst_stats=dst_stats,
             ),
             device=build_device,
         )
@@ -1807,7 +1933,12 @@ def _build_and_broadcast_edges(args, edge_index_global, num_nodes, device, rw_de
             return cached.to(device=target, dtype=torch.long,
                              non_blocking=(cached.device.type == "cpu"))
 
-        with fixed_random_seed(edge_seed):
+        seed_ctx = (
+            fixed_random_seed_cpu(edge_seed)
+            if torch.device(rw_build_device).type == "cpu"
+            else fixed_random_seed(edge_seed)
+        )
+        with seed_ctx:
             merged = profile_call(
                 "edge_build_local",
                 lambda: _build_merged_edges(

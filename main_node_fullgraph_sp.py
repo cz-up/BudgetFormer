@@ -11,9 +11,11 @@ Architecture:
 
 import argparse
 import contextlib
+import copy
 import gc
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
 import torch.distributed as dist
@@ -173,6 +175,19 @@ def _aggregate_comm_profile(summary):
 
 def _should_sync_step_timers(profile_sp_comm: bool, device: str) -> bool:
     return bool(profile_sp_comm) and torch.cuda.is_available() and torch.device(device).type == "cuda"
+
+
+def _should_force_ckpt_sync_timers(model) -> bool:
+    mgr = getattr(model, "_comm_ckpt", None)
+    if mgr is None:
+        return False
+    fn = getattr(mgr, "needs_precise_timing", None)
+    if fn is None:
+        return False
+    try:
+        return bool(fn())
+    except Exception:
+        return False
 
 
 def _time_step_block(fn, *, device: str, synchronize_cuda: bool = False):
@@ -491,6 +506,9 @@ def main():
     dynamic_edges = _use_rw_edges(args, adaptive_edge_budget_cfg=adaptive_edge_budget_cfg) or random_blocks_dynamic
     real_edge_sampling_device = _resolve_real_edge_sampling_device(device, rw_device)
     cpu_real_edge_sampling = real_edge_sampling_device.type == "cpu" and device.startswith("cuda")
+    allow_cpu_rank_local_prefetch = bool(
+        getattr(args, "allow_cpu_rank_local_prefetch", False)
+    )
 
     def _set_runtime_edge_policy_for_phase(*, budget_phase_active: bool) -> None:
         # Once multi_tier finishes calibration and applies its synced ACTIVE
@@ -502,6 +520,14 @@ def main():
             args._runtime_force_edge_broadcast = True
             return
         if cpu_real_edge_sampling:
+            if allow_cpu_rank_local_prefetch:
+                # Experimental path for measuring whether CPU-side prefetch can
+                # hide edge construction. Real-edge sampling and RW stay on CPU,
+                # but we preserve the deterministic rank-local path so the
+                # prefetched CPU cache entry can be reused next epoch.
+                args._runtime_edge_policy = EDGE_POLICY_GPU_EPHEMERAL
+                args._runtime_force_edge_broadcast = False
+                return
             args._runtime_edge_policy = EDGE_POLICY_CPU_BROADCAST
             args._runtime_force_edge_broadcast = True
             return
@@ -677,8 +703,115 @@ def main():
         random_blocks_dynamic
     )
 
+    # Async edge prefetch: while the GPU runs epoch N, a background thread builds
+    # and caches the merged edge_index for epoch N+1.  The main thread's
+    # _build_edges_for_epoch call at epoch N+1 then hits _MERGED_EDGE_CACHE and
+    # returns almost instantly.
+    #
+    # Prefetch is intentionally CPU-only.  The background thread always builds
+    # CPU tensors, so cache reuse requires that the foreground path also uses
+    # the CPU graph object identity and CPU random-walk build device.  Once the
+    # graph is cached on GPU or random walks build on GPU, the prefetch result
+    # no longer matches the foreground cache key and only adds hidden wait time.
+    _prefetch_pool = ThreadPoolExecutor(max_workers=1)
+    _prefetch_future = None
+
+    def _prefetch_cache_compatible() -> bool:
+        return (
+            edge_index_global.device.type == "cpu"
+            and torch.device(rw_device).type == "cpu"
+        )
+
+    def _prefetch_topology_plan_stable() -> bool:
+        if _is_adaptive_ckpt and not _adaptive_edge_decision_done:
+            return False
+        if _is_multi_tier and not _multi_tier_decision_done:
+            return False
+        return True
+
+    def _next_epoch_budget_known_at_epoch_start(epoch_idx: int) -> bool:
+        if not edge_budget_controller.enabled:
+            return True
+        if edge_budget_controller.frozen:
+            return True
+        if epoch_idx <= int(adaptive_edge_budget_cfg.bootstrap_search_epochs):
+            return True
+        warmup_epochs = adaptive_edge_budget_cfg.warmup_epochs
+        if warmup_epochs is not None and epoch_idx > int(warmup_epochs):
+            return True
+        return False
+
+    def _submit_prefetch(next_epoch: int, budget_state) -> bool:
+        nonlocal _prefetch_future
+        if _prefetch_future is not None:
+            return False
+        if next_epoch > args.epochs:
+            return False
+        if (
+            not use_epoch_seed
+            or bool(getattr(args, "disable_edge_prefetch", False))
+            or profile_sp_comm
+            or not _prefetch_cache_compatible()
+            or not _prefetch_topology_plan_stable()
+        ):
+            return False
+
+        edge_policy_snap = str(
+            getattr(args, "_runtime_edge_policy", EDGE_POLICY_GPU_EPHEMERAL)
+        )
+        force_broadcast_snap = bool(
+            getattr(args, "_runtime_force_edge_broadcast", False)
+        )
+        if force_broadcast_snap:
+            return False
+
+        next_seed = _edge_seed_for_epoch(
+            next_epoch,
+            args=args,
+            use_epoch_seed=use_epoch_seed,
+            adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
+        )
+        if next_seed is None:
+            return False
+
+        # Keep the same CPU graph object identity so the next epoch's foreground
+        # cache lookup can reuse the prefetched entry directly.
+        edge_index_cpu = edge_index_global
+        budget_snap = copy.copy(budget_state)
+
+        def _prefetch_fn(
+            _seed=next_seed,
+            _ei=edge_index_cpu,
+            _budget=budget_snap,
+            _edge_policy=edge_policy_snap,
+            _force_broadcast=force_broadcast_snap,
+        ):
+            try:
+                _build_attention_edges(
+                    args,
+                    _ei,
+                    num_nodes,
+                    "cpu",
+                    "cpu",
+                    sp_group,
+                    sp_src_rank,
+                    sp_rank,
+                    local_num_nodes,
+                    edge_seed=_seed,
+                    edge_budget_state=_budget,
+                    adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
+                    edge_policy=_edge_policy,
+                    force_broadcast=_force_broadcast,
+                )
+            except Exception:
+                pass
+
+        _prefetch_future = _prefetch_pool.submit(_prefetch_fn)
+        return True
+
     for epoch in range(1, args.epochs + 1):
         t_epoch = time.time()
+        prefetch_wait_time = 0.0
         if profile_sp_comm:
             reset_comm_profiler()
         model.train()
@@ -692,6 +825,8 @@ def main():
             use_epoch_seed=use_epoch_seed,
             adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
         )
+        epoch_budget_state = dict(edge_budget_controller.current_state())
+        sync_step_timing = precise_step_timing or _should_force_ckpt_sync_timers(model)
 
         if _is_multi_tier and dynamic_edges and not _multi_tier_edge_profiled and _budget_frozen_notified:
             _mt_prof_mgr = getattr(model, "_comm_ckpt", None)
@@ -747,7 +882,7 @@ def main():
                         edge_seed=epoch_edge_seed,
                         edge_budget_state=edge_budget_controller.current_state(),
                         adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
-                        precise_step_timing=precise_step_timing,
+                        precise_step_timing=sync_step_timing,
                         sp_initialized=sp_world_size > 1 and dist.is_initialized(),
                     )
                     if metrics is None:
@@ -797,11 +932,35 @@ def main():
                 edge_budget_state=edge_budget_controller.current_state(),
                 adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
             )
+        # If a prefetch future exists, wait for it before calling _build_edges_for_epoch.
+        # The prefetch populates _MERGED_EDGE_CACHE, so the build call below is a
+        # near-instant cache hit.  If the prefetch failed or produced a stale result
+        # (budget changed), _build_edges_for_epoch falls back to a normal build.
+        if _prefetch_future is not None:
+            _prefetch_wait_start = time.perf_counter()
+            try:
+                _prefetch_future.result()
+            except Exception:
+                pass
+            prefetch_wait_time = time.perf_counter() - _prefetch_wait_start
+            _prefetch_future = None
+
         edge_index_rw, rw_time = _time_step_block(
             _build_edges_for_epoch,
             device=device,
-            synchronize_cuda=precise_step_timing,
+            synchronize_cuda=sync_step_timing,
         )
+        # Submit N+1 prefetch as soon as the current epoch's edge build is done.
+        # This allows the CPU worker to overlap with the current epoch's GPU
+        # forward/backward when the next epoch's budget and edge policy are
+        # already known at epoch start (fixed budget, frozen adaptive budget,
+        # or post-warmup stable phase).
+        _prefetch_submitted = False
+        if _next_epoch_budget_known_at_epoch_start(epoch):
+            _prefetch_submitted = _submit_prefetch(
+                epoch + 1,
+                budget_state=epoch_budget_state,
+            )
 
         def _forward_step():
             # multi_tier models per-layer offload explicitly inside Graphormer;
@@ -835,7 +994,7 @@ def main():
             fwd_result, fwd_t = _time_step_block(
                 _forward_step,
                 device=device,
-                synchronize_cuda=precise_step_timing,
+                synchronize_cuda=sync_step_timing,
             )
             (
                 out_local_,
@@ -855,13 +1014,13 @@ def main():
             _, autograd_bwd_t = _time_step_block(
                 _autograd_backward_step,
                 device=device,
-                synchronize_cuda=precise_step_timing,
+                synchronize_cuda=sync_step_timing,
             )
 
             _, grad_sync_t = _time_step_block(
                 lambda: grad_reducer.finalize_backward(),
                 device=device,
-                synchronize_cuda=precise_step_timing,
+                synchronize_cuda=sync_step_timing,
             )
             bwd_t = autograd_bwd_t + grad_sync_t
 
@@ -875,7 +1034,7 @@ def main():
             _, opt_t = _time_step_block(
                 _optimizer_step,
                 device=device,
-                synchronize_cuda=precise_step_timing,
+                synchronize_cuda=sync_step_timing,
             )
             return (
                 out_local_,
@@ -1235,6 +1394,7 @@ def main():
         # We call this once; notify_budget_frozen() is idempotent (no-op if
         # not in DEFERRED state).
         if not _budget_frozen_notified:
+            _post_adjust_budget_state = dict(edge_budget_controller.current_state())
             _budget_is_stable = (
                 edge_budget_controller.frozen
                 or (
@@ -1246,7 +1406,12 @@ def main():
                 _budget_frozen_notified = True
                 _set_runtime_edge_policy_for_phase(budget_phase_active=False)
                 if hasattr(model, "comm_aware_notify_budget_frozen"):
-                    model.comm_aware_notify_budget_frozen()
+                    model.comm_aware_notify_budget_frozen(
+                        reuse_deferred_baseline=(
+                            _adaptive_edge_budget_enabled(args)
+                            and epoch_budget_state == _post_adjust_budget_state
+                        )
+                    )
                 if args.rank == 0:
                     print(
                         f"[edge-cache] Edge budget stable at epoch {epoch} "
@@ -1254,6 +1419,14 @@ def main():
                         f"rw={edge_budget_controller.rw_budget}). "
                         "Checkpoint calibration will start next epoch."
                     )
+
+        # Fallback for adaptive-budget epochs whose next-step budget is only
+        # known after the end-of-epoch probe/update.
+        if not _prefetch_submitted:
+            _submit_prefetch(
+                epoch + 1,
+                budget_state=edge_budget_controller.current_state(),
+            )
 
         if sp_world_size > 1:
             dist.barrier(group=sp_group)
@@ -1273,6 +1446,7 @@ def main():
             timer_fields = (
                 f"rw={rw_time:.2f}s fwd={fwd_time:.2f}s bwd={bwd_time:.2f}s"
                 f" opt={opt_time:.2f}s adj={adjust_time:.2f}s"
+                f" prefetch_wait={prefetch_wait_time:.2f}s"
             )
             if profile_sp_comm:
                 timer_fields += (
@@ -1289,6 +1463,8 @@ def main():
                     print(line)
                 for line in _format_edge_cardinality(comm_profile):
                     print(line)
+
+    _prefetch_pool.shutdown(wait=False)
 
     if args.rank == 0:
         print(f"\n{'=' * 72}")

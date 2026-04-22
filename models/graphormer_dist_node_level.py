@@ -794,13 +794,14 @@ class _CommAwareCheckpointer:
         except Exception:
             return True
 
-    def notify_budget_frozen(self) -> None:
+    def notify_budget_frozen(self, reuse_deferred_baseline: bool = False) -> None:
         """Signal that the edge budget is stable and calibration can begin.
 
         Transitions DEFERRED → WARMUP.  The next forward pass will trigger
         WARMUP mode (peak-stats reset + all-full_layer).  A no-op when the
         checkpointer is already past DEFERRED (e.g. no adaptive edge budget).
         """
+        del reuse_deferred_baseline
         if self._state != self._DEFERRED:
             return
         self._state = self._WARMUP
@@ -1055,6 +1056,10 @@ class _CommAwareCheckpointer:
         """Return True once calibration is complete and ACTIVE mode is set."""
         return self._state == self._ACTIVE
 
+    def needs_precise_timing(self) -> bool:
+        """Return True while calibration is still collecting timing samples."""
+        return self._state not in (self._DEFERRED, self._ACTIVE)
+
     @property
     def cache_edge(self) -> bool:
         """Whether the joint decision recommends caching edge_index_global on GPU."""
@@ -1119,6 +1124,18 @@ class _MultiTierResourceManager:
         self.safety_margin = float(safety_margin)
         self._state        = self._DEFERRED if deferred else self._WARMUP_RECOMPUTE
         self._modes: list  = [self.T0_RECOMPUTE] * self.n_layers
+        self._warmup_target: int = 1 if deferred else 3
+        self._warmup_peak_samples: list[int] = []
+        self._warmup_fwd_live_samples: list[int] = []
+        self._warmup_cpu_live_samples: list[int] = []
+        self._warmup_t_fwd_samples: list[float] = []
+        self._warmup_t_bwd_samples: list[float] = []
+        self._deferred_baseline_ready: bool = False
+        self._deferred_peak: int = 0
+        self._deferred_fwd_live: int = 0
+        self._deferred_cpu_live: int = 0
+        self._deferred_t_fwd: float = 0.0
+        self._deferred_t_bwd: float = 0.0
 
         # --- Profile measurements ---
         self._fwd_live_warmup:    int   = 0
@@ -1261,10 +1278,35 @@ class _MultiTierResourceManager:
     # Public API for training loop
     # ------------------------------------------------------------------
 
-    def notify_budget_frozen(self) -> None:
+    def notify_budget_frozen(self, reuse_deferred_baseline: bool = False) -> None:
         """Signal that edge budget is stable; begin profiling."""
         if self._state != self._DEFERRED:
             return
+        if reuse_deferred_baseline and self._deferred_baseline_ready:
+            self._peak_warmup = int(self._deferred_peak)
+            self._fwd_live_warmup = int(self._deferred_fwd_live)
+            self._cpu_live_warmup = int(self._deferred_cpu_live)
+            self._t_fwd_recompute = float(self._deferred_t_fwd)
+            self._t_bwd_recompute = float(self._deferred_t_bwd)
+            self._state = self._CALIBRATE_OFFLOAD
+            if self._is_rank0():
+                print(
+                    "[MultiTierManager] Edge budget frozen. "
+                    "Reusing pre-freeze recompute baseline from stable stay phase."
+                )
+                print(
+                    f"[MultiTierManager] WARMUP_RECOMPUTE reused: "
+                    f"peak={self._peak_warmup/(1024**2):.0f} MiB  "
+                    f"T_fwd={self._t_fwd_recompute*1000:.0f} ms  "
+                    f"T_bwd={self._t_bwd_recompute*1000:.0f} ms"
+                )
+            return
+        self._warmup_target = 1
+        self._warmup_peak_samples.clear()
+        self._warmup_fwd_live_samples.clear()
+        self._warmup_cpu_live_samples.clear()
+        self._warmup_t_fwd_samples.clear()
+        self._warmup_t_bwd_samples.clear()
         self._state = self._WARMUP_RECOMPUTE
         if self._is_rank0():
             print("[MultiTierManager] Edge budget frozen. Starting WARMUP_RECOMPUTE.")
@@ -1279,12 +1321,17 @@ class _MultiTierResourceManager:
             return
         if self._state == self._DEFERRED:
             self._modes = [self.T0_RECOMPUTE] * self.n_layers
+            torch.cuda.reset_peak_memory_stats(device)
             return
         if self._state == self._WARMUP_RECOMPUTE:
             self._modes = [self.T0_RECOMPUTE] * self.n_layers
             torch.cuda.reset_peak_memory_stats(device)
             if self._is_rank0():
-                print(f"[MultiTierManager] WARMUP_RECOMPUTE: all {self.n_layers} layers → recompute")
+                current_idx = len(self._warmup_peak_samples) + 1
+                print(
+                    f"[MultiTierManager] WARMUP_RECOMPUTE: all {self.n_layers} layers → recompute "
+                    f"(sample {current_idx}/{self._warmup_target})"
+                )
         elif self._state == self._CALIBRATE_OFFLOAD:
             modes = [self.T0_RECOMPUTE] * self.n_layers
             modes[-1] = self.T2_OFFLOAD
@@ -1320,7 +1367,10 @@ class _MultiTierResourceManager:
         live = torch.cuda.memory_allocated(device)
         live = int(self._sync_max_scalar(int(live), device, torch.long))
         cpu_live = int(self._sync_max_scalar(int(self._process_rss_bytes()), device, torch.long))
-        if self._state == self._WARMUP_RECOMPUTE:
+        if self._state == self._DEFERRED:
+            self._deferred_fwd_live = live
+            self._deferred_cpu_live = cpu_live
+        elif self._state == self._WARMUP_RECOMPUTE:
             self._fwd_live_warmup = live
             self._cpu_live_warmup = cpu_live
         elif self._state == self._CALIBRATE_OFFLOAD:
@@ -1339,13 +1389,13 @@ class _MultiTierResourceManager:
         """
         if not torch.cuda.is_available():
             return
-        if self._state in (self._DEFERRED, self._ACTIVE):
+        if self._state == self._ACTIVE:
             return
         is_r0 = self._is_rank0()
         total_gpu = torch.cuda.get_device_properties(device).total_memory
 
-        if self._state == self._WARMUP_RECOMPUTE:
-            self._peak_warmup = int(
+        if self._state == self._DEFERRED:
+            self._deferred_peak = int(
                 self._sync_max_scalar(
                     int(torch.cuda.max_memory_allocated(device)),
                     device,
@@ -1353,21 +1403,76 @@ class _MultiTierResourceManager:
                 )
             )
             if t_fwd is not None:
-                self._t_fwd_recompute = float(
+                self._deferred_t_fwd = float(
                     self._sync_max_scalar(float(t_fwd), device, torch.float64)
                 )
             if t_bwd is not None:
-                self._t_bwd_recompute = float(
+                self._deferred_t_bwd = float(
                     self._sync_max_scalar(float(t_bwd), device, torch.float64)
                 )
+            self._deferred_baseline_ready = True
+            return
+
+        if self._state == self._WARMUP_RECOMPUTE:
+            peak_sample = int(
+                self._sync_max_scalar(
+                    int(torch.cuda.max_memory_allocated(device)),
+                    device,
+                    torch.long,
+                )
+            )
+            t_fwd_sample = (
+                float(self._sync_max_scalar(float(t_fwd), device, torch.float64))
+                if t_fwd is not None
+                else None
+            )
+            t_bwd_sample = (
+                float(self._sync_max_scalar(float(t_bwd), device, torch.float64))
+                if t_bwd is not None
+                else None
+            )
+            self._warmup_peak_samples.append(peak_sample)
+            self._warmup_fwd_live_samples.append(int(self._fwd_live_warmup))
+            self._warmup_cpu_live_samples.append(int(self._cpu_live_warmup))
+            if t_fwd_sample is not None:
+                self._warmup_t_fwd_samples.append(t_fwd_sample)
+            if t_bwd_sample is not None:
+                self._warmup_t_bwd_samples.append(t_bwd_sample)
+            if len(self._warmup_peak_samples) < self._warmup_target:
+                if is_r0:
+                    print(
+                        f"[MultiTierManager] WARMUP_RECOMPUTE sample "
+                        f"{len(self._warmup_peak_samples)}/{self._warmup_target} recorded."
+                    )
+                return
+            keep_start = 1 if self._warmup_target > 1 and len(self._warmup_peak_samples) > 1 else 0
+            kept_peaks = self._warmup_peak_samples[keep_start:]
+            kept_fwd_live = self._warmup_fwd_live_samples[keep_start:]
+            kept_cpu_live = self._warmup_cpu_live_samples[keep_start:]
+            kept_t_fwd = self._warmup_t_fwd_samples[keep_start:] if self._warmup_t_fwd_samples else []
+            kept_t_bwd = self._warmup_t_bwd_samples[keep_start:] if self._warmup_t_bwd_samples else []
+            self._peak_warmup = max(kept_peaks) if kept_peaks else peak_sample
+            self._fwd_live_warmup = max(kept_fwd_live) if kept_fwd_live else int(self._fwd_live_warmup)
+            self._cpu_live_warmup = max(kept_cpu_live) if kept_cpu_live else int(self._cpu_live_warmup)
+            if kept_t_fwd:
+                self._t_fwd_recompute = sum(kept_t_fwd) / len(kept_t_fwd)
+            if kept_t_bwd:
+                self._t_bwd_recompute = sum(kept_t_bwd) / len(kept_t_bwd)
             self._state = self._CALIBRATE_OFFLOAD
             if is_r0:
+                keep_note = ""
+                if self._warmup_target > 1:
+                    keep_note = (
+                        f"  samples={self._warmup_target} "
+                        f"(dropped cold-start sample, averaged last {len(kept_t_fwd) or len(kept_peaks)})"
+                    )
                 print(
                     f"[MultiTierManager] WARMUP_RECOMPUTE done: "
                     f"peak={self._peak_warmup/(1024**2):.0f} MiB  "
                     f"T_fwd={self._t_fwd_recompute*1000:.0f} ms  "
                     f"T_bwd={self._t_bwd_recompute*1000:.0f} ms  "
                     f"(GPU total={total_gpu/(1024**2):.0f} MiB)"
+                    f"{keep_note}"
                 )
 
         elif self._state == self._CALIBRATE_OFFLOAD:
@@ -1616,6 +1721,10 @@ class _MultiTierResourceManager:
     def is_active(self) -> bool:
         return self._state == self._ACTIVE
 
+    def needs_precise_timing(self) -> bool:
+        """Return True while multi_tier is still calibrating its cost model."""
+        return self._state not in (self._DEFERRED, self._ACTIVE)
+
     @property
     def cache_edge(self) -> bool:
         return self._cache_edge
@@ -1842,7 +1951,7 @@ class Graphormer(nn.Module):
         else:
             self._comm_ckpt = None
 
-    def comm_aware_notify_budget_frozen(self) -> None:
+    def comm_aware_notify_budget_frozen(self, reuse_deferred_baseline: bool = False) -> None:
         """Signal that the edge budget is stable; start WARMUP calibration.
 
         Delegates to _CommAwareCheckpointer.notify_budget_frozen().  A no-op
@@ -1850,7 +1959,9 @@ class Graphormer(nn.Module):
         budget or calibration already in progress).
         """
         if self._comm_ckpt is not None:
-            self._comm_ckpt.notify_budget_frozen()
+            self._comm_ckpt.notify_budget_frozen(
+                reuse_deferred_baseline=reuse_deferred_baseline
+            )
 
     def comm_aware_notify_step_end(self, device, t_bwd: float = None, t_fwd: float = None) -> None:
         """Call from the training loop after backward + optimizer.step() + lr_scheduler.step().

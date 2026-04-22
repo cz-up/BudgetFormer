@@ -308,6 +308,22 @@ def add_node_fullgraph_sp_args(parser, defaults=None):
         help="force the legacy full-graph path where the SP source rank builds sampled edges and broadcasts them to the other SP ranks even when deterministic seeded local construction is available",
     )
     parser.add_argument(
+        "--disable_edge_prefetch",
+        action="store_true",
+        default=defaults.get("disable_edge_prefetch", False),
+        help="disable async next-epoch edge prefetch so A/B timing can compare foreground-only edge construction",
+    )
+    parser.add_argument(
+        "--allow_cpu_rank_local_prefetch",
+        action="store_true",
+        default=defaults.get("allow_cpu_rank_local_prefetch", False),
+        help=(
+            "experimental: when training on GPU with --edge_build_device cpu, keep the "
+            "deterministic rank-local edge-build path instead of forcing cpu_broadcast; "
+            "intended only for measuring whether CPU-side edge prefetch can hide build time"
+        ),
+    )
+    parser.add_argument(
         "--fixed_real_edges_per_query",
         type=int,
         default=defaults.get("fixed_real_edges_per_query"),
