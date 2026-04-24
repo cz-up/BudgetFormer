@@ -765,26 +765,49 @@ def build_head_hop_edges(
 
 def _run_random_walk(edge_index: Tensor, rowptr: Tensor, col: Tensor, starts: Tensor, walk_length: int) -> Tensor:
     # DGL path: better CPU parallelism (OpenMP) for CPU-resident graphs.
-    # Only used on CPU; GPU walks stay on torch_cluster.
-   #  if rowptr.device.type == "cpu":
-   #      try:
-   #          import dgl as _dgl
-   #          key = (int(rowptr.data_ptr()), int(col.data_ptr()))
-   #          g = _DGL_GRAPH_CACHE.get(key)
-   #          if g is None:
-   #              num_nodes = int(rowptr.numel()) - 1
-   #              # Reconstruct COO from coalesced CSR so the graph topology
-   #              # exactly matches what _get_random_walk_graph built (no duplicates).
-   #              src = torch.repeat_interleave(
-   #                  torch.arange(num_nodes, dtype=torch.long),
-   #                  rowptr[1:] - rowptr[:-1],
-   #              )
-   #              g = _dgl.graph((src, col.long()), num_nodes=num_nodes, device="cpu")
-   #              _DGL_GRAPH_CACHE[key] = g
-   #          traces, _ = _dgl.sampling.random_walk(g, starts.long(), length=walk_length)
-   #          return traces
-   #      except Exception:
-   #          pass  # fall through to torch_cluster
+    # Only used on CPU from the main thread; background prefetch threads fall
+    # through to torch_cluster.  DGL's OpenMP workers and its internal CUDA
+    # context accesses are not safe when called concurrently with GPU training
+    # on the main thread, causing deadlocks.  torch_cluster is thread-safe and
+    # respects PyTorch's CPU RNG, so prefetch walks remain deterministic.
+    if rowptr.device.type == "cpu":
+        import threading as _threading
+        if _threading.current_thread() is _threading.main_thread():
+            try:
+                import dgl as _dgl
+                # Draw from PyTorch's CPU RNG instead of using initial_seed().
+                # initial_seed() stays constant after manual_seed(), so reseeding
+                # DGL with it on every call makes CPU DGL walks repeat across
+                # batches/epochs.  Drawing a seed preserves fixed_random_seed*
+                # determinism while allowing normal training walks to evolve.
+                dgl_seed = int(torch.randint(0, 2**31 - 1, (1,), dtype=torch.int64).item())
+                _dgl.seed(dgl_seed)
+                key = (int(rowptr.data_ptr()), int(col.data_ptr()))
+                g = _DGL_GRAPH_CACHE.get(key)
+                if g is None:
+                    num_nodes = int(rowptr.numel()) - 1
+                    # Reconstruct COO from coalesced CSR so the graph topology
+                    # exactly matches what _get_random_walk_graph built (no duplicates).
+                    src = torch.repeat_interleave(
+                        torch.arange(num_nodes, dtype=torch.long),
+                        rowptr[1:] - rowptr[:-1],
+                    )
+                    g = _dgl.graph((src, col.long()), num_nodes=num_nodes, device="cpu")
+                    _DGL_GRAPH_CACHE[key] = g
+                traces, _ = _dgl.sampling.random_walk(g, starts.long(), length=walk_length)
+                # DGL fills dead-end steps with -1; torch_cluster repeats the
+                # current node instead.  Replace -1 with the previous node so
+                # that dead-end handling is consistent between both code paths
+                # and the resulting walk distribution matches on directed graphs
+                # (e.g. snap-patents has many sink nodes with out-degree 0).
+                for _step in range(1, traces.shape[1]):
+                    _dead = traces[:, _step] < 0
+                    if not _dead.any():
+                        break
+                    traces[_dead, _step] = traces[_dead, _step - 1]
+                return traces
+            except Exception:
+                pass  # fall through to torch_cluster
 
     try:
         from torch_cluster import random_walk

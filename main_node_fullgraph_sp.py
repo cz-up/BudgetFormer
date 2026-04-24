@@ -202,6 +202,33 @@ def _time_step_block(fn, *, device: str, synchronize_cuda: bool = False):
     return result, time.perf_counter() - t0
 
 
+def _apply_multi_tier_gpu_memory_limit(args, device: str) -> int:
+    limit_mib = int(getattr(args, "multi_tier_gpu_memory_limit_mib", 0) or 0)
+    args._multi_tier_effective_gpu_memory_limit_mib = 0.0
+    if (
+        limit_mib <= 0
+        or getattr(args, "activation_checkpoint_mode", None) != "multi_tier"
+        or not torch.cuda.is_available()
+        or torch.device(device).type != "cuda"
+    ):
+        return 0
+
+    dev = torch.device(device)
+    real_total = int(torch.cuda.get_device_properties(dev).total_memory)
+    requested = int(limit_mib * (1024 ** 2))
+    effective = max(1, min(requested, real_total))
+    fraction = min(max(effective / float(real_total), 0.0), 1.0)
+    torch.cuda.set_per_process_memory_fraction(fraction, dev)
+    args._multi_tier_effective_gpu_memory_limit_mib = effective / (1024 ** 2)
+    if args.rank == 0:
+        print(
+            f"[gpu-cap] multi_tier per-rank GPU memory cap: "
+            f"requested={limit_mib} MiB effective={effective / (1024 ** 2):.0f} MiB "
+            f"(physical={real_total / (1024 ** 2):.0f} MiB, allocator_fraction={fraction:.4f})"
+        )
+    return effective
+
+
 def _sp_group_max(value, *, device: str, group, dtype, initialized: bool) -> float | int:
     if not initialized:
         return value
@@ -502,6 +529,7 @@ def main():
     amp_dtype = _resolve_amp_dtype(args)
     rw_device = resolve_edge_build_device(args, device)
     _set_seed(args.seed)
+    _apply_multi_tier_gpu_memory_limit(args, device)
     profile_sp_comm = bool(getattr(args, "profile_sp_comm", False))
     precise_step_timing = _should_sync_step_timers(profile_sp_comm, device)
     enable_comm_profiler(profile_sp_comm)
@@ -773,6 +801,11 @@ def main():
         print(f"  Edge index GPU cached: {int(edge_index_gpu_cached)}")
         print(f"  AMP dtype: {args.amp_dtype}")
         print(f"  Activation CPU offload: {int(bool(getattr(args, 'activation_cpu_offload', False)))}")
+        if getattr(args, "_multi_tier_effective_gpu_memory_limit_mib", 0.0) > 0.0:
+            print(
+                f"  Multi-tier GPU cap: "
+                f"{getattr(args, '_multi_tier_effective_gpu_memory_limit_mib', 0.0):.0f} MiB per rank"
+            )
         print(
             f"  Random edge blocks: {int(_random_block_sampling_enabled(args, adaptive_edge_budget_cfg))} "
             f"(max_total={adaptive_edge_budget_cfg.max_total_edges_per_query})"
@@ -824,9 +857,11 @@ def main():
         (_is_adaptive_ckpt or _is_multi_tier) and _adaptive_edge_budget_enabled(args)
     )
 
-    use_epoch_seed = (
-        random_blocks_dynamic
-    )
+    # Prefetch can only be reused if the next epoch's sampled topology is
+    # keyed by a deterministic seed.  This must cover plain RW edges too, not
+    # only the later random per-query block sampling stage; otherwise a
+    # cpu_*_prefetch policy silently falls back to foreground construction.
+    use_epoch_seed = dynamic_edges
 
     # Async edge prefetch: while the GPU runs epoch N, a background thread builds
     # and caches the merged edge_index for epoch N+1.  The main thread's
@@ -921,25 +956,22 @@ def main():
             _edge_policy=edge_policy_snap,
             _force_broadcast=(False if is_cpu_broadcast_prefetch else force_broadcast_snap),
         ):
-            try:
-                _build_attention_edges(
-                    args,
-                    _ei,
-                    num_nodes,
-                    "cpu",
-                    "cpu",
-                    sp_group,
-                    sp_src_rank,
-                    sp_rank,
-                    local_num_nodes,
-                    edge_seed=_seed,
-                    edge_budget_state=_budget,
-                    adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
-                    edge_policy=_edge_policy,
-                    force_broadcast=_force_broadcast,
-                )
-            except Exception:
-                pass
+            _build_attention_edges(
+                args,
+                _ei,
+                num_nodes,
+                "cpu",
+                "cpu",
+                sp_group,
+                sp_src_rank,
+                sp_rank,
+                local_num_nodes,
+                edge_seed=_seed,
+                edge_budget_state=_budget,
+                adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
+                edge_policy=_edge_policy,
+                force_broadcast=_force_broadcast,
+            )
 
         _prefetch_future = _prefetch_pool.submit(_prefetch_fn)
         return True
@@ -1088,8 +1120,9 @@ def main():
             _prefetch_wait_start = time.perf_counter()
             try:
                 _prefetch_future.result()
-            except Exception:
-                pass
+            except Exception as exc:
+                if args.rank == 0:
+                    print(f"[edge-prefetch] background build failed; foreground build will be used: {exc}")
             prefetch_wait_time = time.perf_counter() - _prefetch_wait_start
             _prefetch_future = None
 
@@ -1475,6 +1508,7 @@ def main():
                 edge_broadcast_bytes_sum += int(edge_broadcast["total_bytes"])
                 edge_broadcast_epoch_count += 1
 
+        eval_time = 0.0
         if epoch % args.eval_every == 0:
             t_eval = time.time()
             accs = _eval_sp(
@@ -1578,8 +1612,10 @@ def main():
 
         # Fallback for adaptive-budget epochs whose next-step budget is only
         # known after the end-of-epoch probe/update.
+        # Submit as early as possible so the background thread overlaps with
+        # dist.barrier and any remaining epoch overhead.
         if not _prefetch_submitted:
-            _submit_prefetch(
+            _prefetch_submitted = _submit_prefetch(
                 epoch + 1,
                 budget_state=edge_budget_controller.current_state(),
             )
@@ -1587,7 +1623,7 @@ def main():
         if sp_world_size > 1:
             dist.barrier(group=sp_group)
 
-        epoch_wall_time = time.time() - t_epoch
+        epoch_wall_time = time.time() - t_epoch - eval_time
         if sp_world_size > 1 and dist.is_initialized():
             epoch_wall_time_t = torch.tensor(
                 [epoch_wall_time], device=device, dtype=torch.float64
