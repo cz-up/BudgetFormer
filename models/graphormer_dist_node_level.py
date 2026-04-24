@@ -1110,6 +1110,8 @@ class _MultiTierResourceManager:
     EDGE_GPU_PERSIST   = "gpu_persist"
     EDGE_GPU_EPHEMERAL = "gpu_ephemeral"
     EDGE_CPU_BROADCAST = "cpu_broadcast"
+    EDGE_CPU_RANK_LOCAL_PREFETCH = "cpu_rank_local_prefetch"
+    EDGE_CPU_BROADCAST_PREFETCH = "cpu_broadcast_prefetch"
 
     # State machine values.
     _DEFERRED              = -1
@@ -1164,6 +1166,7 @@ class _MultiTierResourceManager:
         self._edge_bytes:  int   = 0
         self._t_h2d_edge:  float = 0.0
         self._edge_profiles: dict = {}
+        self._gpu_memory_limit_bytes: int = 0
 
         # --- Final plan ---
         self._cache_edge:          bool = False
@@ -1199,6 +1202,22 @@ class _MultiTierResourceManager:
         except Exception:
             return 0
 
+    def set_gpu_memory_limit_bytes(self, limit_bytes: int) -> None:
+        """Override the per-rank GPU total used by the multi_tier planner."""
+        self._gpu_memory_limit_bytes = max(0, int(limit_bytes))
+
+    def _effective_total_gpu_bytes(self, real_total_gpu: int) -> int:
+        if self._gpu_memory_limit_bytes <= 0:
+            return int(real_total_gpu)
+        return max(1, min(int(real_total_gpu), int(self._gpu_memory_limit_bytes)))
+
+    def _gpu_total_msg(self, real_total_gpu: int, effective_total_gpu: int) -> str:
+        real_mib = real_total_gpu / (1024 ** 2)
+        effective_mib = effective_total_gpu / (1024 ** 2)
+        if int(real_total_gpu) == int(effective_total_gpu):
+            return f"GPU total={real_mib:.0f} MiB"
+        return f"GPU total={real_mib:.0f} MiB, planner_limit={effective_mib:.0f} MiB"
+
     @staticmethod
     def _sync_max_scalar(value, device, dtype) -> int | float:
         if (
@@ -1217,6 +1236,8 @@ class _MultiTierResourceManager:
         return (
             cls.EDGE_GPU_PERSIST,
             cls.EDGE_GPU_EPHEMERAL,
+            cls.EDGE_CPU_RANK_LOCAL_PREFETCH,
+            cls.EDGE_CPU_BROADCAST_PREFETCH,
             cls.EDGE_CPU_BROADCAST,
         )
 
@@ -1227,6 +1248,8 @@ class _MultiTierResourceManager:
         gpu_peak_bytes: int,
         cpu_delta_bytes: int,
         live_edge_bytes: int = 0,
+        serial_time_s = None,
+        overlap_time_s: float = 0.0,
         enabled: bool = True,
     ) -> None:
         policy = str(policy)
@@ -1237,6 +1260,12 @@ class _MultiTierResourceManager:
             return
         self._edge_profiles[policy] = {
             "prep_time_s": max(0.0, float(prep_time_s)),
+            "serial_time_s": (
+                max(0.0, float(serial_time_s))
+                if serial_time_s is not None
+                else max(0.0, float(prep_time_s))
+            ),
+            "overlap_time_s": max(0.0, float(overlap_time_s)),
             "gpu_peak_bytes": max(0, int(gpu_peak_bytes)),
             "cpu_delta_bytes": max(0, int(cpu_delta_bytes)),
             "live_edge_bytes": max(0, int(live_edge_bytes)),
@@ -1254,6 +1283,8 @@ class _MultiTierResourceManager:
                 self.EDGE_GPU_EPHEMERAL,
                 {
                     "prep_time_s": max(0.0, float(self._t_h2d_edge)),
+                    "serial_time_s": max(0.0, float(self._t_h2d_edge)),
+                    "overlap_time_s": 0.0,
                     "gpu_peak_bytes": 0,
                     "cpu_delta_bytes": 0,
                     "live_edge_bytes": 0,
@@ -1266,6 +1297,8 @@ class _MultiTierResourceManager:
                     self.EDGE_GPU_PERSIST,
                     {
                         "prep_time_s": 0.0,
+                        "serial_time_s": 0.0,
+                        "overlap_time_s": 0.0,
                         "gpu_peak_bytes": 0,
                         "cpu_delta_bytes": 0,
                         "live_edge_bytes": max(0, int(self._edge_bytes)),
@@ -1282,25 +1315,27 @@ class _MultiTierResourceManager:
         """Signal that edge budget is stable; begin profiling."""
         if self._state != self._DEFERRED:
             return
+        _already_announced = False
         if reuse_deferred_baseline and self._deferred_baseline_ready:
-            self._peak_warmup = int(self._deferred_peak)
-            self._fwd_live_warmup = int(self._deferred_fwd_live)
-            self._cpu_live_warmup = int(self._deferred_cpu_live)
-            self._t_fwd_recompute = float(self._deferred_t_fwd)
-            self._t_bwd_recompute = float(self._deferred_t_bwd)
-            self._state = self._CALIBRATE_OFFLOAD
+            # Previously this skipped WARMUP_RECOMPUTE entirely and reused both
+            # memory and timing from the deferred (budget-adjustment) phase.
+            # That caused incorrect calibration: the runtime edge policy switches
+            # at freeze time (cpu_broadcast → post-freeze policy), so backward
+            # time can change by 1-2 s per step even with no tier change.
+            # Reusing the old T_bwd as the recompute baseline made CALIBRATE_RETAIN
+            # appear slower than recompute and caused the planner to always select
+            # all-recompute.
+            #
+            # Fix: always run 1 fresh WARMUP_RECOMPUTE step with the post-freeze
+            # edges before proceeding to the calibration stages.  The extra epoch
+            # cost is unavoidable for a valid baseline.
             if self._is_rank0():
                 print(
                     "[MultiTierManager] Edge budget frozen. "
-                    "Reusing pre-freeze recompute baseline from stable stay phase."
+                    "Running 1 fresh WARMUP_RECOMPUTE step with post-freeze edge "
+                    "policy before calibration (deferred timing not reused)."
                 )
-                print(
-                    f"[MultiTierManager] WARMUP_RECOMPUTE reused: "
-                    f"peak={self._peak_warmup/(1024**2):.0f} MiB  "
-                    f"T_fwd={self._t_fwd_recompute*1000:.0f} ms  "
-                    f"T_bwd={self._t_bwd_recompute*1000:.0f} ms"
-                )
-            return
+            _already_announced = True
         self._warmup_target = 1
         self._warmup_peak_samples.clear()
         self._warmup_fwd_live_samples.clear()
@@ -1308,7 +1343,7 @@ class _MultiTierResourceManager:
         self._warmup_t_fwd_samples.clear()
         self._warmup_t_bwd_samples.clear()
         self._state = self._WARMUP_RECOMPUTE
-        if self._is_rank0():
+        if self._is_rank0() and not _already_announced:
             print("[MultiTierManager] Edge budget frozen. Starting WARMUP_RECOMPUTE.")
 
     def global_offload_requested(self) -> bool:
@@ -1392,7 +1427,9 @@ class _MultiTierResourceManager:
         if self._state == self._ACTIVE:
             return
         is_r0 = self._is_rank0()
-        total_gpu = torch.cuda.get_device_properties(device).total_memory
+        real_total_gpu = torch.cuda.get_device_properties(device).total_memory
+        total_gpu = self._effective_total_gpu_bytes(real_total_gpu)
+        gpu_total_msg = self._gpu_total_msg(real_total_gpu, total_gpu)
 
         if self._state == self._DEFERRED:
             self._deferred_peak = int(
@@ -1471,7 +1508,7 @@ class _MultiTierResourceManager:
                     f"peak={self._peak_warmup/(1024**2):.0f} MiB  "
                     f"T_fwd={self._t_fwd_recompute*1000:.0f} ms  "
                     f"T_bwd={self._t_bwd_recompute*1000:.0f} ms  "
-                    f"(GPU total={total_gpu/(1024**2):.0f} MiB)"
+                    f"({gpu_total_msg})"
                     f"{keep_note}"
                 )
 
@@ -1531,6 +1568,7 @@ class _MultiTierResourceManager:
                     f"[MultiTierManager] CALIBRATE_MHA done: "
                     f"M_layer^mha={m_mha/(1024**2):.1f} MiB  "
                     f"peak={self._peak_mha/(1024**2):.0f} MiB  "
+                    f"net_delta_peak={(self._peak_mha - self._peak_warmup)/(1024**2):+.1f} MiB  "
                     f"T_fwd={self._t_fwd_mha*1000:.0f} ms  "
                     f"T_bwd={self._t_bwd_mha*1000:.0f} ms"
                 )
@@ -1565,6 +1603,7 @@ class _MultiTierResourceManager:
                     f"[MultiTierManager] CALIBRATE_RETAIN done: "
                     f"M_layer^full={m_full/(1024**2):.1f} MiB  "
                     f"peak={self._peak_retain/(1024**2):.0f} MiB  "
+                    f"net_delta_peak={( self._peak_retain - self._peak_warmup)/(1024**2):+.1f} MiB  "
                     f"T_fwd={self._t_fwd_retain*1000:.0f} ms  "
                     f"T_bwd={self._t_bwd_retain*1000:.0f} ms"
                 )
@@ -1594,7 +1633,13 @@ class _MultiTierResourceManager:
 
         for edge_policy, edge_profile in self._edge_policy_profiles():
             edge_peak = int(edge_profile.get("live_edge_bytes", 0))
-            edge_time = float(edge_profile.get("prep_time_s", 0.0))
+            edge_serial_time = float(
+                edge_profile.get(
+                    "serial_time_s",
+                    edge_profile.get("prep_time_s", 0.0),
+                )
+            )
+            edge_overlap_time = float(edge_profile.get("overlap_time_s", 0.0))
             prep_gpu_peak = int(edge_profile.get("gpu_peak_bytes", 0))
             prep_cpu_delta = int(edge_profile.get("cpu_delta_bytes", 0))
             if prep_gpu_peak > peak_limit or prep_cpu_delta > cpu_budget:
@@ -1604,6 +1649,7 @@ class _MultiTierResourceManager:
                 cpu_budget=cpu_budget,
                 edge_peak=edge_peak,
             ):
+                edge_time = edge_serial_time + max(0.0, edge_overlap_time - t_model_est)
                 t_est = t_model_est + edge_time
                 key = (
                     t_est,
@@ -1651,6 +1697,9 @@ class _MultiTierResourceManager:
                 f"[MultiTierManager] ACTIVE plan: "
                 f"edge_policy={best_policy}  "
                 f"tiers={tier_counts}  "
+                f"peak_limit={peak_limit/(1024**2):.0f} MiB  "
+                f"net_delta(mha/retain)={(self._peak_mha - self._peak_warmup)/(1024**2):+.1f}"
+                f"/{(self._peak_retain - self._peak_warmup)/(1024**2):+.1f} MiB  "
                 f"est_T_step={best_step_time*1000:.0f} ms "
                 f"(model={best_model_time*1000:.0f} ms "
                 f"fwd={best_fwd_time*1000:.0f} ms "
@@ -1678,9 +1727,21 @@ class _MultiTierResourceManager:
         t_n = max(t_r + (self._t_bwd_retain - self._t_bwd_recompute), 0.0)
 
         m_o = int(self._m_layer_offload)
-        m_k = int(self._m_layer_mha)
-        m_n = int(self._m_layer_full)
         c_o = max(int(self._cpu_bytes_offload), 0)
+        m_full = int(self._m_layer_full)
+        m_mha = int(self._m_layer_mha)
+        # _peak_warmup embeds exactly one backward recompute spike (≈ m_layer_full).
+        # With k_ret retain + k_keep keep_mha layers, all their activations are live
+        # simultaneously at the start of backward, adding:
+        #   k_ret * m_layer_full + k_keep * m_layer_mha
+        # to the forward live footprint above the all-recompute baseline.
+        # The spike in _peak_warmup offsets one of those layers, so the net extra
+        # peak above _peak_warmup is:
+        #   max(0, k_ret*m_full + k_keep*m_mha - m_full)
+        # max(0,...) keeps the estimate conservative: never below peak_warmup.
+        # (The single-layer calibration delta _peak_retain - _peak_warmup ≈ 0 because
+        # the +m_full forward live and -m_full spike elimination cancel for k=1;
+        # using that delta directly gives a severe underestimate for k > 1.)
 
         candidates = []
         for k_off in range(L + 1):
@@ -1690,17 +1751,13 @@ class _MultiTierResourceManager:
             for k_keep in range(L - k_off + 1):
                 for k_ret in range(L - k_off - k_keep + 1):
                     k_rec = L - k_off - k_keep - k_ret
-                    peak_est = self._peak_warmup + edge_peak + (k_off * m_o)
-                    if k_keep > 0:
-                        peak_est = max(
-                            peak_est,
-                            self._peak_mha + edge_peak + (k_off * m_o) + max(k_keep - 1, 0) * m_k,
-                        )
-                    if k_ret > 0:
-                        peak_est = max(
-                            peak_est,
-                            self._peak_retain + edge_peak + (k_off * m_o) + (k_keep * m_k) + max(k_ret - 1, 0) * m_n,
-                        )
+                    net_fwd_extra = max(0, k_ret * m_full + k_keep * m_mha - m_full)
+                    peak_est = (
+                        self._peak_warmup
+                        + edge_peak
+                        + (k_off * m_o)
+                        + net_fwd_extra
+                    )
                     if peak_est > peak_limit:
                         continue
                     tiers = (
@@ -1749,6 +1806,8 @@ class _MultiTierResourceManager:
         if edge_policy not in (
             self.EDGE_GPU_PERSIST,
             self.EDGE_GPU_EPHEMERAL,
+            self.EDGE_CPU_RANK_LOCAL_PREFETCH,
+            self.EDGE_CPU_BROADCAST_PREFETCH,
             self.EDGE_CPU_BROADCAST,
         ):
             raise ValueError(f"Unsupported multi_tier edge policy: {edge_policy!r}")

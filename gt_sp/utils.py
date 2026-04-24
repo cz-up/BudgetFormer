@@ -766,25 +766,25 @@ def build_head_hop_edges(
 def _run_random_walk(edge_index: Tensor, rowptr: Tensor, col: Tensor, starts: Tensor, walk_length: int) -> Tensor:
     # DGL path: better CPU parallelism (OpenMP) for CPU-resident graphs.
     # Only used on CPU; GPU walks stay on torch_cluster.
-    if rowptr.device.type == "cpu":
-        try:
-            import dgl as _dgl
-            key = (int(rowptr.data_ptr()), int(col.data_ptr()))
-            g = _DGL_GRAPH_CACHE.get(key)
-            if g is None:
-                num_nodes = int(rowptr.numel()) - 1
-                # Reconstruct COO from coalesced CSR so the graph topology
-                # exactly matches what _get_random_walk_graph built (no duplicates).
-                src = torch.repeat_interleave(
-                    torch.arange(num_nodes, dtype=torch.long),
-                    rowptr[1:] - rowptr[:-1],
-                )
-                g = _dgl.graph((src, col.long()), num_nodes=num_nodes, device="cpu")
-                _DGL_GRAPH_CACHE[key] = g
-            traces, _ = _dgl.sampling.random_walk(g, starts.long(), length=walk_length)
-            return traces
-        except Exception:
-            pass  # fall through to torch_cluster
+   #  if rowptr.device.type == "cpu":
+   #      try:
+   #          import dgl as _dgl
+   #          key = (int(rowptr.data_ptr()), int(col.data_ptr()))
+   #          g = _DGL_GRAPH_CACHE.get(key)
+   #          if g is None:
+   #              num_nodes = int(rowptr.numel()) - 1
+   #              # Reconstruct COO from coalesced CSR so the graph topology
+   #              # exactly matches what _get_random_walk_graph built (no duplicates).
+   #              src = torch.repeat_interleave(
+   #                  torch.arange(num_nodes, dtype=torch.long),
+   #                  rowptr[1:] - rowptr[:-1],
+   #              )
+   #              g = _dgl.graph((src, col.long()), num_nodes=num_nodes, device="cpu")
+   #              _DGL_GRAPH_CACHE[key] = g
+   #          traces, _ = _dgl.sampling.random_walk(g, starts.long(), length=walk_length)
+   #          return traces
+   #      except Exception:
+   #          pass  # fall through to torch_cluster
 
     try:
         from torch_cluster import random_walk

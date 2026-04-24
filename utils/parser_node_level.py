@@ -231,6 +231,16 @@ def add_node_fullgraph_sp_args(parser, defaults=None):
         ),
     )
     parser.add_argument(
+        "--multi_tier_gpu_memory_limit_mib",
+        type=int,
+        default=defaults.get("multi_tier_gpu_memory_limit_mib", 0),
+        help=(
+            "per-rank GPU memory cap in MiB for --activation_checkpoint_mode multi_tier; "
+            "<=0 uses the physical GPU size. The cap is used by the multi_tier planner "
+            "and applied to PyTorch's CUDA allocator when running on CUDA."
+        ),
+    )
+    parser.add_argument(
         "--random_edge_blocks",
         action="store_true",
         default=defaults.get("random_edge_blocks", False),
@@ -269,7 +279,7 @@ def add_node_fullgraph_sp_args(parser, defaults=None):
     parser.add_argument(
         "--adaptive_edge_budget_gain_threshold",
         type=float,
-        default=defaults.get("adaptive_edge_budget_gain_threshold", 0.0),
+        default=defaults.get("adaptive_edge_budget_gain_threshold", 1e-4),
         help="advanced override for minimum probe-loss improvement per added edge required to keep expanding the budget",
     )
     parser.add_argument(
@@ -354,6 +364,7 @@ def normalize_main_node_batch_sp_args(args):
 def normalize_main_node_fullgraph_sp_args(args):
     _normalize_checkpoint_args(args)
     _normalize_fixed_edge_budget_args(args)
+    _normalize_multi_tier_gpu_memory_limit_args(args)
     if str(getattr(args, "model", "")).lower() == "gt":
         args.attn_type = "sparse"
     if args.model not in ("graphormer", "acm"):
@@ -371,6 +382,13 @@ def _normalize_checkpoint_args(args):
     if checkpoint_mode not in {"all", "ffn_only", "adaptive", "multi_tier"}:
         raise ValueError(f"Unsupported activation_checkpoint_mode: {checkpoint_mode}")
     args.activation_checkpoint_mode = checkpoint_mode
+
+
+def _normalize_multi_tier_gpu_memory_limit_args(args):
+    limit_mib = int(getattr(args, "multi_tier_gpu_memory_limit_mib", 0) or 0)
+    if limit_mib < 0:
+        limit_mib = 0
+    args.multi_tier_gpu_memory_limit_mib = limit_mib
 
 
 def _normalize_fixed_edge_budget_args(args):

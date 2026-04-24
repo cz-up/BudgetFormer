@@ -55,11 +55,15 @@ _GRAPHORMER_VIRTUAL_NODE_MODELS = frozenset(_GRAPHORMER_VARIANTS)
 EDGE_POLICY_GPU_PERSIST = "gpu_persist"
 EDGE_POLICY_GPU_EPHEMERAL = "gpu_ephemeral"
 EDGE_POLICY_CPU_BROADCAST = "cpu_broadcast"
+EDGE_POLICY_CPU_RANK_LOCAL_PREFETCH = "cpu_rank_local_prefetch"
+EDGE_POLICY_CPU_BROADCAST_PREFETCH = "cpu_broadcast_prefetch"
 _EDGE_POLICY_CHOICES = frozenset(
     {
         EDGE_POLICY_GPU_PERSIST,
         EDGE_POLICY_GPU_EPHEMERAL,
         EDGE_POLICY_CPU_BROADCAST,
+        EDGE_POLICY_CPU_RANK_LOCAL_PREFETCH,
+        EDGE_POLICY_CPU_BROADCAST_PREFETCH,
     }
 )
 
@@ -175,8 +179,10 @@ def _edge_policy_build_devices(edge_policy: str, device: str, rw_device) -> tupl
     policy = str(edge_policy)
     if policy not in _EDGE_POLICY_CHOICES:
         raise ValueError(f"Unsupported edge policy: {policy!r}")
-    if policy == EDGE_POLICY_CPU_BROADCAST:
+    if policy in (EDGE_POLICY_CPU_BROADCAST, EDGE_POLICY_CPU_BROADCAST_PREFETCH):
         return torch.device("cpu"), torch.device("cpu")
+    if policy == EDGE_POLICY_CPU_RANK_LOCAL_PREFETCH:
+        return torch.device(device), torch.device("cpu")
     return torch.device(device), torch.device(rw_device)
 
 
@@ -186,7 +192,7 @@ def _edge_policy_force_broadcast(args, edge_policy: str, force_broadcast: Option
     return (
         bool(getattr(args, "force_edge_broadcast", False))
         or bool(getattr(args, "_runtime_force_edge_broadcast", False))
-        or edge_policy == EDGE_POLICY_CPU_BROADCAST
+        or edge_policy in (EDGE_POLICY_CPU_BROADCAST, EDGE_POLICY_CPU_BROADCAST_PREFETCH)
     )
 
 
@@ -459,6 +465,11 @@ def _build_model(args, feature, y, device):
             mode=_ckpt_mode,
             deferred=_ckpt_deferred,
         )
+        if _ckpt_mode == "multi_tier":
+            _limit_mib = int(getattr(args, "multi_tier_gpu_memory_limit_mib", 0) or 0)
+            _mgr = getattr(model, "_comm_ckpt", None)
+            if _limit_mib > 0 and _mgr is not None and hasattr(_mgr, "set_gpu_memory_limit_bytes"):
+                _mgr.set_gpu_memory_limit_bytes(_limit_mib * (1024 ** 2))
     elif args.model == "gt":
         model = GT(
             **common,
@@ -1111,6 +1122,8 @@ class _AdaptiveEdgeBudgetController:
         self.seen_positive_gain = False
         
         self.auto_hold_released = False
+        self.auto_hold_neg_inf_streak = 0
+        self.auto_hold_neg_inf_freeze_after = 5
         self.baseline_acc = -1.0
         self.bootstrap_baseline_loss = float("inf")
         self.bootstrap_baseline_acc = -1.0
@@ -1122,8 +1135,8 @@ class _AdaptiveEdgeBudgetController:
             self.walk_length = None
             return
 
-        self.real_budget = 1 if self.max_total > 0 else 0
-        self.rw_budget = 1 if self.max_total > 0 else 0
+        self.real_budget = 2 if self.max_total > 0 else 0
+        self.rw_budget = 2 if self.max_total > 0 else 0
         self.walk_length = None
 
     def current_state(self):
@@ -1701,9 +1714,24 @@ def _maybe_update_edge_budget(
 
     # 3. Check Condition for Release or Continued Update
     if not controller.auto_hold_released:
+        if best_gain == float("-inf"):
+            controller.auto_hold_neg_inf_streak += 1
+        else:
+            controller.auto_hold_neg_inf_streak = 0
+        if controller.auto_hold_neg_inf_streak >= controller.auto_hold_neg_inf_freeze_after:
+            controller.frozen = True
+            if args.rank == 0:
+                print(
+                    "  ↳ BudgetCtrl [AutoHoldFrozen] "
+                    f"epoch={epoch} best_rel_gain_found=-inf repeated "
+                    f"{controller.auto_hold_neg_inf_streak} epochs; "
+                    "freezing budget."
+                )
+            return
         # Release trigger: Only if we find a significant relative gain
         if best_gain > controller.gain_threshold:
             controller.auto_hold_released = True
+            controller.auto_hold_neg_inf_streak = 0
             if args.rank == 0:
                 print(
                     "  ↳ BudgetCtrl [AutoHoldReleased] via significant rel_gain: "
@@ -1713,7 +1741,9 @@ def _maybe_update_edge_budget(
             if args.rank == 0:
                 print(
                     f"  ↳ BudgetCtrl [AutoHold] epoch={epoch} searching... "
-                    f"best_rel_gain_found={best_gain:.8e} (threshold={controller.gain_threshold:.8e})"
+                    f"best_rel_gain_found={best_gain:.8e} (threshold={controller.gain_threshold:.8e}) "
+                    f"neg_inf_streak={controller.auto_hold_neg_inf_streak}/"
+                    f"{controller.auto_hold_neg_inf_freeze_after}"
                 )
             return
 

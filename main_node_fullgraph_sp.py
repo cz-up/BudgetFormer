@@ -40,6 +40,8 @@ from gt_sp.reducer import build_gradient_reducer, sync_params_and_buffers
 from gt_sp.utils import clear_random_walk_graph_cache, resolve_edge_build_device
 from utils.fullgraph_sp_support import (
     EDGE_POLICY_CPU_BROADCAST,
+    EDGE_POLICY_CPU_BROADCAST_PREFETCH,
+    EDGE_POLICY_CPU_RANK_LOCAL_PREFETCH,
     EDGE_POLICY_GPU_EPHEMERAL,
     EDGE_POLICY_GPU_PERSIST,
     _AdaptiveEdgeBudgetController,
@@ -217,6 +219,12 @@ def _sp_group_min_int(value: int, *, device: str, group, initialized: bool) -> i
     return int(t.item())
 
 
+def _sp_group_barrier(*, group, initialized: bool) -> None:
+    if not initialized:
+        return
+    dist.barrier(group=group)
+
+
 def _edge_seed_for_epoch(epoch: int, *, args, use_epoch_seed: bool, adaptive_edge_budget_cfg):
     if not use_epoch_seed:
         return None
@@ -243,6 +251,122 @@ def _profile_multi_tier_edge_policy(
     precise_step_timing: bool,
     sp_initialized: bool,
 ):
+    if policy in (EDGE_POLICY_CPU_RANK_LOCAL_PREFETCH, EDGE_POLICY_CPU_BROADCAST_PREFETCH):
+        clear_merged_edge_cache()
+        cpu_before = _get_process_rss_mib()
+        gpu_peak_abs = 0
+        build_time = 0.0
+        stage_time = 0.0
+        try:
+            def _build_prefetch_payload():
+                if policy == EDGE_POLICY_CPU_BROADCAST_PREFETCH and sp_rank != sp_src_rank:
+                    return torch.zeros((2, 0), dtype=torch.long)
+                return _build_attention_edges(
+                    args,
+                    edge_index_global,
+                    num_nodes,
+                    "cpu",
+                    "cpu",
+                    sp_group,
+                    sp_src_rank,
+                    sp_rank,
+                    local_num_nodes,
+                    edge_seed=edge_seed,
+                    edge_budget_state=edge_budget_state,
+                    adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
+                    edge_policy=policy,
+                    force_broadcast=False,
+                )
+
+            build_probe, build_time = _time_step_block(
+                _build_prefetch_payload,
+                device="cpu",
+                synchronize_cuda=False,
+            )
+            cpu_delta_bytes = max(
+                int(((_get_process_rss_mib() - cpu_before) * (1024 ** 2))),
+                0,
+            )
+            if torch.cuda.is_available() and device.startswith("cuda"):
+                torch.cuda.synchronize(device)
+                torch.cuda.reset_peak_memory_stats(device)
+            if policy == EDGE_POLICY_CPU_BROADCAST_PREFETCH:
+                # For broadcast-prefetch, only src_rank performs the CPU build.
+                # Non-src ranks would otherwise enter the foreground broadcast
+                # early and spend most of their measured "stage" time waiting
+                # for src_rank to finish build_time. That wait is the
+                # overlappable build portion and should not be double-counted in
+                # stage_time.
+                _sp_group_barrier(group=sp_group, initialized=sp_initialized)
+
+            stage_probe, stage_time = _time_step_block(
+                lambda: _build_attention_edges(
+                    args,
+                    edge_index_global,
+                    num_nodes,
+                    device,
+                    rw_device,
+                    sp_group,
+                    sp_src_rank,
+                    sp_rank,
+                    local_num_nodes,
+                    edge_seed=edge_seed,
+                    edge_budget_state=edge_budget_state,
+                    adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
+                    edge_policy=policy,
+                    force_broadcast=(policy == EDGE_POLICY_CPU_BROADCAST_PREFETCH),
+                ),
+                device=device,
+                synchronize_cuda=precise_step_timing,
+            )
+            if torch.cuda.is_available() and device.startswith("cuda"):
+                gpu_peak_abs = int(torch.cuda.max_memory_allocated(device))
+        finally:
+            if "build_probe" in locals():
+                del build_probe
+            if "stage_probe" in locals():
+                del stage_probe
+            clear_merged_edge_cache()
+            _cuda_empty_cache(args)
+
+        build_time = _sp_group_max(
+            float(build_time),
+            device=device,
+            group=sp_group,
+            dtype=torch.float64,
+            initialized=sp_initialized,
+        )
+        stage_time = _sp_group_max(
+            float(stage_time),
+            device=device,
+            group=sp_group,
+            dtype=torch.float64,
+            initialized=sp_initialized,
+        )
+        gpu_peak_abs = _sp_group_max(
+            int(gpu_peak_abs),
+            device=device,
+            group=sp_group,
+            dtype=torch.long,
+            initialized=sp_initialized,
+        )
+        cpu_delta_bytes = _sp_group_max(
+            int(cpu_delta_bytes),
+            device=device,
+            group=sp_group,
+            dtype=torch.long,
+            initialized=sp_initialized,
+        )
+        return {
+            "policy": policy,
+            "prep_time_s": float(build_time + stage_time),
+            "serial_time_s": float(stage_time),
+            "overlap_time_s": float(build_time),
+            "gpu_peak_bytes": int(gpu_peak_abs),
+            "cpu_delta_bytes": int(cpu_delta_bytes),
+            "live_edge_bytes": 0,
+        }
+
     probe_edge_index_global = edge_index_global
     live_edge_bytes = 0
     probe_cached = False
@@ -330,6 +454,8 @@ def _profile_multi_tier_edge_policy(
     return {
         "policy": policy,
         "prep_time_s": float(prep_time),
+        "serial_time_s": float(prep_time),
+        "overlap_time_s": 0.0,
         "gpu_peak_bytes": int(gpu_peak_abs),
         "cpu_delta_bytes": int(cpu_delta_bytes),
         "live_edge_bytes": int(live_edge_bytes),
@@ -354,8 +480,9 @@ def main():
         "--multi_tier_probe_cpu_broadcast",
         action="store_true",
         help=(
-            "Include cpu_broadcast in multi_tier edge-policy probing. "
-            "Disabled by default because CPU RW construction can dominate epoch-1 time."
+            "Deprecated compatibility flag. CPU sync broadcast is no longer an ACTIVE "
+            "candidate for multi_tier; CPU edge policies are modelled via prefetchable "
+            "rank-local / broadcast variants instead."
         ),
     )
     args = normalize_main_node_fullgraph_sp_args(parser.parse_args())
@@ -525,7 +652,7 @@ def main():
                 # hide edge construction. Real-edge sampling and RW stay on CPU,
                 # but we preserve the deterministic rank-local path so the
                 # prefetched CPU cache entry can be reused next epoch.
-                args._runtime_edge_policy = EDGE_POLICY_GPU_EPHEMERAL
+                args._runtime_edge_policy = EDGE_POLICY_CPU_RANK_LOCAL_PREFETCH
                 args._runtime_force_edge_broadcast = False
                 return
             args._runtime_edge_policy = EDGE_POLICY_CPU_BROADCAST
@@ -557,8 +684,6 @@ def main():
 
     _cuda_empty_cache(args)
     if cpu_real_edge_sampling:
-        if _is_multi_tier:
-            args._runtime_edge_policy = EDGE_POLICY_CPU_BROADCAST
         if args.rank == 0:
             print(
                 "[edge-cache] Disabled: edge_build_device=cpu keeps real-edge sampling on CPU, "
@@ -717,10 +842,17 @@ def main():
     _prefetch_future = None
 
     def _prefetch_cache_compatible() -> bool:
-        return (
-            edge_index_global.device.type == "cpu"
-            and torch.device(rw_device).type == "cpu"
+        if edge_index_global.device.type != "cpu":
+            return False
+        edge_policy = str(
+            getattr(args, "_runtime_edge_policy", EDGE_POLICY_GPU_EPHEMERAL)
         )
+        if edge_policy in (
+            EDGE_POLICY_CPU_RANK_LOCAL_PREFETCH,
+            EDGE_POLICY_CPU_BROADCAST_PREFETCH,
+        ):
+            return True
+        return torch.device(rw_device).type == "cpu"
 
     def _prefetch_topology_plan_stable() -> bool:
         if _is_adaptive_ckpt and not _adaptive_edge_decision_done:
@@ -762,7 +894,10 @@ def main():
         force_broadcast_snap = bool(
             getattr(args, "_runtime_force_edge_broadcast", False)
         )
-        if force_broadcast_snap:
+        is_cpu_broadcast_prefetch = edge_policy_snap == EDGE_POLICY_CPU_BROADCAST_PREFETCH
+        if force_broadcast_snap and not is_cpu_broadcast_prefetch:
+            return False
+        if is_cpu_broadcast_prefetch and sp_rank != sp_src_rank:
             return False
 
         next_seed = _edge_seed_for_epoch(
@@ -784,7 +919,7 @@ def main():
             _ei=edge_index_cpu,
             _budget=budget_snap,
             _edge_policy=edge_policy_snap,
-            _force_broadcast=force_broadcast_snap,
+            _force_broadcast=(False if is_cpu_broadcast_prefetch else force_broadcast_snap),
         ):
             try:
                 _build_attention_edges(
@@ -831,32 +966,41 @@ def main():
         if _is_multi_tier and dynamic_edges and not _multi_tier_edge_profiled and _budget_frozen_notified:
             _mt_prof_mgr = getattr(model, "_comm_ckpt", None)
             if _mt_prof_mgr is not None:
-                candidate_policies = [EDGE_POLICY_CPU_BROADCAST]
-                if device.startswith("cuda") and not cpu_real_edge_sampling:
-                    candidate_policies = [
-                        EDGE_POLICY_GPU_EPHEMERAL,
-                        EDGE_POLICY_GPU_PERSIST,
-                    ]
-                    if bool(getattr(args, "multi_tier_probe_cpu_broadcast", False)):
-                        candidate_policies.append(EDGE_POLICY_CPU_BROADCAST)
+                candidate_policies = []
+                if device.startswith("cuda"):
+                    candidate_policies.extend(
+                        [
+                            EDGE_POLICY_GPU_EPHEMERAL,
+                            EDGE_POLICY_GPU_PERSIST,
+                        ]
+                    )
+                if device.startswith("cuda") and edge_index_global.device.type == "cpu":
+                    candidate_policies.extend(
+                        [
+                            EDGE_POLICY_CPU_RANK_LOCAL_PREFETCH,
+                            EDGE_POLICY_CPU_BROADCAST_PREFETCH,
+                        ]
+                    )
                 if args.rank == 0:
                     print(
                         f"[multi_tier] Profiling edge policies at epoch {epoch} "
                         f"(budget={edge_budget_controller.current_state()})"
                     )
-                    if (
-                        device.startswith("cuda")
-                        and not cpu_real_edge_sampling
-                        and not bool(getattr(args, "multi_tier_probe_cpu_broadcast", False))
-                    ):
+                    if device.startswith("cuda") and edge_index_global.device.type == "cpu":
                         print(
-                            "[multi_tier] Skipping edge_policy=cpu_broadcast by default; "
-                            "enable --multi_tier_probe_cpu_broadcast to include it."
+                            "[multi_tier] CPU prefetch policies enabled for ACTIVE planning "
+                            "regardless of the run's default edge_build_device."
+                        )
+                    elif device.startswith("cuda"):
+                        print(
+                            "[multi_tier] CPU prefetch policies disabled because edge_index_global "
+                            "is not CPU-resident for this run."
                         )
                 for policy in (
                     EDGE_POLICY_GPU_PERSIST,
                     EDGE_POLICY_GPU_EPHEMERAL,
-                    EDGE_POLICY_CPU_BROADCAST,
+                    EDGE_POLICY_CPU_RANK_LOCAL_PREFETCH,
+                    EDGE_POLICY_CPU_BROADCAST_PREFETCH,
                 ):
                     if policy not in candidate_policies:
                         _mt_prof_mgr.set_edge_policy_profile(
@@ -900,6 +1044,8 @@ def main():
                     _mt_prof_mgr.set_edge_policy_profile(
                         policy,
                         prep_time_s=metrics["prep_time_s"],
+                        serial_time_s=metrics.get("serial_time_s"),
+                        overlap_time_s=metrics.get("overlap_time_s", 0.0),
                         gpu_peak_bytes=metrics["gpu_peak_bytes"],
                         cpu_delta_bytes=metrics["cpu_delta_bytes"],
                         live_edge_bytes=metrics["live_edge_bytes"],
@@ -909,6 +1055,8 @@ def main():
                         print(
                             f"[multi_tier] edge_policy={policy}: "
                             f"prep={metrics['prep_time_s'] * 1000:.1f} ms "
+                            f"serial={metrics.get('serial_time_s', metrics['prep_time_s']) * 1000:.1f} ms "
+                            f"overlap={metrics.get('overlap_time_s', 0.0) * 1000:.1f} ms "
                             f"gpu_peak={metrics['gpu_peak_bytes'] / (1024 ** 2):.1f} MiB "
                             f"cpu_delta={metrics['cpu_delta_bytes'] / (1024 ** 2):.1f} MiB "
                             f"live_edge={metrics['live_edge_bytes'] / (1024 ** 2):.1f} MiB"
@@ -1175,7 +1323,9 @@ def main():
                 _policy_to_id = {
                     EDGE_POLICY_GPU_PERSIST: 0,
                     EDGE_POLICY_GPU_EPHEMERAL: 1,
-                    EDGE_POLICY_CPU_BROADCAST: 2,
+                    EDGE_POLICY_CPU_RANK_LOCAL_PREFETCH: 2,
+                    EDGE_POLICY_CPU_BROADCAST_PREFETCH: 3,
+                    EDGE_POLICY_CPU_BROADCAST: 4,
                 }
                 _id_to_policy = {v: k for k, v in _policy_to_id.items()}
                 _mode_to_sync_id = {
@@ -1279,7 +1429,10 @@ def main():
                         ]
                         args._runtime_edge_policy = _fallback_policy
                         args._runtime_force_edge_broadcast = (
-                            _fallback_policy == EDGE_POLICY_CPU_BROADCAST
+                            _fallback_policy in (
+                                EDGE_POLICY_CPU_BROADCAST,
+                                EDGE_POLICY_CPU_BROADCAST_PREFETCH,
+                            )
                         )
                         args._runtime_edge_policy_locked = True
                         _mt_ckpt.override_active_plan(_fallback_policy, _fallback_modes)
@@ -1291,7 +1444,10 @@ def main():
                 else:
                     args._runtime_edge_policy = _mt_policy
                     args._runtime_force_edge_broadcast = (
-                        _mt_policy == EDGE_POLICY_CPU_BROADCAST
+                        _mt_policy in (
+                            EDGE_POLICY_CPU_BROADCAST,
+                            EDGE_POLICY_CPU_BROADCAST_PREFETCH,
+                        )
                     )
                     args._runtime_edge_policy_locked = True
                     _mt_ckpt.override_active_plan(_mt_policy, _synced_modes)
