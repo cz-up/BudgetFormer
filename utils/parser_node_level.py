@@ -15,8 +15,14 @@ def add_node_common_args(parser, defaults=None):
     parser.add_argument(
         "--hops",
         type=int,
-        default=defaults.get("hops", 7),
-        help="[NAGphormer] number of propagation hops; x_local shape becomes (N_local, hops+1, d)",
+        default=defaults.get("hops", 0),
+        help=(
+            "Number of K-hop propagation hops. "
+            "NAGphormer: must be >= 1 (default 7 recommended). "
+            "Graphormer/GT: 0 = disabled (default); > 0 enables multi-hop feature "
+            "pre-aggregation — K-hop features are concatenated into (hops+1)*d input "
+            "for the cross-node Transformer, reducing GPU memory vs NAGphormer."
+        ),
     )
     parser.add_argument(
         "--pe_dim",
@@ -399,6 +405,8 @@ def normalize_main_node_fullgraph_sp_args(args):
         raise ValueError("main_node_fullgraph_sp.py currently supports at most one Graphormer-style virtual node.")
     if args.model == "nagphormer" and int(getattr(args, "hops", 7)) < 1:
         raise ValueError("--hops must be >= 1 for NAGphormer.")
+    if args.model in ("graphormer", "gt") and int(getattr(args, "hops", 0)) < 0:
+        raise ValueError("--hops must be >= 0 for Graphormer/GT (0 = disabled).")
     return args
 
 

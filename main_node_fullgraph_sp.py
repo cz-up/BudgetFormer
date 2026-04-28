@@ -603,6 +603,41 @@ def main():
                 rank=args.rank,
             )
 
+    # Graphormer / GT NAGphormer-style preprocessing:
+    #   hops > 0 : K-hop mean feature smoothing (bidirected+self-loop, same as NAGphormer)
+    #              (N, hops+1, d+pe_dim) → mean over hop dim → (N, d+pe_dim)
+    #              input_dim stays d+pe_dim; cross-node attention is unchanged.
+    #   hops == 0, pe_dim > 0 : Laplacian PE only — concatenated to raw features → (N, d+pe_dim)
+    _is_graphormer_preprocess = (
+        args.model in ("graphormer", "gt")
+        and (int(getattr(args, "hops", 0)) > 0 or int(getattr(args, "pe_dim", 0)) > 0)
+    )
+    if _is_graphormer_preprocess:
+        _gmh_hops = int(getattr(args, "hops", 0))
+        _gmh_pe_dim = int(getattr(args, "pe_dim", 0))
+        if _gmh_hops > 0:
+            feat_3d = _compute_multihop_features(
+                edge_index_global, feature.shape[0], feature, _gmh_hops,
+                pe_dim=_gmh_pe_dim,
+                rank=args.rank,
+            )
+            # Mean over hop dim: (N, hops+1, d+pe_dim) → (N, d+pe_dim)
+            # Graphormer's cross-node attention refines these pre-smoothed features;
+            # keeping input_dim = d+pe_dim avoids inflating the first linear layer.
+            feature = feat_3d.mean(dim=1).contiguous()
+            del feat_3d
+        else:
+            # hops == 0: add Laplacian PE to raw features only
+            if args.rank == 0:
+                print(f"[graphormer-preprocess] Adding Laplacian PE (pe_dim={_gmh_pe_dim}) to raw features …")
+            _row_bi = torch.cat([edge_index_global[0].cpu(), edge_index_global[1].cpu()])
+            _col_bi = torch.cat([edge_index_global[1].cpu(), edge_index_global[0].cpu()])
+            _self = torch.arange(feature.shape[0], dtype=torch.long)
+            _row_aug = torch.cat([_row_bi, _self])
+            _col_aug = torch.cat([_col_bi, _self])
+            lpe = _compute_laplacian_pe(_row_aug, _col_aug, feature.shape[0], _gmh_pe_dim)
+            feature = torch.cat([feature.float().cpu(), lpe], dim=1)
+
     nodes_per_rank = pad_num_nodes // sp_world_size
     rank_start = sp_rank * nodes_per_rank
     rank_end = rank_start + nodes_per_rank
