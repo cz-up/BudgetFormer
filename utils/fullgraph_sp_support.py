@@ -175,6 +175,93 @@ def _compute_multihop_features(edge_index_global, num_nodes, features, hops, pe_
     return result
 
 
+def _build_nagphormer_rw_csr(edge_index_global, num_nodes):
+    """Build bidirected+self-loop CSR (indexed by source) for random-walk sampling.
+
+    Returns csr_ptr (N+1,), csr_col (E_aug,), and the augmented (row_aug, col_aug)
+    so callers can reuse them for Laplacian PE without rebuilding the graph.
+    """
+    row = edge_index_global[0].cpu()
+    col = edge_index_global[1].cpu()
+
+    # bidirected dedup
+    row_bi = torch.cat([row, col])
+    col_bi = torch.cat([col, row])
+    idx = row_bi * num_nodes + col_bi
+    idx, perm = torch.sort(idx)
+    mask = torch.ones(idx.size(0), dtype=torch.bool)
+    mask[1:] = idx[1:] != idx[:-1]
+    perm = perm[mask]
+    row_bi = row_bi[perm]
+    col_bi = col_bi[perm]
+
+    # self-loops — every node has at least one neighbour (itself), so walks never get stuck
+    self_nodes = torch.arange(num_nodes, dtype=torch.long)
+    row_aug = torch.cat([row_bi, self_nodes])
+    col_aug = torch.cat([col_bi, self_nodes])
+
+    # sort by source (row) to build CSR ptr
+    order = torch.argsort(row_aug, stable=True)
+    row_sorted = row_aug[order]
+    col_sorted = col_aug[order]
+
+    # bincount → prefix-sum pointer array (N+1,)
+    counts = torch.bincount(row_sorted, minlength=num_nodes)
+    csr_ptr = torch.zeros(num_nodes + 1, dtype=torch.long)
+    torch.cumsum(counts, dim=0, out=csr_ptr[1:])
+
+    return csr_ptr, col_sorted, row_aug, col_aug
+
+
+def _build_rw_hop_features(feature_cpu, csr_ptr, csr_col, local_nodes, hops, walks_per_node, seed=None):
+    """Vectorized stochastic multi-hop aggregation via random walks.
+
+    W = walks_per_node independent walks of length K are started from each node in
+    local_nodes.  At step k the walker picks a uniformly random neighbour (including
+    self-loop, so the walk never gets stuck).  The feature at each hop is the mean
+    over all W walkers at that position.
+
+    Returns: (N_local, hops+1, d) float32 tensor on CPU.
+    """
+    N = local_nodes.size(0)
+    W = int(walks_per_node)
+    d = feature_cpu.size(1)
+
+    if seed is not None:
+        gen = torch.Generator()
+        gen.manual_seed(int(seed))
+    else:
+        gen = None
+
+    # h_0: own node features, repeated for averaging consistency
+    h0 = feature_cpu[local_nodes]          # (N, d)
+    hop_feats = [h0]
+
+    # current walkers: (N, W) — each of the N local nodes has W parallel walkers
+    current = local_nodes.unsqueeze(1).expand(N, W).clone()   # (N, W)
+
+    for _ in range(hops):
+        flat = current.reshape(-1)           # (N*W,)
+        counts = csr_ptr[flat + 1] - csr_ptr[flat]   # number of neighbours (>=1)
+
+        if gen is not None:
+            rand_frac = torch.rand(flat.size(0), generator=gen)
+        else:
+            rand_frac = torch.rand(flat.size(0))
+
+        rand_off = (rand_frac * counts.float()).long().clamp_max(counts - 1)
+        col_idx = csr_ptr[flat] + rand_off
+        next_flat = csr_col[col_idx]         # (N*W,) next node indices
+
+        # mean feature across W walkers for this hop
+        walker_feats = feature_cpu[next_flat].reshape(N, W, d)   # (N, W, d)
+        hop_feats.append(walker_feats.mean(dim=1))               # (N, d)
+
+        current = next_flat.reshape(N, W)
+
+    return torch.stack(hop_feats, dim=1)   # (N, hops+1, d)
+
+
 EDGE_POLICY_GPU_PERSIST = "gpu_persist"
 EDGE_POLICY_GPU_EPHEMERAL = "gpu_ephemeral"
 EDGE_POLICY_CPU_BROADCAST = "cpu_broadcast"

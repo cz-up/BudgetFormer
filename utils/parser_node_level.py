@@ -27,6 +27,17 @@ def add_node_common_args(parser, defaults=None):
             "NAGphormer paper default is 15. Features are extended to d+pe_dim before propagation."
         ),
     )
+    parser.add_argument(
+        "--nagphormer_rw_walks",
+        type=int,
+        default=defaults.get("nagphormer_rw_walks", 0),
+        help=(
+            "[NAGphormer] Random-walk walks per node per epoch (0 = matrix-power mode). "
+            "When > 0, replaces the static K-hop matrix-power aggregation with W stochastic "
+            "random walks of length K, re-sampled every epoch for implicit regularisation. "
+            "Typical values: 10-50."
+        ),
+    )
     parser.add_argument("--n_layers", type=int, default=defaults.get("n_layers", 4))
     parser.add_argument("--num_heads", type=int, default=defaults.get("num_heads", 8))
     parser.add_argument("--hidden_dim", type=int, default=defaults.get("hidden_dim", 64))
