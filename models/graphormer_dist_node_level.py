@@ -1730,18 +1730,20 @@ class _MultiTierResourceManager:
         c_o = max(int(self._cpu_bytes_offload), 0)
         m_full = int(self._m_layer_full)
         m_mha = int(self._m_layer_mha)
-        # _peak_warmup embeds exactly one backward recompute spike (≈ m_layer_full).
-        # With k_ret retain + k_keep keep_mha layers, all their activations are live
-        # simultaneously at the start of backward, adding:
-        #   k_ret * m_layer_full + k_keep * m_layer_mha
-        # to the forward live footprint above the all-recompute baseline.
-        # The spike in _peak_warmup offsets one of those layers, so the net extra
-        # peak above _peak_warmup is:
-        #   max(0, k_ret*m_full + k_keep*m_mha - m_full)
-        # max(0,...) keeps the estimate conservative: never below peak_warmup.
-        # (The single-layer calibration delta _peak_retain - _peak_warmup ≈ 0 because
-        # the +m_full forward live and -m_full spike elimination cancel for k=1;
-        # using that delta directly gives a severe underestimate for k > 1.)
+        # Use calibration-measured peak deltas as the base for the first keep_mha/retain
+        # layer, then scale linearly for additional layers.
+        #
+        # The old formula used m_full as a proxy for the backward recompute spike, but
+        # m_full = fwd_live_retain - fwd_live_warmup (a forward-live delta) is NOT the
+        # same as the backward recompute spike.  For L=1 in particular, the formula
+        # always produced net_fwd_extra=0 (since m_mha <= m_full), accepting the
+        # keep_mha plan even when _peak_mha > peak_warmup, causing OOM.
+        #
+        # The calibration steps already measured _peak_mha and _peak_retain directly.
+        # For k_keep=1: the measured delta _peak_mha - _peak_warmup is the ground truth.
+        # For k_keep>1: scale by m_mha per additional layer.
+        mha_delta = self._peak_mha - self._peak_warmup
+        retain_delta = self._peak_retain - self._peak_warmup
 
         candidates = []
         for k_off in range(L + 1):
@@ -1751,7 +1753,9 @@ class _MultiTierResourceManager:
             for k_keep in range(L - k_off + 1):
                 for k_ret in range(L - k_off - k_keep + 1):
                     k_rec = L - k_off - k_keep - k_ret
-                    net_fwd_extra = max(0, k_ret * m_full + k_keep * m_mha - m_full)
+                    mha_extra = (mha_delta + max(0, k_keep - 1) * m_mha) if k_keep > 0 else 0
+                    retain_extra = (retain_delta + max(0, k_ret - 1) * m_full) if k_ret > 0 else 0
+                    net_fwd_extra = max(0, mha_extra + retain_extra)
                     peak_est = (
                         self._peak_warmup
                         + edge_peak
