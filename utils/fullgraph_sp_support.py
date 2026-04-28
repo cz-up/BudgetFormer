@@ -26,8 +26,8 @@ from gt_sp.utils import (
     random_split_idx,
 )
 from models.graphormer_dist_node_level import Graphormer
-from models.acm_dist_node_level import ACMGraphormer
 from models.gt_dist_node_level import GT
+from models.nagphormer_dist_node_level import NAGphormer
 from utils.lr import PolynomialDecayLR
 from utils.split_utils import load_default_split
 
@@ -49,9 +49,132 @@ _EDGE_DST_STATS_CACHE: dict = {}
 
 _GRAPHORMER_VARIANTS = {
     "graphormer": Graphormer,
-    "acm": ACMGraphormer,
 }
 _GRAPHORMER_VIRTUAL_NODE_MODELS = frozenset(_GRAPHORMER_VARIANTS)
+
+
+def _compute_laplacian_pe(row_aug, col_aug, num_nodes, pe_dim):
+    """Compute Laplacian Positional Encoding matching NAGphormer's utils.laplacian_positional_encoding.
+
+    NAGphormer computes PE on the UNWEIGHTED 0/1 adjacency (dgl_graph_to_sparse_adj returns
+    values=1 regardless of edge weights), then uses the integer in-degree for normalisation.
+    The result is the standard normalised graph Laplacian eigenvectors of the
+    bidirected+self-loop graph structure.
+    """
+    import numpy as np
+    import scipy.sparse as sp
+    from scipy.sparse.linalg import eigs
+
+    n = int(num_nodes)
+    row_np = row_aug.numpy().astype(np.int32)
+    col_np = col_aug.numpy().astype(np.int32)
+
+    # Unweighted 0/1 adjacency — matches dgl_graph_to_sparse_adj (data=np.ones)
+    data = np.ones(len(row_np), dtype=np.float64)
+    A_01 = sp.csr_matrix((data, (row_np, col_np)), shape=(n, n))
+
+    # Integer in-degrees (edge count, not weighted sum)
+    in_deg = np.array(A_01.sum(axis=0), dtype=np.float64).flatten().clip(1)
+    D_inv_sqrt = sp.diags(in_deg ** -0.5)
+
+    # L = I - D^{-1/2} A_01 D^{-1/2}  (standard normalised Laplacian)
+    L = sp.eye(n, format="csr") - D_inv_sqrt @ A_01 @ D_inv_sqrt
+
+    try:
+        EigVal, EigVec = eigs(L, k=pe_dim + 1, which="SR", tol=1e-2)
+    except Exception:
+        # Fallback for very small or disconnected graphs
+        EigVal, EigVec = np.linalg.eigh(L.toarray())
+        EigVal, EigVec = EigVal[: pe_dim + 1], EigVec[:, : pe_dim + 1]
+
+    order = EigVal.real.argsort()
+    EigVec = EigVec[:, order]
+    lap_pe = torch.from_numpy(EigVec[:, 1 : pe_dim + 1].real).float()
+    return lap_pe
+
+
+def _compute_multihop_features(edge_index_global, num_nodes, features, hops, pe_dim=0, rank=0):
+    """Pre-compute K-hop neighborhood feature aggregations for NAGphormer.
+
+    Faithfully reproduces NAGphormer's full data-preprocessing pipeline:
+      1. Convert to bidirected — NAGphormer calls dgl.to_bidirected on every dataset.
+      2. Add self-loops — normalize_sparse_adj does adj = adj + I before normalising.
+      3. Laplacian PE (pe_dim > 0): compute eigenvectors of the normalised Laplacian on
+         the UNWEIGHTED (0/1) bidirected+self-loop structure (matching dgl_graph_to_sparse_adj
+         which returns ones regardless of edge weights), then cat to node features.
+         PE is concatenated BEFORE propagation so it is also smoothed across hops.
+      4. Symmetric normalisation D^{-1/2}(A_bi+I)D^{-1/2} with degree from augmented adj.
+      5. Iterative propagation: h_0 = features, h_k = A_norm @ h_{k-1}.
+      6. Stack [h_0, …, h_hops] → (num_nodes, hops+1, d+pe_dim).
+    """
+    from torch_sparse import SparseTensor
+    from torch_geometric.utils import degree as pyg_degree
+
+    raw_dim = features.shape[-1]
+    if rank == 0:
+        total_dim = raw_dim + pe_dim
+        mem_mib = num_nodes * (hops + 1) * total_dim * 4 / (1024 ** 2)
+        print(
+            f"[nagphormer] Pre-computing {hops}-hop features "
+            f"(N={num_nodes:,}, d={raw_dim}, pe_dim={pe_dim}, est.={mem_mib:.1f} MiB) …"
+        )
+    t0 = time.time()
+
+    row = edge_index_global[0].cpu()
+    col = edge_index_global[1].cpu()
+
+    # Step 1: bidirected
+    row_bi = torch.cat([row, col])
+    col_bi = torch.cat([col, row])
+    idx = row_bi * num_nodes + col_bi
+    idx, perm = torch.sort(idx)
+    mask = torch.ones(idx.size(0), dtype=torch.bool)
+    mask[1:] = idx[1:] != idx[:-1]
+    perm = perm[mask]
+    row_bi = row_bi[perm]
+    col_bi = col_bi[perm]
+
+    # Step 2: self-loops
+    self_nodes = torch.arange(num_nodes, dtype=torch.long)
+    row_aug = torch.cat([row_bi, self_nodes])
+    col_aug = torch.cat([col_bi, self_nodes])
+
+    # Step 3: Laplacian PE — computed on the unweighted 0/1 graph topology,
+    # then concatenated to features BEFORE propagation (matching NAGphormer data.py)
+    x = features.float().cpu()
+    if pe_dim > 0:
+        if rank == 0:
+            print(f"[nagphormer] Computing Laplacian PE (pe_dim={pe_dim}) …")
+        lpe = _compute_laplacian_pe(row_aug, col_aug, num_nodes, pe_dim)
+        x = torch.cat([x, lpe], dim=1)  # (num_nodes, raw_dim + pe_dim)
+
+    # Step 4: weighted normalisation for propagation
+    deg = pyg_degree(col_aug, num_nodes, dtype=torch.float)
+    deg_inv_sqrt = deg.pow(-0.5)
+    deg_inv_sqrt[deg_inv_sqrt == float("inf")] = 0.0
+    norm = deg_inv_sqrt[row_aug] * deg_inv_sqrt[col_aug]
+
+    adj_t = SparseTensor(
+        row=col_aug, col=row_aug, value=norm.float(),
+        sparse_sizes=(num_nodes, num_nodes),
+    )
+
+    # Step 5: iterative propagation
+    hop_feats = [x]
+    for _ in range(hops):
+        x = adj_t @ x
+        hop_feats.append(x)
+
+    result = torch.stack(hop_feats, dim=1)  # (num_nodes, hops+1, raw_dim+pe_dim)
+    if rank == 0:
+        actual_mib = result.numel() * result.element_size() / (1024 ** 2)
+        print(
+            f"[nagphormer] Multi-hop features ready in {time.time() - t0:.2f}s "
+            f"({actual_mib:.1f} MiB)"
+        )
+    return result
+
+
 EDGE_POLICY_GPU_PERSIST = "gpu_persist"
 EDGE_POLICY_GPU_EPHEMERAL = "gpu_ephemeral"
 EDGE_POLICY_CPU_BROADCAST = "cpu_broadcast"
@@ -434,10 +557,13 @@ def _torch_load_cpu(path: str):
 
 def _build_model(args, feature, y, device):
     out_dim = int(y.max().item()) + 1
+    # feature may be (N, d) for GT/Graphormer or (N, hops+1, d) for NAGphormer;
+    # shape[-1] always gives the raw input feature dimension.
+    input_dim = feature.shape[-1]
     common = dict(
         n_layers=args.n_layers,
         num_heads=args.num_heads,
-        input_dim=feature.shape[1],
+        input_dim=input_dim,
         hidden_dim=args.hidden_dim,
         output_dim=out_dim,
         attn_bias_dim=args.attn_bias_dim,
@@ -474,6 +600,18 @@ def _build_model(args, feature, y, device):
         model = GT(
             **common,
             num_global_node=0,
+        ).to(device)
+    elif args.model == "nagphormer":
+        model = NAGphormer(
+            hops=int(getattr(args, "hops", 7)),
+            n_class=out_dim,
+            input_dim=input_dim,
+            n_layers=args.n_layers,
+            num_heads=args.num_heads,
+            hidden_dim=args.hidden_dim,
+            ffn_dim=args.ffn_dim,
+            dropout_rate=args.dropout_rate,
+            attention_dropout_rate=args.attention_dropout_rate,
         ).to(device)
     else:
         raise ValueError(f"Unsupported model: {args.model}")
@@ -2095,7 +2233,10 @@ def _eval_sp(args, model, x_local, y, split_idx, edge_index_global, num_nodes,
              edge_budget_state=None, adaptive_edge_budget_cfg=None):
     use_rocauc = str(getattr(args, "dataset", "")).lower() == "genius"
 
-    if cached_edge_index is None:
+    if str(getattr(args, "model", "")) == "nagphormer":
+        # NAGphormer uses pre-computed multi-hop features; no edge_index needed.
+        edge_index_eval = None
+    elif cached_edge_index is None:
         with fixed_random_seed(args.seed):
             edge_index_eval = _build_attention_edges(
                 args, edge_index_global, num_nodes, device, rw_device,

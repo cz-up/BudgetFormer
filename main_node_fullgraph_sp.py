@@ -53,6 +53,7 @@ from utils.fullgraph_sp_support import (
     _build_model,
     _build_optimizer_bundle,
     _bootstrap_initial_edge_budget,
+    _compute_multihop_features,
     _cuda_empty_cache,
     _eval_sp,
     _measure_edge_h2d_time,
@@ -560,12 +561,24 @@ def main():
         pad_rows = pad_num_nodes - num_nodes
         feature = torch.cat([feature, feature.new_zeros(pad_rows, feature.shape[1])], dim=0)
         y = torch.cat([y, y.new_full((pad_rows,) + y.shape[1:], -1)], dim=0)
+
+    # NAGphormer: pre-compute K-hop neighborhood features once before training.
+    # Done after padding so padded rows are zero-initialised and propagate cleanly.
+    # feature becomes (N_padded, hops+1, d); all downstream slices are correct.
+    _is_nagphormer = (args.model == "nagphormer")
+    if _is_nagphormer:
+        feature = _compute_multihop_features(
+            edge_index_global, feature.shape[0], feature, args.hops,
+            pe_dim=int(getattr(args, "pe_dim", 0)),
+            rank=args.rank,
+        )
+
     nodes_per_rank = pad_num_nodes // sp_world_size
     rank_start = sp_rank * nodes_per_rank
     rank_end = rank_start + nodes_per_rank
     local_num_nodes = nodes_per_rank
 
-    if args.model in ("graphormer", "acm") and args.num_global_node > 0:
+    if args.model == "graphormer" and args.num_global_node > 0:
         sub_real_seq_len = nodes_per_rank + args.num_global_node
         global_token_indices = list(range(0, sp_world_size * sub_real_seq_len, sub_real_seq_len))
         set_global_token_indices(global_token_indices)
@@ -711,7 +724,13 @@ def main():
     _adaptive_edge_decision_done = True  # True = no deferred work needed
 
     _cuda_empty_cache(args)
-    if cpu_real_edge_sampling:
+    if _is_nagphormer:
+        if args.rank == 0:
+            print(
+                "[edge-cache] Disabled: NAGphormer uses pre-computed multi-hop features; "
+                "edge_index_global is not passed to the model."
+            )
+    elif cpu_real_edge_sampling:
         if args.rank == 0:
             print(
                 "[edge-cache] Disabled: edge_build_device=cpu keeps real-edge sampling on CPU, "
@@ -1126,11 +1145,15 @@ def main():
             prefetch_wait_time = time.perf_counter() - _prefetch_wait_start
             _prefetch_future = None
 
-        edge_index_rw, rw_time = _time_step_block(
-            _build_edges_for_epoch,
-            device=device,
-            synchronize_cuda=sync_step_timing,
-        )
+        if _is_nagphormer:
+            # NAGphormer uses pre-computed multi-hop features; no edge building needed.
+            edge_index_rw, rw_time = None, 0.0
+        else:
+            edge_index_rw, rw_time = _time_step_block(
+                _build_edges_for_epoch,
+                device=device,
+                synchronize_cuda=sync_step_timing,
+            )
         # Submit N+1 prefetch as soon as the current epoch's edge build is done.
         # This allows the CPU worker to overlap with the current epoch's GPU
         # forward/backward when the next epoch's budget and edge policy are
@@ -1495,7 +1518,8 @@ def main():
         loss_ema = loss_val if loss_ema is None else 0.9 * loss_ema + 0.1 * loss_val
 
         del out_local, loss, local_y_eff, valid_train_mask, local_train_idx_eff
-        del edge_index_rw
+        if edge_index_rw is not None:
+            del edge_index_rw
 
         cpu_rss = _get_process_rss_mib()
         cpu_rss_peak = _get_process_peak_rss_mib()

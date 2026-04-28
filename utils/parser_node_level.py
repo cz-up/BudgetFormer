@@ -11,7 +11,22 @@ def add_node_common_args(parser, defaults=None):
     )
 
     parser.add_argument("--model", type=str, default=defaults.get("model", "graphormer"),
-                        choices=["graphormer", "gt", "acm"])
+                        choices=["graphormer", "gt", "nagphormer"])
+    parser.add_argument(
+        "--hops",
+        type=int,
+        default=defaults.get("hops", 7),
+        help="[NAGphormer] number of propagation hops; x_local shape becomes (N_local, hops+1, d)",
+    )
+    parser.add_argument(
+        "--pe_dim",
+        type=int,
+        default=defaults.get("pe_dim", 0),
+        help=(
+            "[NAGphormer] Laplacian positional encoding dimension (0 = disabled). "
+            "NAGphormer paper default is 15. Features are extended to d+pe_dim before propagation."
+        ),
+    )
     parser.add_argument("--n_layers", type=int, default=defaults.get("n_layers", 4))
     parser.add_argument("--num_heads", type=int, default=defaults.get("num_heads", 8))
     parser.add_argument("--hidden_dim", type=int, default=defaults.get("hidden_dim", 64))
@@ -365,12 +380,14 @@ def normalize_main_node_fullgraph_sp_args(args):
     _normalize_checkpoint_args(args)
     _normalize_fixed_edge_budget_args(args)
     _normalize_multi_tier_gpu_memory_limit_args(args)
-    if str(getattr(args, "model", "")).lower() == "gt":
+    if str(getattr(args, "model", "")).lower() in ("gt", "nagphormer"):
         args.attn_type = "sparse"
-    if args.model not in ("graphormer", "acm"):
+    if args.model != "graphormer":
         args.num_global_node = 0
     elif args.num_global_node not in (0, 1):
         raise ValueError("main_node_fullgraph_sp.py currently supports at most one Graphormer-style virtual node.")
+    if args.model == "nagphormer" and int(getattr(args, "hops", 7)) < 1:
+        raise ValueError("--hops must be >= 1 for NAGphormer.")
     return args
 
 
