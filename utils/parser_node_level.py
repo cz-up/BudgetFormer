@@ -11,7 +11,7 @@ def add_node_common_args(parser, defaults=None):
     )
 
     parser.add_argument("--model", type=str, default=defaults.get("model", "graphormer"),
-                        choices=["graphormer", "gt", "nagphormer"])
+                        choices=["graphormer", "gt", "nagphormer", "exphormer"])
     parser.add_argument(
         "--hops",
         type=int,
@@ -31,6 +31,18 @@ def add_node_common_args(parser, defaults=None):
         help=(
             "[NAGphormer] Laplacian positional encoding dimension (0 = disabled). "
             "NAGphormer paper default is 15. Features are extended to d+pe_dim before propagation."
+        ),
+    )
+    parser.add_argument(
+        "--expander_degree",
+        type=int,
+        default=defaults.get("expander_degree", 0),
+        help=(
+            "[Exphormer] Degree of the random d-regular expander graph added as extra "
+            "attention edges (0 = disabled). Paper uses 3. Expander edges are generated "
+            "once at startup (fixed seed) and merged into the attention edge pool each epoch. "
+            "Edge type (0=real/RW, 1=expander) is carried in edge_index row-2 for the "
+            "Exphormer model's edge-feature-modulated attention."
         ),
     )
     parser.add_argument(
@@ -397,7 +409,7 @@ def normalize_main_node_fullgraph_sp_args(args):
     _normalize_checkpoint_args(args)
     _normalize_fixed_edge_budget_args(args)
     _normalize_multi_tier_gpu_memory_limit_args(args)
-    if str(getattr(args, "model", "")).lower() in ("gt", "nagphormer"):
+    if str(getattr(args, "model", "")).lower() in ("gt", "nagphormer", "exphormer"):
         args.attn_type = "sparse"
     if args.model != "graphormer":
         args.num_global_node = 0
@@ -407,6 +419,8 @@ def normalize_main_node_fullgraph_sp_args(args):
         raise ValueError("--hops must be >= 1 for NAGphormer.")
     if args.model in ("graphormer", "gt") and int(getattr(args, "hops", 0)) < 0:
         raise ValueError("--hops must be >= 0 for Graphormer/GT (0 = disabled).")
+    if str(getattr(args, "dataset", "")).lower() == "ogbn-arxiv":
+        args.to_bidirected = True
     return args
 
 

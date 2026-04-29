@@ -25,6 +25,7 @@ from gt_sp.utils import (
     fixed_random_seed,
     random_split_idx,
 )
+from models.exphormer_dist_node_level import Exphormer
 from models.graphormer_dist_node_level import Graphormer
 from models.gt_dist_node_level import GT
 from models.nagphormer_dist_node_level import NAGphormer
@@ -260,6 +261,31 @@ def _build_rw_hop_features(feature_cpu, csr_ptr, csr_col, local_nodes, hops, wal
         current = next_flat.reshape(N, W)
 
     return torch.stack(hop_feats, dim=1)   # (N, hops+1, d)
+
+
+def _generate_expander_edges(num_nodes, degree, seed=0):
+    """Generate a random d-regular expander graph using Hamiltonian cycles.
+
+    Matches Exphormer's default 'Hamiltonian' algorithm.  Each of the `degree`
+    cycles is a random permutation of all nodes visited in order; edges are
+    added in both directions.  Self-loops are removed.
+
+    Returns edge_index (2, ~num_nodes * degree * 2) with global node indices.
+    """
+    import numpy as np
+    rng = np.random.default_rng(int(seed))
+    senders, receivers = [], []
+    for _ in range(degree):
+        perm = rng.permutation(num_nodes).tolist()
+        for idx in range(num_nodes):
+            v = perm[idx]
+            u = perm[(idx - 1) % num_nodes]
+            senders.extend([v, u])
+            receivers.extend([u, v])
+    row = torch.tensor(senders, dtype=torch.long)
+    col = torch.tensor(receivers, dtype=torch.long)
+    mask = row != col
+    return torch.stack([row[mask], col[mask]], dim=0)
 
 
 EDGE_POLICY_GPU_PERSIST = "gpu_persist"
@@ -685,6 +711,11 @@ def _build_model(args, feature, y, device):
                 _mgr.set_gpu_memory_limit_bytes(_limit_mib * (1024 ** 2))
     elif args.model == "gt":
         model = GT(
+            **common,
+            num_global_node=0,
+        ).to(device)
+    elif args.model == "exphormer":
+        model = Exphormer(
             **common,
             num_global_node=0,
         ).to(device)

@@ -57,6 +57,7 @@ from utils.fullgraph_sp_support import (
     _build_rw_hop_features,
     _compute_laplacian_pe,
     _compute_multihop_features,
+    _generate_expander_edges,
     _cuda_empty_cache,
     _eval_sp,
     _measure_edge_h2d_time,
@@ -569,6 +570,7 @@ def main():
     # Done after padding so padded rows are zero-initialised and propagate cleanly.
     # feature becomes (N_padded, hops+1, d); all downstream slices are correct.
     _is_nagphormer = (args.model == "nagphormer")
+    _is_exphormer = (args.model == "exphormer")
     _nag_rw_mode = _is_nagphormer and int(getattr(args, "nagphormer_rw_walks", 0)) > 0
     _nag_rw_ptr = None
     _nag_rw_col = None
@@ -637,6 +639,22 @@ def main():
             _col_aug = torch.cat([_col_bi, _self])
             lpe = _compute_laplacian_pe(_row_aug, _col_aug, feature.shape[0], _gmh_pe_dim)
             feature = torch.cat([feature.float().cpu(), lpe], dim=1)
+
+    # Exphormer: generate fixed expander edges once (same seed every run).
+    # Stored on CPU; merged into edge_index per epoch as edge type = 1.
+    _expander_edge_index_cpu = None
+    _expander_degree = int(getattr(args, "expander_degree", 0))
+    if _expander_degree > 0:
+        if args.rank == 0:
+            print(
+                f"[exphormer] Generating expander edges "
+                f"(N={pad_num_nodes:,}, degree={_expander_degree}) …"
+            )
+        _expander_edge_index_cpu = _generate_expander_edges(
+            pad_num_nodes, _expander_degree, seed=int(getattr(args, "seed", 0))
+        )
+        if args.rank == 0:
+            print(f"[exphormer] Expander edges: {_expander_edge_index_cpu.shape[1]:,}")
 
     nodes_per_rank = pad_num_nodes // sp_world_size
     rank_start = sp_rank * nodes_per_rank
@@ -953,10 +971,6 @@ def main():
         (_is_adaptive_ckpt or _is_multi_tier) and _adaptive_edge_budget_enabled(args)
     )
 
-    # Prefetch can only be reused if the next epoch's sampled topology is
-    # keyed by a deterministic seed.  This must cover plain RW edges too, not
-    # only the later random per-query block sampling stage; otherwise a
-    # cpu_*_prefetch policy silently falls back to foreground construction.
     use_epoch_seed = dynamic_edges
 
     # Async edge prefetch: while the GPU runs epoch N, a background thread builds
@@ -1239,6 +1253,22 @@ def main():
                 device=device,
                 synchronize_cuda=sync_step_timing,
             )
+
+        # Exphormer: merge expander edges into edge_index_rw and attach edge-type
+        # labels in row-2 (0 = real/RW edge, 1 = expander edge).
+        # ExphormerCoreAttention reads row-2 as edge type for score modulation.
+        if _expander_edge_index_cpu is not None and edge_index_rw is not None:
+            _exp = _expander_edge_index_cpu.to(edge_index_rw.device)
+            # Strip existing row-2 (hop counts) if present — Exphormer uses row-2 for type
+            _ei_base = edge_index_rw[:2] if edge_index_rw.size(0) == 3 else edge_index_rw
+            _n_real = _ei_base.size(1)
+            _n_exp = _exp.size(1)
+            _real_type = torch.zeros(_n_real, dtype=torch.long, device=_ei_base.device)
+            _exp_type = torch.ones(_n_exp, dtype=torch.long, device=_ei_base.device)
+            edge_index_rw = torch.cat([
+                torch.cat([_ei_base, _exp], dim=1),
+                torch.cat([_real_type, _exp_type]).unsqueeze(0),
+            ], dim=0)  # (3, E_real + E_exp)
         # Submit N+1 prefetch as soon as the current epoch's edge build is done.
         # This allows the CPU worker to overlap with the current epoch's GPU
         # forward/backward when the next epoch's budget and edge policy are
