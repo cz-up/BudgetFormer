@@ -1,7 +1,6 @@
 import torch
 import torch.nn.functional as F
 import numpy as np
-import math
 from collections import defaultdict
 import json
 from models.graphormer_dist_node_level import Graphormer
@@ -219,6 +218,7 @@ def _serialize_hop_mass_stats(stats):
             "mean_max_hop": float(max_sum / max(1, max_count)),
             "max_hop": int(max_hop),
             "hop_count": int(hop_count),
+            "hop_ratios_start": 0,
             "hop_ratios": hop_ratios,
         }
     return out
@@ -244,6 +244,7 @@ def _write_hop_mass_stats(args, epoch: int, stats, train_acc: float, val_acc: fl
         "query_sampling": str(getattr(args, "full_attn_hop_query_sampling", "random")),
         "max_batches": int(getattr(args, "full_attn_hop_max_batches", 1)),
         "max_hop_limit": int(getattr(args, "full_attn_hop_max_hop", 64)),
+        "hop_ratios_start": 0,
         "train_acc": float(train_acc),
         "val_acc": float(val_acc),
         "test_acc": float(test_acc),
@@ -303,8 +304,7 @@ def run_step(args, model, device, feature, y, idx_batch_cpu, sub_split_seq_lens,
 def _collect_hop_mass_stats_main_node_sp(args, model, device, feature, y, sub_idx, edge_index_global, N):
     """
     Restore the original hop-stats semantics for main_node_sp.py:
-    use the batch induced subgraph itself for evaluation-time hop tracking
-    instead of the random-walk attention graph built by get_batch_blockize().
+    use the batch induced subgraph itself for evaluation-time hop tracking.
     Shuffle the validation/query nodes globally before batching so the sampled
     queries are not always drawn from the fixed prefix of the split when
     max_batches is small.
@@ -348,260 +348,6 @@ def _collect_hop_mass_stats_main_node_sp(args, model, device, feature, y, sub_id
         _ = model(x_i, attn_bias, edge_index_i, attn_type=args.attn_type)
 
     return model.get_hop_mass_stats_per_layer()
-
-
-def _prepare_induced_eval_batch(args, device, feature, y, idx_i, edge_index_global, N):
-    rest_split_sizes = None
-    if idx_i.shape[0] < args.seq_len:
-        rest_split_sizes, current_global_token_indices_last_batch = _get_current_batch_split_state(
-            args,
-            int(idx_i.shape[0]),
-        )
-        set_last_batch_global_token_indices(current_global_token_indices_last_batch)
-
-    x_i, y_i, edge_index_i, attn_bias = get_batch_blockize(
-        args,
-        feature,
-        y,
-        idx_i,
-        rest_split_sizes,
-        edge_index_global,
-        N,
-        device=device,
-        seed_label_mask=None,
-        force_induced_edges=True,
-        apply_graphormer_virtual_edges=False,
-    )
-
-    x_i = x_i.to(device)
-    y_i = y_i.to(device)
-    if isinstance(edge_index_i, list):
-        edge_index_i = [e.to(device) for e in edge_index_i]
-    else:
-        edge_index_i = edge_index_i.to(device)
-    return x_i, y_i, edge_index_i, attn_bias
-
-
-def _build_onehop_neighbors(edge_index, num_nodes: int):
-    neighbors = [set() for _ in range(max(0, int(num_nodes)))]
-    if edge_index is None:
-        return [tuple() for _ in neighbors]
-    if isinstance(edge_index, list):
-        edge_parts = [e for e in edge_index if e is not None and e.numel() > 0]
-        if not edge_parts:
-            return [tuple() for _ in neighbors]
-        edge_index = torch.cat(edge_parts, dim=1)
-    if edge_index.numel() == 0:
-        return [tuple() for _ in neighbors]
-
-    edge_cpu = edge_index.detach().cpu()
-    src = edge_cpu[0].long().tolist()
-    dst = edge_cpu[1].long().tolist()
-    for s, d in zip(src, dst):
-        if 0 <= s < num_nodes and 0 <= d < num_nodes:
-            neighbors[s].add(d)
-            neighbors[d].add(s)
-    return [tuple(sorted(v)) for v in neighbors]
-
-
-def _build_full_onehop_extra_bias(
-    attn_mean,
-    edge_index,
-    y_i,
-    num_global_tokens: int,
-    mode: str,
-    keep_k: int,
-    keep_ratio: float,
-    seed: int,
-):
-    if attn_mean is None:
-        return None
-    if attn_mean.dim() == 3:
-        attn_mean = attn_mean[0]
-    attn_mean = attn_mean.float().cpu()
-    q_len, k_len = attn_mean.shape
-    real_count = int((y_i.view(-1) != -100).sum().item())
-    extra_bias = torch.zeros((1, 1, q_len, k_len), dtype=torch.float32)
-    if real_count <= 0:
-        return extra_bias
-
-    keep_k = max(1, int(keep_k))
-    keep_ratio = float(keep_ratio)
-    real_key_start = int(num_global_tokens)
-    neg_inf = -1e9
-    neighbors = _build_onehop_neighbors(edge_index, real_count)
-
-    for q_local in range(real_count):
-        row = real_key_start + q_local
-        if row >= q_len:
-            break
-        extra_bias[0, 0, row, real_key_start:k_len] = neg_inf
-
-        chosen = []
-        onehop = list(neighbors[q_local])
-        if onehop:
-            keep_count = min(keep_k, len(onehop))
-            if keep_ratio > 0.0:
-                keep_count = min(len(onehop), max(1, int(math.ceil(len(onehop) * keep_ratio))))
-            if mode == "all":
-                chosen = onehop
-            elif mode == "topk":
-                scored = [
-                    (float(attn_mean[row, real_key_start + n].item()), n)
-                    for n in onehop
-                    if real_key_start + n < k_len
-                ]
-                scored.sort(key=lambda x: x[0], reverse=True)
-                chosen = [n for _, n in scored[:keep_count]]
-            elif mode == "randomk":
-                gen = torch.Generator(device="cpu")
-                gen.manual_seed(int(seed) + q_local * 1000003)
-                perm = torch.randperm(len(onehop), generator=gen)[:keep_count]
-                chosen = [onehop[i] for i in perm.tolist()]
-            else:
-                raise ValueError(f"Unsupported 1-hop ablation mode: {mode}")
-
-        extra_bias[0, 0, row, row] = 0.0
-        for n in chosen:
-            col = real_key_start + n
-            if 0 <= col < k_len:
-                extra_bias[0, 0, row, col] = 0.0
-
-    return extra_bias
-
-
-@torch.no_grad()
-def _evaluate_full_onehop_ablation_split(
-    args,
-    model,
-    device,
-    feature,
-    y,
-    sub_idx,
-    edge_index_global,
-    N,
-    split_name: str,
-    seed: int,
-):
-    if args.attn_type != "full":
-        return None
-    if not hasattr(model, "set_full_attention_capture_layers"):
-        return None
-    if not hasattr(model, "set_full_attention_extra_biases"):
-        return None
-    if sequence_parallel_is_initialized() and get_sequence_parallel_world_size() > 1:
-        return None
-
-    model.eval()
-    keep_k = max(1, int(getattr(args, "full_attn_onehop_keep_k", 4)))
-    keep_ratio = max(0.0, float(getattr(args, "full_attn_onehop_keep_ratio", 0.0)))
-    layer_mode = str(getattr(args, "full_attn_onehop_eval_layer_mode", "all")).lower()
-    num_global_tokens = int(getattr(model, "num_global_node", 0)) if args.model == "graphormer" else 0
-    num_batch = (sub_idx.size(0) + args.seq_len - 1) // args.seq_len
-    correct = {
-        "baseline": 0,
-        "all_1hop": 0,
-        "topk_1hop": 0,
-        "randomk_1hop": 0,
-    }
-    total = 0
-
-    try:
-        for batch_id in range(num_batch):
-            idx_i = sub_idx[batch_id * args.seq_len:(batch_id + 1) * args.seq_len]
-            x_i, y_i, edge_index_i, attn_bias = _prepare_induced_eval_batch(
-                args,
-                device,
-                feature,
-                y,
-                idx_i,
-                edge_index_global,
-                N,
-            )
-
-            model.set_full_attention_extra_biases(None, layer_mode=layer_mode)
-            model.set_full_attention_capture_layers(True, layer_mode=layer_mode)
-            out_base = model(x_i, attn_bias, edge_index_i, attn_type=args.attn_type)
-            attn_means = model.get_full_attention_means_per_layer(layer_mode=layer_mode)
-            model.set_full_attention_capture_layers(False, layer_mode=layer_mode)
-
-            y_flat = y_i.view(-1)
-            is_labeled = y_flat != -100
-            if not is_labeled.any():
-                continue
-            total += int(is_labeled.sum().item())
-            pred_base = out_base.argmax(1)
-            correct["baseline"] += int((pred_base[is_labeled] == y_flat[is_labeled]).sum().item())
-
-            for mode, key in (("all", "all_1hop"), ("topk", "topk_1hop"), ("randomk", "randomk_1hop")):
-                extra_biases = []
-                for layer_offset, attn_mean in enumerate(attn_means):
-                    extra_biases.append(
-                        _build_full_onehop_extra_bias(
-                            attn_mean,
-                            edge_index_i,
-                            y_i,
-                            num_global_tokens=num_global_tokens,
-                            mode=mode,
-                            keep_k=keep_k,
-                            keep_ratio=keep_ratio,
-                            seed=seed
-                            + batch_id * 1009
-                            + layer_offset * 10000019
-                            + (17 if mode == "topk" else 31 if mode == "randomk" else 0),
-                        )
-                    )
-                model.set_full_attention_extra_biases(extra_biases, layer_mode=layer_mode)
-                out_masked = model(x_i, attn_bias, edge_index_i, attn_type=args.attn_type)
-                pred_masked = out_masked.argmax(1)
-                correct[key] += int((pred_masked[is_labeled] == y_flat[is_labeled]).sum().item())
-            model.set_full_attention_extra_biases(None, layer_mode=layer_mode)
-    finally:
-        model.set_full_attention_capture_layers(False, layer_mode=layer_mode)
-        model.set_full_attention_extra_biases(None, layer_mode=layer_mode)
-
-    if total <= 0:
-        return None
-    return {name: float(val) / float(total) for name, val in correct.items()}
-
-
-def _run_full_onehop_ablation_eval(
-    args,
-    model,
-    device,
-    feature,
-    y,
-    split_idx,
-    edge_index_global,
-    N,
-    epoch: int,
-):
-    which = str(getattr(args, "full_attn_onehop_eval_splits", "valid")).lower()
-    split_items = []
-    if which in ("valid", "both"):
-        split_items.append(("valid", split_idx["valid"]))
-    if which in ("test", "both"):
-        split_items.append(("test", split_idx["test"]))
-
-    results = {}
-    for offset, (name, idx) in enumerate(split_items):
-        split_seed = int(args.seed + epoch * 10000 + offset * 1000000)
-        with fixed_random_seed(split_seed):
-            split_result = _evaluate_full_onehop_ablation_split(
-                args,
-                model,
-                device,
-                feature,
-                y,
-                idx,
-                edge_index_global,
-                N,
-                split_name=name,
-                seed=split_seed,
-            )
-        if split_result is not None:
-            results[name] = split_result
-    return results
 
 
 def main():
@@ -719,7 +465,6 @@ def main():
 
         if epoch % args.eval_every == 0:
             stats = None
-            onehop_eval_results = None
             t4 = time.time()
             with fixed_random_seed(args.seed):
                 train_acc = sparse_eval_gpu(args, model, feature, y, split_idx["train"], None, edge_index_global, device)
@@ -760,28 +505,6 @@ def main():
 
             with fixed_random_seed(args.seed):
                 test_acc = sparse_eval_gpu(args, model, feature, y, split_idx["test"], None, edge_index_global, device)
-            if args.full_attn_onehop_eval:
-                if args.attn_type != "full":
-                    if args.rank == 0:
-                        print("[onehop_eval] skipped because attn_type is not full.")
-                elif sequence_parallel_is_initialized() and get_sequence_parallel_world_size() > 1:
-                    if args.rank == 0:
-                        print("[onehop_eval] skipped because sequence parallel eval is not supported yet.")
-                elif not hasattr(model, "set_full_attention_capture_layers"):
-                    if args.rank == 0:
-                        print("[onehop_eval] skipped because model does not expose full-attention capture hooks.")
-                else:
-                    onehop_eval_results = _run_full_onehop_ablation_eval(
-                        args,
-                        model,
-                        device,
-                        feature,
-                        y,
-                        split_idx,
-                        edge_index_global,
-                        N,
-                        epoch,
-                    )
             t5 = time.time()
             if args.rank == 0:
                 epoch_wall_so_far = time.time() - t_epoch_start
@@ -802,30 +525,11 @@ def main():
                             ratio_str = ", ".join(f"{r:.3f}" for r in ratios)
                             print(
                                 f"  layer {i}: mean_max_hop={mean_max_hop:.3f}, max_hop={max_hop}, "
-                                f"hop_ratios=[{ratio_str}]"
+                                f"hop_ratios(0-hop first)=[{ratio_str}]"
                             )
                         else:
-                            print(f"  layer {i}: mean_max_hop={mean_max_hop:.3f}, max_hop={max_hop}, hop_ratios=NA")
+                            print(f"  layer {i}: mean_max_hop={mean_max_hop:.3f}, max_hop={max_hop}, hop_ratios(0-hop first)=NA")
                     _write_hop_mass_stats(args, epoch, stats, train_acc, val_acc, test_acc)
-                if onehop_eval_results:
-                    keep_k = int(getattr(args, "full_attn_onehop_keep_k", 4))
-                    keep_ratio = float(getattr(args, "full_attn_onehop_keep_ratio", 0.0))
-                    layer_mode = str(getattr(args, "full_attn_onehop_eval_layer_mode", "all")).lower()
-                    if keep_ratio > 0.0:
-                        keep_desc = f"keep_ratio={keep_ratio:g}"
-                    else:
-                        keep_desc = f"keep_k={keep_k}"
-                    print(f"Full-attention 1-hop ablation ({keep_desc}, layer_mode={layer_mode}):")
-                    for split_name, split_metrics in onehop_eval_results.items():
-                        print(
-                            "  {}: baseline={:.2%}, all_1hop={:.2%}, topk_1hop={:.2%}, randomk_1hop={:.2%}".format(
-                                split_name,
-                                split_metrics["baseline"],
-                                split_metrics["all_1hop"],
-                                split_metrics["topk_1hop"],
-                                split_metrics["randomk_1hop"],
-                            )
-                        )
                 print("------------------------------------------------------------------------------------")
 
                 if val_acc > best_val:

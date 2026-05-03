@@ -2,6 +2,7 @@ import torch
 import math
 import torch.nn as nn
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
 from torch_geometric.utils import degree
 from torch_sparse import SparseTensor, matmul
 from gt_sp.gt_layer import DistributedAttentionNodeLevel, _SeqGather
@@ -17,6 +18,25 @@ from gt_sp.initialize import (
 from torch_scatter import scatter
 from flash_attn import flash_attn_qkvpacked_func, flash_attn_func
 from collections import deque
+
+try:
+    from gt_sp.multi_tier import _MultiTierResourceManager, apply_tier
+except ModuleNotFoundError as exc:
+    if exc.name != "gt_sp.multi_tier":
+        raise
+    _MultiTierResourceManager = None
+
+    def apply_tier(layer, mode: str, x, **kwargs):
+        if mode == "retain":
+            return layer(x, **kwargs)
+        if mode in ("keep_mha", "ffn_only"):
+            x = layer.forward_attn_only(x, **kwargs)
+            return layer.forward_ffn_checkpointed(x)
+
+        def _full(h):
+            return layer(h, **kwargs)
+
+        return checkpoint(_full, x, use_reentrant=False)
 
 
 def init_params(module, n_layers):
@@ -271,12 +291,12 @@ class CoreAttention(nn.Module):
 
         max_hop_limit = int(self.hop_mass_max_hop)
         if max_hop_limit > 0:
-            mask = (edge_hops >= 1) & (edge_hops <= max_hop_limit)
+            mask = (edge_hops >= 0) & (edge_hops <= max_hop_limit)
         else:
-            mask = edge_hops >= 1
+            mask = edge_hops >= 0
         if not mask.any():
             return
-        edge_hops = edge_hops[mask] - 1
+        edge_hops = edge_hops[mask]
         dst = dst[mask]
         weights = weights[mask]
 
@@ -303,7 +323,7 @@ class CoreAttention(nn.Module):
             cum = hop_mass.cumsum(dim=0)
             hit = torch.nonzero(cum >= mass_target, as_tuple=False)
             if hit.numel() > 0:
-                needed = int(hit[0].item()) + 1
+                needed = int(hit[0].item())
                 self.hop_mass_max_sum += float(needed)
                 self.hop_mass_max_count += 1
                 if needed > self.hop_mass_max:
@@ -382,13 +402,13 @@ class CoreAttention(nn.Module):
 
                 hop_mass = []
                 for idx, d in enumerate(dist):
-                    if d <= 0:
+                    if d < 0:
                         continue
                     if max_hop > 0 and d > max_hop:
                         continue
-                    while len(hop_mass) < d:
+                    while len(hop_mass) <= d:
                         hop_mass.append(0.0)
-                    hop_mass[d - 1] += float(p[idx].item())
+                    hop_mass[d] += float(p[idx].item())
                 if not hop_mass:
                     continue
                 cum = 0.0
@@ -400,16 +420,16 @@ class CoreAttention(nn.Module):
                         break
                 if cum <= 0:
                     continue
-                needed = len(trimmed)
-                if len(self.hop_mass_sum) < needed:
-                    self.hop_mass_sum.extend([0.0] * (needed - len(self.hop_mass_sum)))
+                needed_hop = len(trimmed) - 1
+                if len(self.hop_mass_sum) < len(trimmed):
+                    self.hop_mass_sum.extend([0.0] * (len(trimmed) - len(self.hop_mass_sum)))
                 for i, m in enumerate(trimmed):
                     self.hop_mass_sum[i] += m / cum
                 self.hop_mass_count += 1
-                self.hop_mass_max_sum += float(needed)
+                self.hop_mass_max_sum += float(needed_hop)
                 self.hop_mass_max_count += 1
-                if needed > self.hop_mass_max:
-                    self.hop_mass_max = needed
+                if needed_hop > self.hop_mass_max:
+                    self.hop_mass_max = needed_hop
 
 
     # ------------------------------------------------------------------
@@ -625,47 +645,51 @@ class EncoderLayer(nn.Module):
         self.self_attention_dropout = nn.Dropout(dropout_rate)
         self.O = nn.Linear(hidden_size, hidden_size)
 
-        # Match the original Graph Transformer block order:
-        # attention -> residual -> norm -> FFN -> residual -> norm.
-        self.batch_norm1 = nn.BatchNorm1d(hidden_size)
+        self.layer_norm1 = nn.LayerNorm(hidden_size)
 
         self.FFN_layer1 = nn.Linear(hidden_size, hidden_size * 2)
         self.FFN_layer2 = nn.Linear(hidden_size*2, hidden_size)
-        self.batch_norm2 = nn.BatchNorm1d(hidden_size)
-
-    @staticmethod
-    def _apply_batch_norm(x: torch.Tensor, bn: nn.BatchNorm1d) -> torch.Tensor:
-        orig_shape = x.shape
-        x = x.reshape(-1, orig_shape[-1])
-        x = bn(x)
-        return x.reshape(orig_shape)
+        self.layer_norm2 = nn.LayerNorm(hidden_size)
 
     def forward(self, x, attn_bias=None, edge_index=None, attn_type=None):
-        # ==================================
-        # MHA
-        # ==================================
-        # x: [b, s/p, h]
-        h_in1 = x
         y = self.self_attention(x, attn_bias, edge_index=edge_index, attn_type=attn_type)
         y = self.self_attention_dropout(y)
         y = self.O(y)
-        x = h_in1 + y
-        x = self._apply_batch_norm(x, self.batch_norm1)
+        x = x + y
+        x = self.layer_norm1(x)
 
-        # ==================================
-        # MLP
-        # ==================================
-        h_in2 = x
         y = self.FFN_layer1(x)
         y = F.relu(y)
         y = self.self_attention_dropout(y)
         y = self.FFN_layer2(y)
-        x = h_in2 + y
-        x = self._apply_batch_norm(x, self.batch_norm2)
-
+        x = x + y
+        x = self.layer_norm2(x)
         return x
-        
-        
+
+    def forward_attn_only(self, x, attn_bias=None, edge_index=None, attn_type=None, **kwargs):
+        """MHA sub-block (used by apply_tier keep_mha path).
+
+        Returns LN1(x + attn_out); FFN takes this normalized residual as input.
+        """
+        y = self.self_attention(x, attn_bias, edge_index=edge_index, attn_type=attn_type)
+        y = self.self_attention_dropout(y)
+        y = self.O(y)
+        return self.layer_norm1(x + y)
+
+    def forward_ffn_checkpointed(self, x_ln):
+        """FFN sub-block with gradient checkpointing.
+
+        x_ln is LN1(x + attn_out) from forward_attn_only.
+        """
+        def _ffn(h):
+            y = self.FFN_layer1(h)
+            y = F.relu(y)
+            y = self.self_attention_dropout(y)
+            y = self.FFN_layer2(y)
+            return self.layer_norm2(h + y)
+        return checkpoint(_ffn, x_ln, use_reentrant=False)
+
+
 class MLPReadout(nn.Module):
 
     def __init__(self, input_dim, output_dim, L=2): #L=nb_hidden_layers
@@ -716,16 +740,53 @@ class GT(nn.Module):
             for _ in range(n_layers)
         ]
         self.layers = nn.ModuleList(encoders)
+        self.n_layers = n_layers
 
-        self.MLP_layer = MLPReadout(hidden_dim, output_dim)   # 1 out dim since regression problem  
-        self.downstream_out_proj = nn.Linear(hidden_dim, output_dim)
+        self.MLP_layer = MLPReadout(hidden_dim, output_dim)   # 1 out dim since regression problem
         self.apply(lambda module: init_params(module, n_layers=n_layers))
-        
-        
+
+        self.activation_checkpoint = False
+        self.activation_checkpoint_mode = "none"
+        self._comm_ckpt = None  # _MultiTierResourceManager | None
+
+    def set_activation_checkpoint(self, enabled: bool = True, mode: str | None = None, deferred: bool = False) -> None:
+        mode_aliases = {
+            None: "none",
+            "none": "none",
+            "all": "layer",
+            "layer": "layer",
+            "ffn_only": "ffn_only",
+            "multi_tier": "multi_tier",
+        }
+        resolved_mode = mode_aliases.get(mode)
+        if resolved_mode is None:
+            raise ValueError(
+                f"activation_checkpoint_mode must be 'all', 'ffn_only', or 'multi_tier', got {mode!r}"
+            )
+        enabled = bool(enabled) and resolved_mode != "none"
+        self.activation_checkpoint = enabled
+        self.activation_checkpoint_mode = resolved_mode if enabled else "none"
+        if self.activation_checkpoint_mode == "multi_tier":
+            if _MultiTierResourceManager is None:
+                raise RuntimeError(
+                    "activation_checkpoint_mode='multi_tier' requires gt_sp/multi_tier.py, "
+                    "but that module is not available in this environment."
+                )
+            self._comm_ckpt = _MultiTierResourceManager(len(self.layers), deferred=deferred)
+        else:
+            self._comm_ckpt = None
+
+    def comm_aware_notify_budget_frozen(self, reuse_deferred_baseline: bool = False) -> None:
+        if self._comm_ckpt is not None:
+            self._comm_ckpt.notify_budget_frozen(reuse_deferred_baseline=reuse_deferred_baseline)
+
+    def comm_aware_notify_step_end(self, device, t_bwd: float = None, t_fwd: float = None) -> None:
+        if self._comm_ckpt is not None:
+            self._comm_ckpt.notify_step_end(device, t_bwd=t_bwd, t_fwd=t_fwd)
+
     def forward(self, x, attn_bias, edge_index, perturb=None, attn_type=None):
         # x → [bs=1, s/p, x_d]
         x = x.unsqueeze(0)
-        n_graph = x.shape[0]
 
         # [bs, s/p, x_d] → [bs, s/p, h]
         node_feature = self.node_encoder(x)
@@ -733,17 +794,27 @@ class GT(nn.Module):
         node_feature -= perturb if perturb is not None else 0
         output = self.input_dropout(node_feature)
 
-        # Graphormer encoder
+        use_ckpt = self.activation_checkpoint and self.training and torch.is_grad_enabled()
+        ckpt_mode = getattr(self, "activation_checkpoint_mode", "none")
 
-        for enc_layer in self.layers:
-            output = enc_layer(
-                output,
-                edge_index=edge_index,
-                attn_type=attn_type,
-            )
+        if use_ckpt and ckpt_mode == "multi_tier" and self._comm_ckpt is not None:
+            self._comm_ckpt.plan(output.device)
+
+        for i, enc_layer in enumerate(self.layers):
+            if not use_ckpt:
+                output = enc_layer(output, edge_index=edge_index, attn_type=attn_type)
+                continue
+            if ckpt_mode == "multi_tier" and self._comm_ckpt is not None:
+                layer_mode = self._comm_ckpt.mode(i)
+            else:
+                layer_mode = ckpt_mode
+            output = apply_tier(enc_layer, layer_mode, output, edge_index=edge_index, attn_type=attn_type)
+
+        if use_ckpt and ckpt_mode == "multi_tier" and self._comm_ckpt is not None:
+            self._comm_ckpt.record_post_forward_memory(output.device)
 
         # Output part
-        output = self.MLP_layer(output[0, :, :]) 
+        output = self.MLP_layer(output[0, :, :])
 
         return F.log_softmax(output, dim=1)
 

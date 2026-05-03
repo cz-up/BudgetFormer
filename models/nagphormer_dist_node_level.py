@@ -16,6 +16,9 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
+
+from gt_sp.multi_tier import _MultiTierResourceManager, apply_tier
 
 
 def init_params(module, n_layers):
@@ -95,6 +98,22 @@ class EncoderLayer(nn.Module):
         x = x + y
         return x
 
+    def forward_attn_only(self, x, **kwargs):
+        """MHA sub-block only (used by apply_tier keep_mha path)."""
+        y = self.self_attention_norm(x)
+        y = self.self_attention(y, y, y)
+        y = self.self_attention_dropout(y)
+        return x + y
+
+    def forward_ffn_checkpointed(self, x):
+        """FFN sub-block with gradient checkpointing (used by apply_tier keep_mha path)."""
+        def _ffn(h):
+            y = self.ffn_norm(h)
+            y = self.ffn(y)
+            y = self.ffn_dropout(y)
+            return h + y
+        return checkpoint(_ffn, x, use_reentrant=False)
+
 
 class NAGphormer(nn.Module):
     """NAGphormer for node-level tasks in the distributed full-graph SP framework.
@@ -142,13 +161,63 @@ class NAGphormer(nn.Module):
 
         self.apply(lambda m: init_params(m, n_layers=n_layers))
 
+        self.activation_checkpoint = False
+        self.activation_checkpoint_mode = "none"
+        self._comm_ckpt = None  # _MultiTierResourceManager | None
+
+    def set_activation_checkpoint(self, enabled: bool = True, mode: str | None = None, deferred: bool = False) -> None:
+        mode_aliases = {
+            None: "none",
+            "none": "none",
+            "all": "layer",
+            "layer": "layer",
+            "ffn_only": "ffn_only",
+            "multi_tier": "multi_tier",
+        }
+        resolved_mode = mode_aliases.get(mode)
+        if resolved_mode is None:
+            raise ValueError(
+                f"activation_checkpoint_mode must be 'all', 'ffn_only', or 'multi_tier', got {mode!r}"
+            )
+        enabled = bool(enabled) and resolved_mode != "none"
+        self.activation_checkpoint = enabled
+        self.activation_checkpoint_mode = resolved_mode if enabled else "none"
+        if self.activation_checkpoint_mode == "multi_tier":
+            self._comm_ckpt = _MultiTierResourceManager(len(self.layers), deferred=deferred)
+        else:
+            self._comm_ckpt = None
+
+    def comm_aware_notify_budget_frozen(self, reuse_deferred_baseline: bool = False) -> None:
+        if self._comm_ckpt is not None:
+            self._comm_ckpt.notify_budget_frozen(reuse_deferred_baseline=reuse_deferred_baseline)
+
+    def comm_aware_notify_step_end(self, device, t_bwd: float = None, t_fwd: float = None) -> None:
+        if self._comm_ckpt is not None:
+            self._comm_ckpt.notify_step_end(device, t_bwd=t_bwd, t_fwd=t_fwd)
+
     def forward(self, x_local, attn_bias, edge_index, attn_type=None):
         # x_local: (N_local, hops+1, input_dim) — pre-computed multi-hop features
         # attn_bias, edge_index: not used by NAGphormer
         tensor = self.att_embeddings_nope(x_local)  # (N_local, seq_len, hidden_dim)
 
-        for enc_layer in self.layers:
-            tensor = enc_layer(tensor)
+        use_ckpt = self.activation_checkpoint and self.training and torch.is_grad_enabled()
+        ckpt_mode = getattr(self, "activation_checkpoint_mode", "none")
+
+        if use_ckpt and ckpt_mode == "multi_tier" and self._comm_ckpt is not None:
+            self._comm_ckpt.plan(tensor.device)
+
+        for i, enc_layer in enumerate(self.layers):
+            if not use_ckpt:
+                tensor = enc_layer(tensor)
+                continue
+            if ckpt_mode == "multi_tier" and self._comm_ckpt is not None:
+                layer_mode = self._comm_ckpt.mode(i)
+            else:
+                layer_mode = ckpt_mode
+            tensor = apply_tier(enc_layer, layer_mode, tensor)
+
+        if use_ckpt and ckpt_mode == "multi_tier" and self._comm_ckpt is not None:
+            self._comm_ckpt.record_post_forward_memory(tensor.device)
 
         output = self.final_ln(tensor)
 

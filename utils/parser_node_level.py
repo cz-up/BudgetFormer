@@ -230,6 +230,12 @@ def add_node_fullgraph_sp_args(parser, defaults=None):
     defaults = defaults or {}
 
     parser.add_argument(
+        "--force_random_split",
+        action="store_true",
+        default=defaults.get("force_random_split", False),
+        help="skip default split files and always use random 60/20/20 split (for fair comparison with baselines)",
+    )
+    parser.add_argument(
         "--activation_checkpoint_mode",
         type=str,
         default=defaults.get("activation_checkpoint_mode"),

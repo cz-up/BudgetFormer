@@ -615,15 +615,20 @@ def _load_data(args):
     if args.dataset == "pokec":
         y = torch.clamp(y, min=0)
 
-    split_idx = _load_default_split(
-        args.dataset,
-        args.dataset_dir,
-        wait_for_rank0=True,
-        split_id=int(getattr(args, "split_id", 0)),
-    )
+    if getattr(args, "force_random_split", False):
+        split_idx = None
+        if args.rank == 0:
+            print("[split] --force_random_split set; skipping default split lookup.")
+    else:
+        split_idx = _load_default_split(
+            args.dataset,
+            args.dataset_dir,
+            wait_for_rank0=True,
+            split_id=int(getattr(args, "split_id", 0)),
+        )
     if split_idx is None:
         if args.rank == 0:
-            print("[split] No default split found, falling back to random 60/20/20 split.")
+            print("[split] Using random 60/20/20 split.")
         split_idx = random_split_idx(y, 0.6, 0.2, 0.2, args.seed)
     else:
         if args.rank == 0:
@@ -685,17 +690,28 @@ def _build_model(args, feature, y, device):
         attention_dropout_rate=args.attention_dropout_rate,
         ffn_dim=args.ffn_dim,
     )
-    if args.model in _GRAPHORMER_VARIANTS:
-        model_cls = _GRAPHORMER_VARIANTS[args.model]
-        model = model_cls(
-            **common,
-            num_global_node=args.num_global_node,
-        ).to(device)
+
+    def _configure_activation_checkpoint(model, *, allow_adaptive: bool):
         _ckpt_mode = getattr(args, "activation_checkpoint_mode", None)
+        if _ckpt_mode == "adaptive" and not allow_adaptive:
+            raise ValueError(
+                "--activation_checkpoint_mode adaptive is only implemented for Graphormer. "
+                f"Use --activation_checkpoint_mode all, ffn_only, or multi_tier with --model {args.model}."
+            )
+        if not hasattr(model, "set_activation_checkpoint"):
+            if _ckpt_mode is not None:
+                import warnings
+                warnings.warn(
+                    f"--activation_checkpoint_mode {_ckpt_mode!r} was requested but "
+                    f"{type(model).__name__} does not implement set_activation_checkpoint. "
+                    "Activation checkpointing will be disabled.",
+                    stacklevel=3,
+                )
+            return
         # Defer checkpoint calibration when adaptive_edge_budget is also active:
         # peak_warmup measured before the budget stabilises is too small and
-        # produces wrong keep_mha layer counts.  multi_tier always starts
-        # DEFERRED since its WARMUP/CALIBRATE phases use the same signal.
+        # produces wrong keep_mha layer counts. multi_tier also starts deferred
+        # since its WARMUP/CALIBRATE phases use the same signal.
         _ckpt_deferred = (
             _ckpt_mode in ("adaptive", "multi_tier")
             and _adaptive_edge_budget_enabled(args)
@@ -705,20 +721,37 @@ def _build_model(args, feature, y, device):
             deferred=_ckpt_deferred,
         )
         if _ckpt_mode == "multi_tier":
-            _limit_mib = int(getattr(args, "multi_tier_gpu_memory_limit_mib", 0) or 0)
             _mgr = getattr(model, "_comm_ckpt", None)
-            if _limit_mib > 0 and _mgr is not None and hasattr(_mgr, "set_gpu_memory_limit_bytes"):
+            if _mgr is None:
+                raise RuntimeError(
+                    f"{type(model).__name__}.set_activation_checkpoint(mode='multi_tier') was "
+                    "called but model._comm_ckpt is still None.  The model's "
+                    "set_activation_checkpoint implementation must create a "
+                    "_MultiTierResourceManager and assign it to self._comm_ckpt."
+                )
+            _limit_mib = int(getattr(args, "multi_tier_gpu_memory_limit_mib", 0) or 0)
+            if _limit_mib > 0 and hasattr(_mgr, "set_gpu_memory_limit_bytes"):
                 _mgr.set_gpu_memory_limit_bytes(_limit_mib * (1024 ** 2))
+
+    if args.model in _GRAPHORMER_VARIANTS:
+        model_cls = _GRAPHORMER_VARIANTS[args.model]
+        model = model_cls(
+            **common,
+            num_global_node=args.num_global_node,
+        ).to(device)
+        _configure_activation_checkpoint(model, allow_adaptive=True)
     elif args.model == "gt":
         model = GT(
             **common,
             num_global_node=0,
         ).to(device)
+        _configure_activation_checkpoint(model, allow_adaptive=False)
     elif args.model == "exphormer":
         model = Exphormer(
             **common,
             num_global_node=0,
         ).to(device)
+        _configure_activation_checkpoint(model, allow_adaptive=False)
     elif args.model == "nagphormer":
         model = NAGphormer(
             hops=int(getattr(args, "hops", 7)),
@@ -731,6 +764,7 @@ def _build_model(args, feature, y, device):
             dropout_rate=args.dropout_rate,
             attention_dropout_rate=args.attention_dropout_rate,
         ).to(device)
+        _configure_activation_checkpoint(model, allow_adaptive=False)
     else:
         raise ValueError(f"Unsupported model: {args.model}")
     return model

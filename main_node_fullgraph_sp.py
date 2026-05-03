@@ -815,6 +815,11 @@ def main():
     # ------------------------------------------------------------------
     _is_adaptive_ckpt = getattr(args, "activation_checkpoint_mode", None) == "adaptive"
     _is_multi_tier = getattr(args, "activation_checkpoint_mode", None) == "multi_tier"
+    if _is_multi_tier and getattr(model, "_comm_ckpt", None) is None:
+        raise RuntimeError(
+            "--activation_checkpoint_mode multi_tier was requested, but the model "
+            "does not have a _MultiTierResourceManager attached."
+        )
     edge_index_gpu_cached = False
     _adaptive_edge_decision_done = True  # True = no deferred work needed
 
@@ -824,12 +829,6 @@ def main():
             print(
                 "[edge-cache] Disabled: NAGphormer uses pre-computed multi-hop features; "
                 "edge_index_global is not passed to the model."
-            )
-    elif cpu_real_edge_sampling:
-        if args.rank == 0:
-            print(
-                "[edge-cache] Disabled: edge_build_device=cpu keeps real-edge sampling on CPU, "
-                "so edge_index_global will not be cached on GPU."
             )
     elif _is_multi_tier:
         # ---- multi_tier: measure t_h2d, register with planner, defer --------
@@ -847,6 +846,12 @@ def main():
                 f"[edge-cache] multi_tier mode: t_h2d={_t_h2d * 1000:.1f} ms, "
                 f"edge={_edge_bytes_for_cache / (1024 ** 2):.1f} MiB. "
                 "Edge-policy decision deferred to after planner calibration."
+            )
+    elif cpu_real_edge_sampling:
+        if args.rank == 0:
+            print(
+                "[edge-cache] Disabled: edge_build_device=cpu keeps real-edge sampling on CPU, "
+                "so edge_index_global will not be cached on GPU."
             )
     elif not _is_adaptive_ckpt:
         # ---- Non-adaptive: simple memory-check path ----------------------
@@ -915,6 +920,17 @@ def main():
         print(f"  Edge index GPU cached: {int(edge_index_gpu_cached)}")
         print(f"  AMP dtype: {args.amp_dtype}")
         print(f"  Activation CPU offload: {int(bool(getattr(args, 'activation_cpu_offload', False)))}")
+        _ckpt_mgr = getattr(model, "_comm_ckpt", None)
+        print(
+            f"  Activation checkpoint: requested={getattr(args, 'activation_checkpoint_mode', None)} "
+            f"model={getattr(model, 'activation_checkpoint_mode', 'n/a')} "
+            f"enabled={int(bool(getattr(model, 'activation_checkpoint', False)))}"
+        )
+        if _ckpt_mgr is not None:
+            print(
+                f"  Multi-tier manager: state={getattr(_ckpt_mgr, 'state_name', 'unknown')} "
+                f"active={int(bool(_ckpt_mgr.is_active()))}"
+            )
         if getattr(args, "_multi_tier_effective_gpu_memory_limit_mib", 0.0) > 0.0:
             print(
                 f"  Multi-tier GPU cap: "
@@ -1386,37 +1402,60 @@ def main():
 
         local_oom = False
         _oom_exc = None
-        try:
-            (
-                out_local,
-                out_rows,
-                local_y_eff,
-                valid_train_mask,
-                local_train_idx_eff,
-                loss,
-                fwd_time,
-                autograd_bwd_time,
-                grad_sync_time,
-                bwd_time,
-                opt_time,
-            ) = _run_fwd_bwd_opt()
-        except torch.cuda.OutOfMemoryError as _e:
-            local_oom = True
-            _oom_exc = _e
-        # Every rank must vote on OOM status: if one rank OOM'd inside an NCCL
-        # collective, others are blocked there and can't reach this point — they
-        # will surface as a timeout rather than a local OOM flag.
-        if _sp_any_oom(local_oom):
+        _MAX_OOM_RETRIES = 3
+        _oom_retries = 0
+        while True:
+            local_oom = False
+            try:
+                (
+                    out_local,
+                    out_rows,
+                    local_y_eff,
+                    valid_train_mask,
+                    local_train_idx_eff,
+                    loss,
+                    fwd_time,
+                    autograd_bwd_time,
+                    grad_sync_time,
+                    bwd_time,
+                    opt_time,
+                ) = _run_fwd_bwd_opt()
+            except torch.cuda.OutOfMemoryError as _e:
+                local_oom = True
+                _oom_exc = _e
+            # Every rank must vote on OOM status: if one rank OOM'd inside an NCCL
+            # collective, others are blocked there and can't reach this point — they
+            # will surface as a timeout rather than a local OOM flag.
+            if not _sp_any_oom(local_oom):
+                break   # success
             optimizer.zero_grad(set_to_none=True)
             torch.cuda.empty_cache()
             gc.collect()
-            # Adaptive budget verified this graph fits with all-recompute, so
-            # OOM during calibration is unexpected and unrecoverable.
-            if local_oom:
-                raise _oom_exc
-            raise RuntimeError(
-                "multi_tier: peer rank reported OOM; aborting."
+            # Try to downgrade the tier plan and retry (multi_tier ACTIVE only).
+            _mt_mgr = getattr(model, "_comm_ckpt", None) if _is_multi_tier else None
+            _can_fallback = (
+                _mt_mgr is not None
+                and _mt_mgr.is_active()
+                and _oom_retries < _MAX_OOM_RETRIES
             )
+            if not _can_fallback:
+                if local_oom:
+                    raise _oom_exc
+                raise RuntimeError("multi_tier: peer rank reported OOM; aborting.")
+            _demoted = _mt_mgr.apply_oom_fallback(
+                device, sp_group=sp_group, sp_world_size=sp_world_size
+            )
+            if not _demoted:
+                # All layers already T0_RECOMPUTE — nothing left to fall back to.
+                if local_oom:
+                    raise _oom_exc
+                raise RuntimeError("multi_tier: OOM with all layers at T0_RECOMPUTE.")
+            _oom_retries += 1
+            if args.rank == 0:
+                print(
+                    f"[multi_tier] OOM at epoch {epoch} "
+                    f"(retry {_oom_retries}/{_MAX_OOM_RETRIES}); retrying with demoted plan."
+                )
 
         # Notify comm-aware checkpointer that this step is complete.
         # Must happen after optimizer.step() so that optimizer state (lazily
@@ -1503,7 +1542,6 @@ def main():
                     _mt_ckpt.T4_RETAIN: 0,
                     _mt_ckpt.T1_KEEP_MHA: 1,
                     _mt_ckpt.T0_RECOMPUTE: 2,
-                    _mt_ckpt.T2_OFFLOAD: 3,
                 }
                 _sync_id_to_mode = {v: k for k, v in _mode_to_sync_id.items()}
                 _mt_policy_id = _policy_to_id.get(_mt_ckpt.edge_policy, 1)
@@ -1734,7 +1772,8 @@ def main():
             if _budget_is_stable:
                 _budget_frozen_notified = True
                 _set_runtime_edge_policy_for_phase(budget_phase_active=False)
-                if hasattr(model, "comm_aware_notify_budget_frozen"):
+                _ckpt_mgr = getattr(model, "_comm_ckpt", None)
+                if _ckpt_mgr is not None and hasattr(model, "comm_aware_notify_budget_frozen"):
                     model.comm_aware_notify_budget_frozen(
                         reuse_deferred_baseline=(
                             _adaptive_edge_budget_enabled(args)
@@ -1742,11 +1781,15 @@ def main():
                         )
                     )
                 if args.rank == 0:
+                    ckpt_msg = (
+                        "Checkpoint calibration will start next epoch."
+                        if _ckpt_mgr is not None
+                        else "No activation-checkpoint calibration is active."
+                    )
                     print(
                         f"[edge-cache] Edge budget stable at epoch {epoch} "
                         f"(real={edge_budget_controller.real_budget}, "
-                        f"rw={edge_budget_controller.rw_budget}). "
-                        "Checkpoint calibration will start next epoch."
+                        f"rw={edge_budget_controller.rw_budget}). {ckpt_msg}"
                     )
 
         # Fallback for adaptive-budget epochs whose next-step budget is only
