@@ -79,6 +79,28 @@ def add_node_common_args(parser, defaults=None):
         default=defaults.get("warmup_updates", 10),
         help="warmup steps for optimizer learning rate scheduling",
     )
+    parser.add_argument(
+        "--tot_updates",
+        type=int,
+        default=defaults.get("tot_updates", 0),
+        help=(
+            "Total LR-schedule batch steps (original NAGphormer default: 1000). "
+            "When > 0 and --lr_ref_batch_size is set, warmup_updates and tot_updates "
+            "are converted to epoch-equivalent values so the full-graph (1 step/epoch) "
+            "LR schedule matches the original mini-batch schedule shape. "
+            "Set 0 (default) to keep the existing epoch-based schedule (tot=epochs)."
+        ),
+    )
+    parser.add_argument(
+        "--lr_ref_batch_size",
+        type=int,
+        default=defaults.get("lr_ref_batch_size", 1024),
+        help=(
+            "Reference mini-batch size used to convert --tot_updates / --warmup_updates "
+            "from batch-step counts to epoch-equivalent counts. "
+            "Matches the original NAGphormer batch_size default of 1024."
+        ),
+    )
     parser.add_argument("--epochs", type=int, default=defaults.get("epochs", 300))
     parser.add_argument("--eval_every", type=int, default=defaults.get("eval_every", 5))
     parser.add_argument("--peak_lr", type=float, default=defaults.get("peak_lr", 2e-4))

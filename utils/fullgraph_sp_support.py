@@ -108,7 +108,6 @@ def _compute_multihop_features(edge_index_global, num_nodes, features, hops, pe_
       5. Iterative propagation: h_0 = features, h_k = A_norm @ h_{k-1}.
       6. Stack [h_0, …, h_hops] → (num_nodes, hops+1, d+pe_dim).
     """
-    from torch_sparse import SparseTensor
     from torch_geometric.utils import degree as pyg_degree
 
     raw_dim = features.shape[-1]
@@ -155,15 +154,18 @@ def _compute_multihop_features(edge_index_global, num_nodes, features, hops, pe_
     deg_inv_sqrt[deg_inv_sqrt == float("inf")] = 0.0
     norm = deg_inv_sqrt[row_aug] * deg_inv_sqrt[col_aug]
 
-    adj_t = SparseTensor(
-        row=col_aug, col=row_aug, value=norm.float(),
-        sparse_sizes=(num_nodes, num_nodes),
-    )
+    # Build a standard PyTorch sparse COO tensor (avoids torch_sparse C++ memory bugs).
+    # adj[row_aug[k], col_aug[k]] = norm[k] — symmetric for bidirected+self-loop graphs,
+    # so adj @ x is identical to the original SparseTensor(row=col_aug, col=row_aug) @ x.
+    indices = torch.stack([row_aug, col_aug])  # (2, E)
+    adj = torch.sparse_coo_tensor(
+        indices, norm.float(), (num_nodes, num_nodes)
+    ).coalesce()
 
     # Step 5: iterative propagation
     hop_feats = [x]
     for _ in range(hops):
-        x = adj_t @ x
+        x = torch.sparse.mm(adj, x)
         hop_feats.append(x)
 
     result = torch.stack(hop_feats, dim=1)  # (num_nodes, hops+1, raw_dim+pe_dim)
@@ -1613,16 +1615,26 @@ def _probe_loss_sp(args, model, x_local, local_y, local_probe_idx, edge_index_pr
     return mean_loss, mean_acc
 
 
-def _build_optimizer_bundle(args, model, device, amp_dtype):
+def _build_optimizer_bundle(args, model, device, amp_dtype, n_train=None):
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.peak_lr,
         weight_decay=args.weight_decay,
     )
+
+    warmup_epochs = args.warmup_updates
+    tot_epochs = args.epochs
+    tot_updates = int(getattr(args, "tot_updates", 0))
+    if tot_updates > 0 and n_train is not None and n_train > 0:
+        ref_batch = max(1, int(getattr(args, "lr_ref_batch_size", 1000)))
+        batches_per_epoch = max(1, (n_train + ref_batch - 1) // ref_batch)
+        warmup_epochs = max(1, round(args.warmup_updates / batches_per_epoch))
+        tot_epochs = max(warmup_epochs + 1, round(tot_updates / batches_per_epoch))
+
     lr_scheduler = PolynomialDecayLR(
         optimizer,
-        warmup=args.warmup_updates,
-        tot=args.epochs,
+        warmup=warmup_epochs,
+        tot=tot_epochs,
         lr=args.peak_lr,
         end_lr=args.end_lr,
         power=1.0,
