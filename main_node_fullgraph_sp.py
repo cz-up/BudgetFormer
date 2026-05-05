@@ -1291,7 +1291,7 @@ def main():
         # already known at epoch start (fixed budget, frozen adaptive budget,
         # or post-warmup stable phase).
         _prefetch_submitted = False
-        if _next_epoch_budget_known_at_epoch_start(epoch):
+        if epoch < args.epochs and _next_epoch_budget_known_at_epoch_start(epoch):
             _prefetch_submitted = _submit_prefetch(
                 epoch + 1,
                 budget_state=epoch_budget_state,
@@ -1796,7 +1796,7 @@ def main():
         # known after the end-of-epoch probe/update.
         # Submit as early as possible so the background thread overlaps with
         # dist.barrier and any remaining epoch overhead.
-        if not _prefetch_submitted:
+        if epoch < args.epochs and not _prefetch_submitted:
             _prefetch_submitted = _submit_prefetch(
                 epoch + 1,
                 budget_state=edge_budget_controller.current_state(),
@@ -1838,7 +1838,14 @@ def main():
                 for line in _format_edge_cardinality(comm_profile):
                     print(line)
 
-    _prefetch_pool.shutdown(wait=False)
+    if _prefetch_future is not None:
+        _prefetch_future.cancel()
+        try:
+            _prefetch_future.result()
+        except Exception:
+            pass
+        _prefetch_future = None
+    _prefetch_pool.shutdown(wait=True, cancel_futures=True)
 
     if args.rank == 0:
         print(f"\n{'=' * 72}")

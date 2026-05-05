@@ -37,6 +37,7 @@ from utils.parser_node_level import (
     normalize_main_node_batch_sp_args,
 )
 from utils.split_utils import load_default_split
+from torch_geometric.utils import coalesce
 
 
 def _resolve_device() -> str:
@@ -209,17 +210,33 @@ def _serialize_hop_mass_stats(stats):
     for i, stat in enumerate(stats):
         if stat is None:
             continue
-        hop_sums, hop_count, max_sum, max_count, max_hop = stat
+        hop_sums, hop_count, max_sum, max_count, max_hop = stat[:5]
+        hop_node_counts = stat[5] if len(stat) > 5 else []
         if hop_count > 0:
             hop_ratios = [float(h / hop_count) for h in hop_sums]
         else:
             hop_ratios = []
+        graph_ratios_raw = hop_ratios[1:] if len(hop_ratios) > 1 else []
+        graph_total = sum(graph_ratios_raw)
+        graph_ratios = [r / graph_total for r in graph_ratios_raw] if graph_total > 0 else graph_ratios_raw
+        # hop_relative: per-node attention relative to uniform baseline (same as NodeFormer)
+        total_nc = sum(hop_node_counts)
+        N_eff = total_nc / hop_count if hop_count > 0 else 1.0
+        hop_relative = [
+            float(hop_sums[h] / hop_node_counts[h] * N_eff) if h < len(hop_node_counts) and hop_node_counts[h] > 0 else 0.0
+            for h in range(len(hop_sums))
+        ]
         out[str(i)] = {
             "mean_max_hop": float(max_sum / max(1, max_count)),
             "max_hop": int(max_hop),
             "hop_count": int(hop_count),
+            "N_eff": float(N_eff),
             "hop_ratios_start": 0,
             "hop_ratios": hop_ratios,
+            "hop_node_counts": hop_node_counts,
+            "graph_hop_ratios_start": 1,
+            "graph_hop_ratios": graph_ratios,
+            "hop_relative": hop_relative,
         }
     return out
 
@@ -365,6 +382,13 @@ def main():
         os.makedirs(args.model_dir, exist_ok=True)
 
     feature, y, edge_index_global, N, split_idx = _load_node_level_data(args, device)
+    if getattr(args, 'to_bidirected', False):
+        edge_index_global = coalesce(
+            torch.cat([edge_index_global, edge_index_global.flip(0)], dim=1),
+            num_nodes=N,
+        )
+        if args.rank == 0:
+            print(f"[to_bidirected] Converted to bidirected graph: {edge_index_global.shape[1]} edges")
     seed_batch_size = get_seed_batch_size(args)
 
     flatten_train_idx, sub_split_seq_lens, seq_parallel_world_size, profile_single_machine = (
@@ -518,7 +542,7 @@ def main():
                         if stat is None:
                             print(f"  layer {i}: no data")
                             continue
-                        hop_sums, hop_count, max_sum, max_count, max_hop = stat
+                        hop_sums, hop_count, max_sum, max_count, max_hop = stat[:5]
                         mean_max_hop = max_sum / max(1, max_count)
                         if hop_count > 0:
                             ratios = [h / hop_count for h in hop_sums]

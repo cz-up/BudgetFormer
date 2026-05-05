@@ -131,6 +131,7 @@ class CoreAttention(nn.Module):
 
     def reset_hop_mass_stats(self) -> None:
         self.hop_mass_sum = []
+        self.hop_node_count_sum = []
         self.hop_mass_count = 0
         self.hop_mass_max_sum = 0.0
         self.hop_mass_max_count = 0
@@ -146,6 +147,7 @@ class CoreAttention(nn.Module):
             self.hop_mass_max_sum,
             self.hop_mass_max_count,
             self.hop_mass_max,
+            list(self.hop_node_count_sum),
         )
 
 
@@ -406,6 +408,7 @@ class CoreAttention(nn.Module):
                         q_deque.append(nxt)
 
                 hop_mass = []
+                hop_node_count = []
                 for idx, d in enumerate(dist):
                     if d < 0:
                         continue
@@ -413,7 +416,9 @@ class CoreAttention(nn.Module):
                         continue
                     while len(hop_mass) <= d:
                         hop_mass.append(0.0)
+                        hop_node_count.append(0)
                     hop_mass[d] += float(p[idx].item())
+                    hop_node_count[d] += 1
                 if not hop_mass:
                     continue
                 cum = 0.0
@@ -430,6 +435,11 @@ class CoreAttention(nn.Module):
                     self.hop_mass_sum.extend([0.0] * (len(trimmed) - len(self.hop_mass_sum)))
                 for i, m in enumerate(trimmed):
                     self.hop_mass_sum[i] += m / cum
+                # Accumulate node counts across ALL reachable hops (not trimmed) for N_eff
+                if len(self.hop_node_count_sum) < len(hop_node_count):
+                    self.hop_node_count_sum.extend([0] * (len(hop_node_count) - len(self.hop_node_count_sum)))
+                for i, c in enumerate(hop_node_count):
+                    self.hop_node_count_sum[i] += c
                 self.hop_mass_count += 1
                 self.hop_mass_max_sum += float(needed_hop)
                 self.hop_mass_max_count += 1
