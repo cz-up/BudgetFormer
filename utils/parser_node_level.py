@@ -94,11 +94,11 @@ def add_node_common_args(parser, defaults=None):
     parser.add_argument(
         "--lr_ref_batch_size",
         type=int,
-        default=defaults.get("lr_ref_batch_size", 1024),
+        default=defaults.get("lr_ref_batch_size", 1000),
         help=(
             "Reference mini-batch size used to convert --tot_updates / --warmup_updates "
             "from batch-step counts to epoch-equivalent counts. "
-            "Matches the original NAGphormer batch_size default of 1024."
+            "Matches the original NAGphormer batch_size default of 1000."
         ),
     )
     parser.add_argument("--epochs", type=int, default=defaults.get("epochs", 300))
@@ -361,12 +361,6 @@ def add_node_fullgraph_sp_args(parser, defaults=None):
         help="advanced override; <=0 uses the default stop patience",
     )
     parser.add_argument(
-        "--adaptive_edge_budget_bootstrap_search_epochs",
-        type=int,
-        default=defaults.get("adaptive_edge_budget_bootstrap_search_epochs", 0),
-        help="advanced override; 0 uses a short automatic pre-training search (default 2 rounds) to select the initial (real, rw) budget, <0 disables it",
-    )
-    parser.add_argument(
         "--adaptive_edge_budget_static_seed_epochs",
         type=int,
         default=defaults.get("adaptive_edge_budget_static_seed_epochs", 0),
@@ -449,6 +443,11 @@ def normalize_main_node_fullgraph_sp_args(args):
         raise ValueError("--hops must be >= 0 for Graphormer/GT (0 = disabled).")
     if str(getattr(args, "dataset", "")).lower() == "ogbn-arxiv":
         args.to_bidirected = True
+    # Exphormer always attends over the real graph edges (matching original Exphormer's
+    # add_edge_index=True default).  Set include_real_edges=1 unless the user has
+    # explicitly passed a positive value or a fixed budget that already controls it.
+    if args.model == "exphormer" and not int(getattr(args, "include_real_edges", 0) or 0):
+        args.include_real_edges = 1
     return args
 
 

@@ -781,7 +781,6 @@ class _AdaptiveEdgeBudgetConfig:
     patience: int
     gain_threshold: float
     max_total_edges_per_query: int
-    bootstrap_search_epochs: int
     static_seed_epochs: int
 
 
@@ -892,19 +891,9 @@ def _resolve_adaptive_edge_budget_config(args, valid_size: int) -> _AdaptiveEdge
         patience = 3
     patience = max(3, patience)
 
-    bootstrap_search_epochs = int(getattr(args, "adaptive_edge_budget_bootstrap_search_epochs", 0))
-    if enabled:
-        if bootstrap_search_epochs == 0:
-            bootstrap_search_epochs = 2
-        elif bootstrap_search_epochs < 0:
-            bootstrap_search_epochs = 0
-    bootstrap_search_epochs = max(0, bootstrap_search_epochs)
-
     static_seed_epochs = int(getattr(args, "adaptive_edge_budget_static_seed_epochs", 0))
     if enabled:
-        if static_seed_epochs == 0:
-            static_seed_epochs = bootstrap_search_epochs
-        elif static_seed_epochs < 0:
+        if static_seed_epochs < 0:
             static_seed_epochs = 0
     static_seed_epochs = max(0, static_seed_epochs)
 
@@ -916,7 +905,6 @@ def _resolve_adaptive_edge_budget_config(args, valid_size: int) -> _AdaptiveEdge
         patience=patience,
         gain_threshold=float(getattr(args, "adaptive_edge_budget_gain_threshold", 0.0)),
         max_total_edges_per_query=max(0, int(getattr(args, "max_total_edges_per_query", 0))),
-        bootstrap_search_epochs=bootstrap_search_epochs,
         static_seed_epochs=static_seed_epochs,
     )
 
@@ -1743,161 +1731,8 @@ def _bootstrap_initial_edge_budget(
     grad_reducer,
     edge_index_csr=None,
 ):
-    if not controller.enabled:
-        return None
-    if (
-        not adaptive_edge_budget_cfg.bootstrap_search_epochs
-        or adaptive_edge_budget_cfg.bootstrap_search_epochs <= 0
-    ):
-        return None
-    if probe_idx_global is None or local_probe_idx is None or probe_idx_global.numel() == 0:
-        return None
-
-    full_initial_model_state = _clone_model_state_to_cpu(model)
-    try:
-        bootstrap_model = model
-        bootstrap_grad_reducer = grad_reducer
-        candidate_states = _auto_initial_budget_candidates(edge_index_global, num_nodes, adaptive_edge_budget_cfg)
-        if not candidate_states:
-            return None
-
-        initial_model_state = _clone_model_state_to_cpu(bootstrap_model)
-        probe_seed = int(getattr(args, "seed", 0))
-        probe_edge_pools = None
-        if sp_rank == sp_src_rank:
-            probe_edge_pools = _build_probe_edge_pools(
-                args,
-                edge_index_global,
-                num_nodes,
-                _budget_phase_probe_rw_device(rw_device),
-                probe_idx_global,
-                edge_seed=probe_seed,
-                adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
-                edge_index_csr=edge_index_csr,
-            )
-
-        candidate_specs = []
-        for candidate_state in candidate_states:
-            candidate_specs.append(
-                {
-                    "budget_state": dict(candidate_state),
-                    "full_state": dict(candidate_state),
-                    "probe_edge_pools": probe_edge_pools,
-                    "model_state": initial_model_state,
-                    "trained_epochs": 0,
-                    "loss": float("inf"),
-                    "edge_count": float("inf"),
-                }
-            )
-
-        n_epochs = max(1, int(adaptive_edge_budget_cfg.bootstrap_search_epochs))
-
-        def _fmt_summary(state, loss, trained_epochs):
-            return f"({state['real_edges_per_query']},{state['rw_edges_per_query']})@{loss:.4f}[e={trained_epochs}]"
-
-        # Flat search: train every candidate for the same n_epochs, then pick by loss.
-        all_summaries = []
-        for spec in candidate_specs:
-            _set_seed(int(getattr(args, "seed", 0)))
-            bootstrap_model.load_state_dict(initial_model_state, strict=True)
-            optimizer, lr_scheduler, scaler = _build_optimizer_bundle(args, bootstrap_model, device, amp_dtype)
-
-            for _ in range(n_epochs):
-                _train_one_epoch_with_budget(
-                    args,
-                    adaptive_edge_budget_cfg,
-                    bootstrap_model,
-                    optimizer,
-                    lr_scheduler,
-                    scaler,
-                    x_local,
-                    local_y,
-                    local_train_idx,
-                    edge_index_global,
-                    num_nodes,
-                    device,
-                    rw_device,
-                    sp_group,
-                    sp_src_rank,
-                    sp_rank,
-                    local_nodes,
-                    amp_dtype,
-                    sp_world_size,
-                    bootstrap_grad_reducer,
-                    spec["budget_state"],
-                    probe_seed,
-                )
-
-            probe_edges = _build_probe_attention_edges(
-                args,
-                edge_index_global,
-                num_nodes,
-                device,
-                _budget_phase_probe_rw_device(rw_device),
-                sp_group,
-                sp_src_rank,
-                sp_rank,
-                local_nodes,
-                probe_idx_global,
-                edge_seed=probe_seed,
-                edge_budget_state=spec["budget_state"],
-                adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
-                edge_pools=spec["probe_edge_pools"],
-            )
-            candidate_loss, _ = _probe_loss_sp(
-                args,
-                bootstrap_model,
-                x_local,
-                local_y,
-                local_probe_idx,
-                probe_edges,
-                device,
-                amp_dtype,
-                sp_group,
-                sp_world_size,
-            )
-            candidate_edge_count = _edge_count(probe_edges)
-            spec["loss"] = float(candidate_loss)
-            spec["edge_count"] = int(candidate_edge_count)
-            spec["trained_epochs"] = n_epochs
-            all_summaries.append((spec, float(candidate_loss), int(candidate_edge_count)))
-            del probe_edges, optimizer, lr_scheduler, scaler
-
-        if not all_summaries:
-            return None
-
-        all_summaries.sort(key=lambda item: (float(item[1]), int(item[2])))
-        best_spec, best_loss, best_edge_count = all_summaries[0]
-        best_state = dict(best_spec["full_state"])
-
-        bootstrap_model.load_state_dict(initial_model_state, strict=True)
-        _set_seed(int(getattr(args, "seed", 0)))
-
-        if args.rank == 0:
-            formatted_candidates = ", ".join(
-                _fmt_summary(spec["full_state"], spec["loss"], spec["trained_epochs"])
-                for spec, _, _ in all_summaries
-            )
-            print(
-                "  ↳ BootstrapBudgetSearch "
-                f"strategy=flat "
-                f"epochs={n_epochs} "
-                f"walk_length={_resolve_walk_length(args)} "
-                f"candidates=[{formatted_candidates}] "
-                f"chosen=({best_state['real_edges_per_query']},{best_state['rw_edges_per_query']}) "
-                f"probe_loss={best_loss:.4f} probe_edges={best_edge_count}"
-            )
-
-        if args.rank == 0:
-            print(
-                "  ↳ BudgetCtrl [ThresholdFixed] "
-                f"rel_gain_threshold remains {controller.gain_threshold:.8e} from args."
-            )
-
-        controller.bootstrap_baseline_loss = float(best_loss)
-        return best_state
-    finally:
-        model.load_state_dict(full_initial_model_state, strict=True)
+    # Bootstrap search phase removed; initial budget defaults to adaptive controller start state.
+    return None
 
 
 def _maybe_update_edge_budget(
@@ -1925,7 +1760,7 @@ def _maybe_update_edge_budget(
     if (
         (not controller.enabled)
         or controller.frozen
-        or epoch <= int(adaptive_edge_budget_cfg.bootstrap_search_epochs)
+        or epoch <= 0
         or (controller.warmup_epochs is not None and epoch > controller.warmup_epochs)
     ):
         return

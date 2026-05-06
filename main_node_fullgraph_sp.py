@@ -643,6 +643,7 @@ def main():
     # Exphormer: generate fixed expander edges once (same seed every run).
     # Stored on CPU; merged into edge_index per epoch as edge type = 1.
     _expander_edge_index_cpu = None
+    _exphormer_eval_ei = None   # fixed eval edge_index: real + self-loops + expander
     _expander_degree = int(getattr(args, "expander_degree", 0))
     if _expander_degree > 0:
         if args.rank == 0:
@@ -655,6 +656,26 @@ def main():
         )
         if args.rank == 0:
             print(f"[exphormer] Expander edges: {_expander_edge_index_cpu.shape[1]:,}")
+
+        # Pre-compute fixed eval edge_index: real graph edges + self-loops + expander.
+        # Matches original Exphormer (add_edge_index=True, add_self_loops=True, exp=True).
+        # Used as cached_edge_index in _eval_sp so eval and training see the same graph.
+        _self_nodes = torch.arange(num_nodes, dtype=torch.long)
+        _self_loops_cpu = torch.stack([_self_nodes, _self_nodes], dim=0)
+        _n_real = edge_index_global.shape[1]
+        _n_self = num_nodes
+        _n_exp = _expander_edge_index_cpu.shape[1]
+        _real_self_type = torch.zeros(_n_real + _n_self, dtype=torch.long)
+        _exp_type_cpu = torch.ones(_n_exp, dtype=torch.long)
+        _exphormer_eval_ei = torch.cat([
+            torch.cat([edge_index_global.cpu(), _self_loops_cpu, _expander_edge_index_cpu], dim=1),
+            torch.cat([_real_self_type, _exp_type_cpu]).unsqueeze(0),
+        ], dim=0)  # (3, E_real + N + E_exp) on CPU
+        if args.rank == 0:
+            print(
+                f"[exphormer] Eval edge_index: real={_n_real:,} + self-loops={_n_self:,} "
+                f"+ expander={_n_exp:,} = {_exphormer_eval_ei.shape[1]:,}"
+            )
 
     nodes_per_rank = pad_num_nodes // sp_world_size
     rank_start = sp_rank * nodes_per_rank
@@ -953,7 +974,6 @@ def main():
             f"block={adaptive_edge_budget_cfg.block_size} "
             f"warmup={adaptive_edge_budget_cfg.warmup_epochs if adaptive_edge_budget_cfg.warmup_epochs is not None else 'none'} "
             f"patience={adaptive_edge_budget_cfg.patience} "
-            f"bootstrap_search={adaptive_edge_budget_cfg.bootstrap_search_epochs} "
             f"static_seed={adaptive_edge_budget_cfg.static_seed_epochs})"
         )
         if edge_budget_controller.enabled:
@@ -1029,7 +1049,7 @@ def main():
             return True
         if edge_budget_controller.frozen:
             return True
-        if epoch_idx <= int(adaptive_edge_budget_cfg.bootstrap_search_epochs):
+        if epoch_idx <= 0:
             return True
         warmup_epochs = adaptive_edge_budget_cfg.warmup_epochs
         if warmup_epochs is not None and epoch_idx > int(warmup_epochs):
@@ -1272,21 +1292,26 @@ def main():
                 synchronize_cuda=sync_step_timing,
             )
 
-        # Exphormer: merge expander edges into edge_index_rw and attach edge-type
-        # labels in row-2 (0 = real/RW edge, 1 = expander edge).
-        # ExphormerCoreAttention reads row-2 as edge type for score modulation.
+        # Exphormer: merge expander edges (+ self-loops) into edge_index_rw and attach
+        # edge-type labels in row-2 (0 = real/RW/self-loop, 1 = expander).
+        # Self-loops match original Exphormer (prep.add_self_loops=True); every node
+        # can attend to itself. ExphormerCoreAttention reads row-2 for score modulation.
         if _expander_edge_index_cpu is not None and edge_index_rw is not None:
             _exp = _expander_edge_index_cpu.to(edge_index_rw.device)
             # Strip existing row-2 (hop counts) if present — Exphormer uses row-2 for type
             _ei_base = edge_index_rw[:2] if edge_index_rw.size(0) == 3 else edge_index_rw
-            _n_real = _ei_base.size(1)
+            # Add self-loops so every node can attend to itself (original: add_self_loops=True)
+            _self_nn = torch.arange(num_nodes, dtype=torch.long, device=_ei_base.device)
+            _self_loops_d = torch.stack([_self_nn, _self_nn], dim=0)
+            _ei_with_self = torch.cat([_ei_base, _self_loops_d], dim=1)
+            _n_real_self = _ei_with_self.size(1)
             _n_exp = _exp.size(1)
-            _real_type = torch.zeros(_n_real, dtype=torch.long, device=_ei_base.device)
+            _real_type = torch.zeros(_n_real_self, dtype=torch.long, device=_ei_base.device)
             _exp_type = torch.ones(_n_exp, dtype=torch.long, device=_ei_base.device)
             edge_index_rw = torch.cat([
-                torch.cat([_ei_base, _exp], dim=1),
+                torch.cat([_ei_with_self, _exp], dim=1),
                 torch.cat([_real_type, _exp_type]).unsqueeze(0),
-            ], dim=0)  # (3, E_real + E_exp)
+            ], dim=0)  # (3, E_real + N_self + E_exp)
         # Submit N+1 prefetch as soon as the current epoch's edge build is done.
         # This allows the CPU worker to overlap with the current epoch's GPU
         # forward/backward when the next epoch's budget and edge policy are
@@ -1363,9 +1388,12 @@ def main():
 
             def _optimizer_step():
                 if scaler.is_enabled():
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     scaler.step(optimizer)
                     scaler.update()
                 else:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     optimizer.step()
                 lr_scheduler.step()
             _, opt_t = _time_step_block(
@@ -1690,6 +1718,9 @@ def main():
         eval_time = 0.0
         if epoch % args.eval_every == 0:
             t_eval = time.time()
+            _eval_cached_ei = (
+                _exphormer_eval_ei.to(device) if _exphormer_eval_ei is not None else None
+            )
             accs = _eval_sp(
                 args,
                 model,
@@ -1708,6 +1739,7 @@ def main():
                 rank_end,
                 local_num_nodes,
                 amp_dtype=amp_dtype,
+                cached_edge_index=_eval_cached_ei,
                 edge_budget_state=edge_budget_controller.current_state(),
                 adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
             )
