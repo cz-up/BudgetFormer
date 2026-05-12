@@ -306,7 +306,7 @@ class GraphGPS(nn.Module):
         output_dim,
         attn_bias_dim,
         dropout_rate,
-        input_dropout_rate,
+        input_dropout_rate,  # not used: original GPS has no input dropout
         attention_dropout_rate,
         ffn_dim,
         num_global_node,   # interface compatibility, not used
@@ -315,7 +315,6 @@ class GraphGPS(nn.Module):
     ):
         super().__init__()
         self.node_encoder = nn.Linear(input_dim, hidden_dim)
-        self.input_dropout = nn.Dropout(input_dropout_rate)
 
         self.layers = nn.ModuleList([
             EncoderLayer(hidden_dim, dropout_rate, attention_dropout_rate, num_heads,
@@ -370,7 +369,7 @@ class GraphGPS(nn.Module):
 
     def forward(self, x, attn_bias, edge_index, attn_type=None):
         x = x.unsqueeze(0)
-        x = self.input_dropout(self.node_encoder(x))
+        x = self.node_encoder(x)
 
         use_ckpt = self.activation_checkpoint and self.training and torch.is_grad_enabled()
         ckpt_mode = getattr(self, "activation_checkpoint_mode", "none")
