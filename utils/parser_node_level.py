@@ -11,7 +11,7 @@ def add_node_common_args(parser, defaults=None):
     )
 
     parser.add_argument("--model", type=str, default=defaults.get("model", "graphormer"),
-                        choices=["graphormer", "gt", "nagphormer", "exphormer"])
+                        choices=["graphormer", "gt", "nagphormer", "exphormer", "graphgps"])
     parser.add_argument(
         "--hops",
         type=int,
@@ -69,7 +69,7 @@ def add_node_common_args(parser, defaults=None):
         "--attn_type",
         type=str,
         default=defaults.get("attn_type", "sparse"),
-        help="attention type: sparse/full/flash",
+        help="attention type: sparse/full/flash/performer",
     )
 
     parser.add_argument("--weight_decay", type=float, default=defaults.get("weight_decay", 0.01))
@@ -120,6 +120,13 @@ def add_node_common_args(parser, defaults=None):
         type=int,
         default=defaults.get("head_hop_walks_per_node", 2),
         help="head hop random walks per node",
+    )
+    parser.add_argument(
+        "--min_rw_hop",
+        type=int,
+        default=defaults.get("min_rw_hop", 1),
+        help="minimum hop distance collected into the RW edge pool (default 1 = include direct neighbors; "
+             "set to 2 to exclude 1-hop real neighbors from RW pool, improving signal quality on heterophilic graphs)",
     )
     parser.add_argument(
         "--edge_build_device",
@@ -351,7 +358,7 @@ def add_node_fullgraph_sp_args(parser, defaults=None):
     parser.add_argument(
         "--adaptive_edge_budget_gain_threshold",
         type=float,
-        default=defaults.get("adaptive_edge_budget_gain_threshold", 1e-4),
+        default=defaults.get("adaptive_edge_budget_gain_threshold", 0),
         help="advanced override for minimum probe-loss improvement per added edge required to keep expanding the budget",
     )
     parser.add_argument(
@@ -433,6 +440,10 @@ def normalize_main_node_fullgraph_sp_args(args):
     _normalize_multi_tier_gpu_memory_limit_args(args)
     if str(getattr(args, "model", "")).lower() in ("gt", "nagphormer", "exphormer"):
         args.attn_type = "sparse"
+    # graphgps supports both sparse (default) and full attention; preserve user's --attn_type
+    if str(getattr(args, "model", "")).lower() == "graphgps":
+        if not getattr(args, "attn_type", None):
+            args.attn_type = "sparse"
     if args.model != "graphormer":
         args.num_global_node = 0
     elif args.num_global_node not in (0, 1):
@@ -443,11 +454,12 @@ def normalize_main_node_fullgraph_sp_args(args):
         raise ValueError("--hops must be >= 0 for Graphormer/GT (0 = disabled).")
     if str(getattr(args, "dataset", "")).lower() == "ogbn-arxiv":
         args.to_bidirected = True
-    # Exphormer always attends over the real graph edges (matching original Exphormer's
-    # add_edge_index=True default).  Set include_real_edges=1 unless the user has
-    # explicitly passed a positive value or a fixed budget that already controls it.
-    if args.model == "exphormer" and not int(getattr(args, "include_real_edges", 0) or 0):
-        args.include_real_edges = 1
+    # sparse-mode graphgps (and exphormer) need real graph edges in the edge pool
+    _attn_type = str(getattr(args, "attn_type", "sparse")).lower()
+    # if args.model in ("exphormer",) and not int(getattr(args, "include_real_edges", 0) or 0):
+        # args.include_real_edges = 1
+    # if args.model == "graphgps" and _attn_type == "sparse" and not int(getattr(args, "include_real_edges", 0) or 0):
+        # args.include_real_edges = 1
     return args
 
 

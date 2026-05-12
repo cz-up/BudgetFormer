@@ -697,14 +697,18 @@ def compute_hop_buckets_random_walk(
     device: str = "cpu",
     walk_length: int = 4,
     walks_per_node: int = 2,
+    min_hop: int = 1,
 ) -> List[Tensor]:
     """
     使用随机游走生成 hop buckets，bucket i 对应 hop i+1，
     最后一个 bucket 合并 >= num_buckets 的 hop.
+    min_hop 控制收集的最小跳距离（默认 1 = 包含直接邻居）。
+    设置 min_hop=2 可跳过 1-hop 真实邻居，使 RW 池只包含远距节点。
     """
     num_buckets = max(1, int(num_buckets))
     walk_length = max(1, int(walk_length))
     walks_per_node = max(1, int(walks_per_node))
+    min_hop = max(1, int(min_hop))
     if edge_index.numel() == 0:
         return [edge_index.new_zeros((2, 0), dtype=edge_index.dtype) for _ in range(num_buckets)]
 
@@ -719,7 +723,7 @@ def compute_hop_buckets_random_walk(
 
     buckets = [edge_index_dev.new_zeros((2, 0), dtype=edge_index_dev.dtype) for _ in range(num_buckets)]
     query_nodes = walks[:, 0]
-    for d in range(1, walk_length + 1):
+    for d in range(min_hop, walk_length + 1):
         kv_nodes = walks[:, d]
         valid = kv_nodes >= 0
         if d > 1:
@@ -744,11 +748,13 @@ def build_head_hop_edges(
     device: str = "cpu",
     walk_length: int = 4,
     walks_per_node: int = 2,
+    min_hop: int = 1,
 ):
     """
     构建 per-head edge_index 列表。
     当前实现不再按 head 分桶：所有 head 共享同一份随机游走子图。
     返回单个共享 edge_index，避免调用方把同一张图复制多份后再去重。
+    min_hop=2 可使 RW 池只包含 2-hop 以上的远距节点。
     """
     _ = num_heads
     _ = num_groups  # kept for backward-compatible call signature
@@ -759,6 +765,7 @@ def build_head_hop_edges(
         device=device,
         walk_length=walk_length,
         walks_per_node=walks_per_node,
+        min_hop=min_hop,
     )
     return buckets[0] if buckets else edge_index.new_zeros((2, 0), dtype=edge_index.dtype)
 

@@ -26,6 +26,7 @@ from gt_sp.utils import (
     random_split_idx,
 )
 from models.exphormer_dist_node_level import Exphormer
+from models.graphgps_dist_node_level import GraphGPS
 from models.graphormer_dist_node_level import Graphormer
 from models.gt_dist_node_level import GT
 from models.nagphormer_dist_node_level import NAGphormer
@@ -754,6 +755,13 @@ def _build_model(args, feature, y, device):
             num_global_node=0,
         ).to(device)
         _configure_activation_checkpoint(model, allow_adaptive=False)
+    elif args.model == "graphgps":
+        model = GraphGPS(
+            **common,
+            num_global_node=0,
+            attn_type=getattr(args, "attn_type", "sparse"),
+        ).to(device)
+        _configure_activation_checkpoint(model, allow_adaptive=False)
     elif args.model == "nagphormer":
         model = NAGphormer(
             hops=int(getattr(args, "hops", 7)),
@@ -875,7 +883,7 @@ def _resolve_adaptive_edge_budget_config(args, valid_size: int) -> _AdaptiveEdge
     probe_size = int(getattr(args, "adaptive_edge_budget_probe_size", 0))
     if enabled and probe_size <= 0:
         valid_n = max(0, int(valid_size))
-        probe_size = min(512, valid_n) if valid_n > 0 else 0
+        probe_size = valid_n if valid_n > 0 else 0
     else:
         probe_size = max(0, probe_size)
 
@@ -1286,6 +1294,7 @@ def _build_probe_edge_pools(
                 device=rw_device,
                 walk_length=wl,
                 walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
+                min_hop=getattr(args, "min_rw_hop", 1),
             )
             if isinstance(rw_pool, list):
                 rw_pool = _merge_edge_index_list(rw_pool)
@@ -1418,6 +1427,15 @@ class _AdaptiveEdgeBudgetController:
         self.real_budget = 2 if self.max_total > 0 else 0
         self.rw_budget = 2 if self.max_total > 0 else 0
         self.walk_length = None
+        # Dynamic confirmation: the n-th budget adjustment requires n consecutive
+        # wins before committing (capped at _max_confirm_rounds).  Early moves
+        # have large marginal gains (clear signal); later moves are smaller and
+        # closer to noise level, so they need more evidence.
+        self._n_budget_updates: int = 0
+        self._max_confirm_rounds: int = 3
+        self._pending_kind: str | None = None
+        self._pending_state: dict | None = None
+        self._pending_wins: int = 0
 
     def current_state(self):
         state = {
@@ -1430,6 +1448,7 @@ class _AdaptiveEdgeBudgetController:
 
     def candidate_states(self):
         out = {}
+        # Expand total budget if headroom remains.
         if self.real_budget + self.rw_budget + self.block_size <= self.max_total:
             real_up = {
                 "real_edges_per_query": self.real_budget + self.block_size,
@@ -1444,6 +1463,27 @@ class _AdaptiveEdgeBudgetController:
                 rw_up["walk_length"] = int(self.walk_length)
             out["real_up"] = real_up
             out["rw_up"] = rw_up
+        # At the budget ceiling: offer incremental shift candidates so the
+        # controller can redistribute between real and rw even after both sides
+        # have grown.  Dynamic confirmation (in update()) prevents noise-driven
+        # oscillation — a shift must win consecutively before being committed.
+        if self.real_budget + self.rw_budget >= self.max_total:
+            if self.rw_budget >= self.block_size:
+                cand = {
+                    "real_edges_per_query": self.real_budget + self.block_size,
+                    "rw_edges_per_query":   self.rw_budget - self.block_size,
+                }
+                if self.walk_length is not None:
+                    cand["walk_length"] = int(self.walk_length)
+                out["shift_to_real"] = cand
+            if self.real_budget >= self.block_size:
+                cand = {
+                    "real_edges_per_query": self.real_budget - self.block_size,
+                    "rw_edges_per_query":   self.rw_budget + self.block_size,
+                }
+                if self.walk_length is not None:
+                    cand["walk_length"] = int(self.walk_length)
+                out["shift_to_rw"] = cand
         return out
 
     def set_state(self, state) -> None:
@@ -1458,12 +1498,31 @@ class _AdaptiveEdgeBudgetController:
         if best_gain > 0.0:
             self.seen_positive_gain = True
         if next_state is not None and choice is not None:
-            self.real_budget = int(next_state["real_edges_per_query"])
-            self.rw_budget = int(next_state["rw_edges_per_query"])
-            if "walk_length" in next_state:
-                self.walk_length = int(next_state["walk_length"])
-            self.bad_rounds = 0
+            is_expand = choice in ("real_up", "rw_up")
+            # Both expand and lump use the same dynamic confirmation logic.
+            required = max(1, min(self._n_budget_updates, self._max_confirm_rounds))
+            if choice == self._pending_kind:
+                self._pending_wins += 1
+            else:
+                # Direction changed: restart confirmation for new direction.
+                self._pending_kind = choice
+                self._pending_state = next_state
+                self._pending_wins = 1
+            if self._pending_wins >= required:
+                self.real_budget = int(self._pending_state["real_edges_per_query"])
+                self.rw_budget = int(self._pending_state["rw_edges_per_query"])
+                if "walk_length" in self._pending_state:
+                    self.walk_length = int(self._pending_state["walk_length"])
+                self._n_budget_updates += 1
+                self._pending_kind = None
+                self._pending_state = None
+                self._pending_wins = 0
+                self.bad_rounds = 0
             return
+        # No winning candidate this epoch: reset expand confirmation.
+        self._pending_kind = None
+        self._pending_state = None
+        self._pending_wins = 0
         if not self.seen_positive_gain:
             return
         if best_gain <= self.gain_threshold:
@@ -1760,7 +1819,7 @@ def _maybe_update_edge_budget(
     if (
         (not controller.enabled)
         or controller.frozen
-        or epoch <= 0
+        or epoch <= 1
         or (controller.warmup_epochs is not None and epoch > controller.warmup_epochs)
     ):
         return
@@ -1813,8 +1872,11 @@ def _maybe_update_edge_budget(
     best_state = None
     best_loss = base_loss
     best_count = 0
-    
-    for kind, cand_state in controller.candidate_states().items():
+
+    candidates = controller.candidate_states()
+    is_lump_epoch = any(k.startswith("lump_") for k in candidates)
+
+    for kind, cand_state in candidates.items():
         cand_edges = _build_probe_attention_edges(
             args,
             edge_index_global,
@@ -1836,17 +1898,17 @@ def _maybe_update_edge_budget(
             device, amp_dtype, sp_group, sp_world_size,
         )
         cand_count = _edge_count(cand_edges)
-        
+
         # Relative improvement against the current budget; no edge-count normalization.
         gain = (base_loss - cand_loss) / max(base_loss, 1e-6)
-        
+
         if gain > best_gain:
             best_kind = kind
             best_gain = gain
             best_state = cand_state
             best_loss = cand_loss
             best_count = cand_count
-            
+
         del cand_edges
 
     # 3. Check Condition for Release or Continued Update
@@ -1891,8 +1953,13 @@ def _maybe_update_edge_budget(
     if args.rank == 0:
         actual_move = best_kind if best_gain > controller.gain_threshold else "STAY"
         cur_budget = controller.current_state()
+        lump_tag = " [lump-check]" if is_lump_epoch else ""
+        pending_tag = ""
+        if controller._pending_wins > 0:
+            required = max(1, min(controller._n_budget_updates, controller._max_confirm_rounds))
+            pending_tag = f" [confirm {controller._pending_wins}/{required}]"
         print(
-            f"  ↳ BudgetCtrl update epoch={epoch} move={actual_move} rel_gain={best_gain:.8e} "
+            f"  ↳ BudgetCtrl update epoch={epoch}{lump_tag} move={actual_move}{pending_tag} rel_gain={best_gain:.8e} "
             f"new_budget=({cur_budget['real_edges_per_query']},{cur_budget['rw_edges_per_query']}) "
             f"probe_loss={best_loss:.4f} probe_edges={best_count}"
         )
@@ -1942,6 +2009,7 @@ def _build_merged_edges(args, edge_index_global, num_nodes, final_device, rw_dev
                 device=rw_device,
                 walk_length=wl,
                 walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
+                min_hop=getattr(args, "min_rw_hop", 1),
             ),
             device=rw_device,
         )
