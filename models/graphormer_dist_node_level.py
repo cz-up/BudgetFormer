@@ -155,10 +155,7 @@ class CoreAttention(nn.Module):
     def sparse_attention_bias(self, k, q, v, edge_index, attn_bias):
         # kqv: [b, s+p, np, hn], edge_index: [2, n_edges], attn_bias: [b, s+p, s+p, np]
         batch_size, node_num = k.size(0), k.size(1)
-        if self.training:
-            num_heads = self.num_attention_heads_per_partition
-        else:
-            num_heads = self.num_heads
+        num_heads = q.size(2)
         if isinstance(edge_index, torch.Tensor) and edge_index.dim() == 2 and edge_index.size(0) == 3:
             edge_index = edge_index[:2]
    
@@ -273,10 +270,7 @@ class CoreAttention(nn.Module):
                        q.size(2),
                        q.size(1),
                        k.size(1))
-        if self.training:
-            num_heads = self.num_attention_heads_per_partition
-        else:
-            num_heads = self.num_heads
+        num_heads = q.size(2)
 
         
         # [b, sq+1, np, hn] -> [sq+1, b * np, hn]
@@ -525,10 +519,7 @@ class CoreAttention(nn.Module):
         conditions enforced by DistributedAttentionNoMerge._can_overlap().
         """
         batch_size, node_num = k.size(0), k.size(1)
-        if self.training:
-            num_heads = self.num_attention_heads_per_partition
-        else:
-            num_heads = self.num_heads
+        num_heads = q.size(2)
 
         edge_hops = None
         if isinstance(edge_index, torch.Tensor) and edge_index.dim() == 2 and edge_index.size(0) == 3:

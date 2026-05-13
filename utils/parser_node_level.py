@@ -129,13 +129,6 @@ def add_node_common_args(parser, defaults=None):
         help="head hop random walks per node",
     )
     parser.add_argument(
-        "--min_rw_hop",
-        type=int,
-        default=defaults.get("min_rw_hop", 1),
-        help="minimum hop distance collected into the RW edge pool (default 1 = include direct neighbors; "
-             "set to 2 to exclude 1-hop real neighbors from RW pool, improving signal quality on heterophilic graphs)",
-    )
-    parser.add_argument(
         "--edge_build_device",
         "--random_walk_device",
         dest="edge_build_device",

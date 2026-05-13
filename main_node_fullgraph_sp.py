@@ -990,8 +990,9 @@ def main():
         args, model, device, amp_dtype, n_train=int(train_idx_global.numel())
     )
 
-    best_val = 0.0
-    best_test = 0.0
+    best_train_at_best_val = 0.0
+    best_val = float("-inf")
+    best_test_at_best_val = 0.0
     best_epoch = -1
     loss_ema = None
     epoch_wall_time_sum = 0.0
@@ -1754,13 +1755,18 @@ def main():
                 _metric_name = "ROC-AUC" if _use_rocauc else "Acc"
                 print(f"  ↳ Eval ({eval_time:.2f}s) [{_metric_name}] | Train={_fmt(train_acc)}  Val={_fmt(val_acc)}  Test={_fmt(test_acc)}")
                 if val_acc > best_val:
+                    best_train_at_best_val = train_acc
                     best_val = val_acc
+                    best_test_at_best_val = test_acc
                     best_epoch = epoch
                     if args.save_model:
                         torch.save(model.state_dict(), os.path.join(args.model_dir, f"{args.dataset}_fg_sp.pkl"))
-                if test_acc > best_test:
-                    best_test = test_acc
-                print(f"  ↳ Best: epoch={best_epoch}  val={_fmt(best_val)}  test={_fmt(best_test)}")
+                print(
+                    f"  ↳ Best by Val: epoch={best_epoch}  "
+                    f"train={_fmt(best_train_at_best_val)}  "
+                    f"val={_fmt(best_val)}  "
+                    f"test={_fmt(best_test_at_best_val)}"
+                )
             del accs
 
         t_adjust_start = time.time()
@@ -1888,7 +1894,12 @@ def main():
             )
         _use_rocauc = str(getattr(args, "dataset", "")).lower() == "genius"
         _fmt = (lambda v: f"{v:.4f}") if _use_rocauc else (lambda v: f"{v:.2%}")
-        print(f"Done.  Best epoch={best_epoch}  Val={_fmt(best_val)}  Test={_fmt(best_test)}")
+        print(
+            f"Done.  Best by Val epoch={best_epoch}  "
+            f"Train={_fmt(best_train_at_best_val)}  "
+            f"Val={_fmt(best_val)}  "
+            f"Test={_fmt(best_test_at_best_val)}"
+        )
         if epoch_wall_time_count > 0:
             print(
                 f"Avg epoch wall time (excluding epoch 1): "

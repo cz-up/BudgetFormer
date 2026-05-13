@@ -697,12 +697,11 @@ def compute_hop_buckets_random_walk(
     device: str = "cpu",
     walk_length: int = 4,
     walks_per_node: int = 2,
-    min_hop: int = 1,
+    min_hop: int = 2,
 ) -> List[Tensor]:
     """
     使用随机游走生成 hop buckets，bucket i 对应 hop i+1，
     最后一个 bucket 合并 >= num_buckets 的 hop.
-    min_hop 控制收集的最小跳距离（默认 1 = 包含直接邻居）。
     设置 min_hop=2 可跳过 1-hop 真实邻居，使 RW 池只包含远距节点。
     """
     num_buckets = max(1, int(num_buckets))
@@ -748,7 +747,7 @@ def build_head_hop_edges(
     device: str = "cpu",
     walk_length: int = 4,
     walks_per_node: int = 2,
-    min_hop: int = 1,
+    min_hop: int = 2,
 ):
     """
     构建 per-head edge_index 列表。

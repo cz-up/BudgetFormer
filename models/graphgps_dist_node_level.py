@@ -198,7 +198,7 @@ class GPSCoreAttention(nn.Module):
         return x.transpose(1, 2).contiguous().view(batch_size, s_len, -1)
 
     def forward(self, q, k, v, attn_bias=None, edge_index=None, attn_type=None):
-        num_heads = self.num_attention_heads_per_partition if self.training else self.num_heads
+        num_heads = q.size(2)
         head_dim = self.hidden_size_per_attention_head
         attn_type = "sparse" if attn_type is None else str(attn_type).lower()
 

@@ -179,10 +179,7 @@ class CoreAttention(nn.Module):
     def sparse_attention_bias(self, q, k, v, edge_index, attn_bias):
         # q, k, v: [b, s, np, hn]  e: [total_edges, n, hn], edge_index: [2, total_edges], attn_bias: [b, n, s+1, s+1]
         batch_size, node_num = k.size(0), k.size(1)
-        if self.training:
-            num_heads = self.num_attention_heads_per_partition
-        else:
-            num_heads = self.num_heads
+        num_heads = q.size(2)
         edge_hops = None
         if isinstance(edge_index, torch.Tensor) and edge_index.dim() == 2 and edge_index.size(0) == 3:
             edge_hops = edge_index[2]
@@ -447,10 +444,7 @@ class CoreAttention(nn.Module):
         Supports only the plain-tensor edge_index path (no list / dict).
         """
         batch_size, node_num = k.size(0), k.size(1)
-        if self.training:
-            num_heads = self.num_attention_heads_per_partition
-        else:
-            num_heads = self.num_heads
+        num_heads = q.size(2)
 
         if isinstance(edge_index, torch.Tensor) and edge_index.dim() == 2 and edge_index.size(0) == 3:
             edge_index = edge_index[:2]

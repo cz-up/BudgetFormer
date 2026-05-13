@@ -261,10 +261,6 @@ class DistributedAttentionNoMerge(torch.nn.Module):
         Returns:
             * output (Tensor): context output
         """
-        if not self.training:
-            # Evaluation path – no communication.
-            return self.local_attn(query, key, value, attn_bias, edge_index, attn_type, *args)
-
         query_layer = _SeqAllToAll.apply(self.spg, query, self.scatter_idx, self.gather_idx)
         key_layer = _SeqAllToAll.apply(self.spg, key, self.scatter_idx, self.gather_idx)
         value_layer = _SeqAllToAll.apply(self.spg, value, self.scatter_idx, self.gather_idx)

@@ -1294,7 +1294,7 @@ def _build_probe_edge_pools(
                 device=rw_device,
                 walk_length=wl,
                 walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
-                min_hop=getattr(args, "min_rw_hop", 1),
+                min_hop=2,
             )
             if isinstance(rw_pool, list):
                 rw_pool = _merge_edge_index_list(rw_pool)
@@ -2018,7 +2018,7 @@ def _build_merged_edges(args, edge_index_global, num_nodes, final_device, rw_dev
                 device=rw_device,
                 walk_length=wl,
                 walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
-                min_hop=getattr(args, "min_rw_hop", 1),
+                min_hop=2,
             ),
             device=rw_device,
         )
@@ -2324,20 +2324,19 @@ def _eval_sp(args, model, x_local, y, split_idx, edge_index_global, num_nodes,
         edge_index_eval = cached_edge_index
 
     was_training = model.training
-    model.train()
-    drop_states = _set_dropout_eval(model)
-    with torch.no_grad():
-        with _autocast_context(device, amp_dtype):
-            out_local = model(x_local, None, edge_index_eval, attn_type=args.attn_type)
-        if use_rocauc:
-            # Gather class-1 probability for binary ROC AUC
-            score_local = out_local.softmax(dim=1)[:, 1].float().contiguous()
-        else:
-            score_local = out_local.argmax(dim=1)
-
-    _restore_dropout(drop_states)
-    if not was_training:
-        model.eval()
+    model.eval()
+    try:
+        with torch.no_grad():
+            with _autocast_context(device, amp_dtype):
+                out_local = model(x_local, None, edge_index_eval, attn_type=args.attn_type)
+            if use_rocauc:
+                # Gather class-1 probability for binary ROC AUC
+                score_local = out_local.softmax(dim=1)[:, 1].float().contiguous()
+            else:
+                score_local = out_local.argmax(dim=1)
+    finally:
+        if was_training:
+            model.train()
 
     if sp_world_size > 1:
         local_len = torch.tensor([score_local.size(0)], dtype=torch.long, device=device)

@@ -75,7 +75,7 @@ class ExphormerCoreAttention(nn.Module):
 
     def forward(self, q, k, v, attn_bias=None, edge_index=None, attn_type=None):
         batch_size, s_len = q.size(0), q.size(1)
-        num_heads = self.num_attention_heads_per_partition if self.training else self.num_heads
+        num_heads = q.size(2)
         head_dim = self.hidden_size_per_attention_head
 
         # Extract edge type from row-2 if present
