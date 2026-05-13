@@ -30,7 +30,7 @@ from models.graphgps_dist_node_level import GraphGPS
 from models.graphormer_dist_node_level import Graphormer
 from models.gt_dist_node_level import GT
 from models.nagphormer_dist_node_level import NAGphormer
-from utils.lr import PolynomialDecayLR
+from utils.lr import CosineWithWarmupLR, PolynomialDecayLR
 from utils.split_utils import load_default_split
 
 _MINHASH_SAMPLE_K_LIMIT = 8
@@ -1678,14 +1678,23 @@ def _build_optimizer_bundle(args, model, device, amp_dtype, n_train=None):
         warmup_epochs = max(1, round(args.warmup_updates / batches_per_epoch))
         tot_epochs = max(warmup_epochs + 1, round(tot_updates / batches_per_epoch))
 
-    lr_scheduler = PolynomialDecayLR(
-        optimizer,
-        warmup=warmup_epochs,
-        tot=tot_epochs,
-        lr=args.peak_lr,
-        end_lr=args.end_lr,
-        power=1.0,
-    )
+    lr_schedule = getattr(args, "lr_schedule", "polynomial")
+    if lr_schedule == "cosine_with_warmup":
+        lr_scheduler = CosineWithWarmupLR(
+            optimizer,
+            warmup=warmup_epochs,
+            tot=tot_epochs,
+            lr=args.peak_lr,
+        )
+    else:
+        lr_scheduler = PolynomialDecayLR(
+            optimizer,
+            warmup=warmup_epochs,
+            tot=tot_epochs,
+            lr=args.peak_lr,
+            end_lr=args.end_lr,
+            power=1.0,
+        )
     scaler = torch.cuda.amp.GradScaler(
         enabled=(amp_dtype == torch.float16 and device.startswith("cuda"))
     )

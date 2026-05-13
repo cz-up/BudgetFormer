@@ -1,4 +1,26 @@
+import math
 from torch.optim.lr_scheduler import _LRScheduler
+
+
+class CosineWithWarmupLR(_LRScheduler):
+    """Linear warmup then cosine decay to 0 — mirrors Exphormer's cosine_with_warmup."""
+
+    def __init__(self, optimizer, warmup, tot, lr, last_epoch=-1, verbose=False):
+        self.warmup = max(1, warmup)
+        self.tot = tot
+        self.lr = lr
+        super().__init__(optimizer, last_epoch, verbose)
+
+    def get_lr(self):
+        if self._step_count <= self.warmup:
+            lr = self.lr * self._step_count / float(self.warmup)
+        else:
+            progress = (self._step_count - self.warmup) / max(1, self.tot - self.warmup)
+            lr = self.lr * 0.5 * (1.0 + math.cos(math.pi * progress))
+        return [lr for _ in self.optimizer.param_groups]
+
+    def _get_closed_form_lr(self):
+        assert False
 
 
 class PolynomialDecayLR(_LRScheduler):

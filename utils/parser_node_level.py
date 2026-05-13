@@ -105,6 +105,13 @@ def add_node_common_args(parser, defaults=None):
     parser.add_argument("--eval_every", type=int, default=defaults.get("eval_every", 5))
     parser.add_argument("--peak_lr", type=float, default=defaults.get("peak_lr", 2e-4))
     parser.add_argument("--end_lr", type=float, default=defaults.get("end_lr", 1e-9))
+    parser.add_argument(
+        "--lr_schedule",
+        type=str,
+        default=defaults.get("lr_schedule", "polynomial"),
+        choices=["polynomial", "cosine_with_warmup"],
+        help="LR scheduler: 'polynomial' (linear decay) or 'cosine_with_warmup' (matches Exphormer)",
+    )
     parser.add_argument("--seed", type=int, default=defaults.get("seed", 42))
     parser.add_argument("--save_model", action="store_true", default=False, help="whether to save model")
     parser.add_argument("--model_dir", type=str, default=defaults.get("model_dir", "./model_ckpt/"))
@@ -454,12 +461,6 @@ def normalize_main_node_fullgraph_sp_args(args):
         raise ValueError("--hops must be >= 0 for Graphormer/GT (0 = disabled).")
     if str(getattr(args, "dataset", "")).lower() == "ogbn-arxiv":
         args.to_bidirected = True
-    # sparse-mode graphgps (and exphormer) need real graph edges in the edge pool
-    _attn_type = str(getattr(args, "attn_type", "sparse")).lower()
-    # if args.model in ("exphormer",) and not int(getattr(args, "include_real_edges", 0) or 0):
-        # args.include_real_edges = 1
-    # if args.model == "graphgps" and _attn_type == "sparse" and not int(getattr(args, "include_real_edges", 0) or 0):
-        # args.include_real_edges = 1
     return args
 
 

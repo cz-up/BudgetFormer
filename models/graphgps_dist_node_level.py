@@ -163,12 +163,18 @@ class GPSCoreAttention(nn.Module):
         score = (torch.mul(src, dest) / self.scale).sum(-1, keepdim=True).clamp(-5, 5)
         score = torch.exp(score)
 
-        msg = v_flat[edge_index[0].long()] * score
-        wV = torch.zeros_like(v_flat)
-        scatter(msg, edge_index[1], dim=0, out=wV, reduce="add")
+        # Normalize first (per-destination softmax), then apply att_dropout —
+        # matching torch.nn.MultiheadAttention(dropout=attn_dropout) which drops
+        # weights after softmax normalization.
         Z = score.new_zeros(v_flat.size(0), num_heads, 1)
         scatter(score, edge_index[1], dim=0, out=Z, reduce="add")
-        return (wV / (Z + 1e-6)).view(batch_size, s_len, -1)
+        norm_score = score / (Z[edge_index[1].long()] + 1e-6)
+        norm_score = self.att_dropout(norm_score)
+
+        msg = v_flat[edge_index[0].long()] * norm_score
+        wV = torch.zeros_like(v_flat)
+        scatter(msg, edge_index[1], dim=0, out=wV, reduce="add")
+        return wV.view(batch_size, s_len, -1)
 
     def _full(self, q, k, v):
         """Dense O(N²) softmax attention.  q/k/v: (B, N, H, d)."""
@@ -188,6 +194,7 @@ class GPSCoreAttention(nn.Module):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
         x = self.performer(q, k, v)            # (B, H, N, d)
+        x = self.att_dropout(x)                # match native SelfAttention(dropout=attn_dropout)
         return x.transpose(1, 2).contiguous().view(batch_size, s_len, -1)
 
     def forward(self, q, k, v, attn_bias=None, edge_index=None, attn_type=None):
@@ -212,9 +219,9 @@ class MultiHeadAttention(nn.Module):
         self.num_heads = num_heads
         self.att_size = hidden_size // num_heads
         # Q/K/V bias follows each mode's GPS original:
-        #   full     → bias=True  (torch.nn.MultiheadAttention default)
-        #   performer → bias=False (performer_pytorch SelfAttention qkv_bias=False default)
-        #   sparse   → bias=False (Exphormer style)
+        #   full      → bias=True  (torch.nn.MultiheadAttention default)
+        #   performer → bias=False (performer_pytorch SelfAttention default: qkv_bias=False)
+        #   sparse    → bias=False (Exphormer style)
         qkv_bias = (str(attn_type).lower() == "full")
         self.linear_q = nn.Linear(hidden_size, num_heads * self.att_size, bias=qkv_bias)
         self.linear_k = nn.Linear(hidden_size, num_heads * self.att_size, bias=qkv_bias)
@@ -323,7 +330,7 @@ class GraphGPS(nn.Module):
         ])
 
         self.output_proj = nn.Linear(hidden_dim, output_dim)
-        self.apply(lambda m: init_params(m, n_layers=n_layers))
+        # Use PyTorch default init (Kaiming uniform) to match native GPS — no custom scaled init
 
         self.activation_checkpoint = False
         self.activation_checkpoint_mode = "none"
