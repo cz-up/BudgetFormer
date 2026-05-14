@@ -48,7 +48,6 @@ from utils.fullgraph_sp_support import (
     _adaptive_edge_budget_enabled,
     _autocast_context,
     _build_attention_edges,
-    _build_dst_csr,
     clear_merged_edge_cache,
     _build_model,
     _build_optimizer_bundle,
@@ -502,7 +501,7 @@ def main():
         parser,
         defaults={
             "peak_lr": 1e-3,
-            "warmup_updates": 20,
+            "warmup_updates": 5,
             "sequence_parallel_size": 1,
             "num_global_node": 1,
         },
@@ -546,19 +545,6 @@ def main():
     valid_idx = split_idx.get("valid")
     valid_size = int(valid_idx.numel()) if valid_idx is not None else 0
     adaptive_edge_budget_cfg = _resolve_adaptive_edge_budget_config(args, valid_size)
-
-    # Build CSR indexed by dst once for fast probe-node edge filtering.
-    # Replaces O(E) torch.isin scans in bootstrap and adaptive budget updates
-    # with O(probe_size × avg_degree) lookups.
-    edge_index_csr = None
-    if _adaptive_edge_budget_enabled(args) and sp_rank == sp_src_rank:
-        if args.rank == 0:
-            print("[dst-csr] Building dst-indexed CSR for probe edge filtering...")
-        _t_csr = time.time()
-        edge_index_csr = _build_dst_csr(edge_index_global, num_nodes)
-        if args.rank == 0:
-            print(f"[dst-csr] Built in {time.time() - _t_csr:.2f}s  "
-                  f"(E={edge_index_global.shape[1]:,}, N={num_nodes:,})")
 
     pad_num_nodes = ((num_nodes + sp_world_size - 1) // sp_world_size) * sp_world_size
     if pad_num_nodes > num_nodes:
@@ -769,7 +755,6 @@ def main():
             amp_dtype,
             sp_world_size,
             grad_reducer,
-            edge_index_csr=edge_index_csr,
         )
         total_bootstrap_time += (time.time() - t_bs_start)
         edge_budget_controller.set_state(initial_budget_state)
@@ -1790,7 +1775,6 @@ def main():
             local_num_nodes,
             amp_dtype,
             sp_world_size,
-            edge_index_csr=edge_index_csr,
         )
         adjust_time = time.time() - t_adjust_start
         total_adjustment_time += adjust_time
