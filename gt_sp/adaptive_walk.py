@@ -93,6 +93,7 @@ def coverage_for_R(args, idx_batch_cpu, edge_index_global, num_nodes_global, see
             device="cpu",
             walk_length=getattr(args, "head_hop_walk_length", 4),
             walks_per_node=int(walks_per_node),
+            min_hop=int(getattr(args, "min_hop", 2)),
         )
         if isinstance(edge_index_i, list):
             edge_index_i = _merge_edge_index_list(edge_index_i)

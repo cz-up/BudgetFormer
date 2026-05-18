@@ -697,7 +697,7 @@ def compute_hop_buckets_random_walk(
     device: str = "cpu",
     walk_length: int = 4,
     walks_per_node: int = 2,
-    min_hop: int = 2,
+    min_hop: int = 1,
 ) -> List[Tensor]:
     """
     使用随机游走生成 hop buckets，bucket i 对应 hop i+1，
@@ -747,7 +747,7 @@ def build_head_hop_edges(
     device: str = "cpu",
     walk_length: int = 4,
     walks_per_node: int = 2,
-    min_hop: int = 2,
+    min_hop: int = 1,
 ):
     """
     构建 per-head edge_index 列表。
@@ -1165,6 +1165,7 @@ def get_batch_blockize(
                     device=rw_base.device,
                     walk_length=getattr(args, "head_hop_walk_length", 4),
                     walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
+                    min_hop=int(getattr(args, "min_hop", 2)),
                 )
             except RuntimeError:
                 rw_base = rw_base.to("cpu")
@@ -1176,6 +1177,7 @@ def get_batch_blockize(
                     device=rw_base.device,
                     walk_length=getattr(args, "head_hop_walk_length", 4),
                     walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
+                    min_hop=int(getattr(args, "min_hop", 2)),
                 )
             if rw_edge_index_i_raw is not None and rw_edge_index_i_raw.numel() > 0:
                 edge_parts.append(rw_edge_index_i_raw)
@@ -1196,6 +1198,7 @@ def get_batch_blockize(
                 device=rw_base.device,
                 walk_length=getattr(args, "head_hop_walk_length", 4),
                 walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
+                min_hop=int(getattr(args, "min_hop", 2)),
             )
         except RuntimeError:
             rw_base = rw_base.to("cpu")
@@ -1207,6 +1210,7 @@ def get_batch_blockize(
                 device=rw_base.device,
                 walk_length=getattr(args, "head_hop_walk_length", 4),
                 walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
+                min_hop=int(getattr(args, "min_hop", 2)),
             )
 
     if args.model == "graphormer" and apply_graphormer_virtual_edges:

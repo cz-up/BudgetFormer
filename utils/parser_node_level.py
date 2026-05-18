@@ -1,3 +1,6 @@
+import argparse
+
+
 def add_node_common_args(parser, defaults=None):
     defaults = defaults or {}
 
@@ -127,6 +130,16 @@ def add_node_common_args(parser, defaults=None):
         type=int,
         default=defaults.get("head_hop_walks_per_node", 2),
         help="head hop random walks per node",
+    )
+    parser.add_argument(
+        "--min_hop",
+        type=int,
+        default=defaults.get("min_hop", 2),
+        help=(
+            "minimum hop distance kept when collecting RW edges; d < min_hop is filtered "
+            "(min_hop=1 keeps 1-hop neighbours like the original behaviour, min_hop=2 skips "
+            "direct neighbours so the RW pool only contains far-distance nodes)."
+        ),
     )
     parser.add_argument(
         "--edge_build_device",
@@ -372,6 +385,28 @@ def add_node_fullgraph_sp_args(parser, defaults=None):
         type=int,
         default=defaults.get("adaptive_edge_budget_static_seed_epochs", 0),
         help="advanced override; 0 keeps early-epoch edge sampling deterministic for the automatic default number of epochs, <0 disables fixed early-epoch sampling",
+    )
+    parser.add_argument(
+        "--probe_dedup_rw_against_real",
+        action=argparse.BooleanOptionalAction,
+        default=defaults.get("probe_dedup_rw_against_real", True),
+        help=(
+            "during the adaptive edge-budget probe, remove RW edges that already exist in "
+            "the real-edge pool before per-query sampling so the marginal-gain estimate of "
+            "the RW budget is not inflated by 1-hop overlap. Training-time edge construction "
+            "is unaffected (1-hop RW edges remain available when --min_hop=1)."
+        ),
+    )
+    parser.add_argument(
+        "--adaptive_edge_budget_require_loss_acc_agreement",
+        action=argparse.BooleanOptionalAction,
+        default=defaults.get("adaptive_edge_budget_require_loss_acc_agreement", True),
+        help=(
+            "only register a budget move when the loss-winner and accuracy-winner agree on "
+            "the same non-base candidate. Filters out noisy probe epochs where the two "
+            "metrics disagree on direction (typical on small valid sets like arxiv where the "
+            "loss gap between candidates is below the per-seed noise floor)."
+        ),
     )
     parser.add_argument(
         "--include_real_edges",

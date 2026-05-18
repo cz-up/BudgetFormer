@@ -883,7 +883,7 @@ def _resolve_adaptive_edge_budget_config(args, valid_size: int) -> _AdaptiveEdge
     probe_size = int(getattr(args, "adaptive_edge_budget_probe_size", 0))
     if enabled and probe_size <= 0:
         valid_n = max(0, int(valid_size))
-        probe_size = valid_n//10 if valid_n > 0 else 0
+        probe_size = valid_n if valid_n > 0 else 0
     else:
         probe_size = max(0, probe_size)
 
@@ -1205,6 +1205,25 @@ def _filter_edge_index_by_dst(edge_index, dst_nodes):
     return edge_index[:, mask]
 
 
+def _subtract_edge_index(a, b, num_nodes):
+    # Drop edges in `a` whose (src, dst) pair also appears in `b`.
+    # Used to deduplicate the probe-time RW pool against the real-edge pool so
+    # the budget probe sees disjoint candidate sets.
+    if a is None or a.numel() == 0:
+        return a
+    if b is None or b.numel() == 0:
+        return a
+    n = max(1, int(num_nodes))
+    if b.device != a.device:
+        b = b.to(a.device)
+    a_keys = a[0].to(torch.long) * n + a[1].to(torch.long)
+    b_keys = b[0].to(torch.long) * n + b[1].to(torch.long)
+    keep = ~torch.isin(a_keys, b_keys)
+    if keep.all():
+        return a
+    return a[:, keep].contiguous()
+
+
 @dataclass(frozen=True)
 class _DstEdgeCSR:
     """CSR indexed by destination node for O(probe_size × avg_degree) edge filtering.
@@ -1299,13 +1318,26 @@ def _build_probe_edge_pools(
                 device=rw_device,
                 walk_length=wl,
                 walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
-                min_hop=2,
+                min_hop=int(getattr(args, "min_hop", 2)),
             )
             if isinstance(rw_pool, list):
                 rw_pool = _merge_edge_index_list(rw_pool)
             if rw_pool is not None:
                 rw_pool = _filter_edge_index_by_dst(rw_pool, dst_filter)
                 rw_pool = rw_pool.to(dtype=torch.long, device="cpu")
+            # Probe-only dedup: when min_hop<=1 the RW pool can overlap with the
+            # real pool at d=1; remove that overlap so the probe's marginal-gain
+            # estimate of RW budget isn't inflated by edges already covered by
+            # real edges. Training-time edge construction is unaffected.
+            if (
+                bool(getattr(args, "probe_dedup_rw_against_real", True))
+                and int(getattr(args, "min_hop", 2)) <= 1
+                and rw_pool is not None
+                and rw_pool.numel() > 0
+                and real_pool is not None
+                and real_pool.numel() > 0
+            ):
+                rw_pool = _subtract_edge_index(rw_pool, real_pool, num_nodes)
 
     return {
         "real": real_pool,
@@ -1507,8 +1539,12 @@ class _AdaptiveEdgeBudgetController:
             self.seen_positive_gain = True
         if next_state is not None and choice is not None:
             is_expand = choice in ("real_up", "rw_up")
-            # Both expand and lump use the same dynamic confirmation logic.
-            required = max(1, min(self._n_budget_updates, self._max_confirm_rounds))
+            # Single-shot commit: the loss/acc agreement + threshold gate in
+            # _maybe_update_edge_budget is the filter we trust. Once a
+            # candidate clears both metrics on a single probe epoch, commit
+            # immediately rather than waiting for additional confirmation
+            # rounds.
+            required = 1
             if choice == self._pending_kind:
                 self._pending_wins += 1
             else:
@@ -1894,49 +1930,61 @@ def _maybe_update_edge_budget(
         controller.frozen = True
         return
 
-    probe_seed_a = int(getattr(args, "seed", 0)) + 100000 + int(epoch)
-    probe_seed_b = probe_seed_a + 1
+    probe_seed = int(getattr(args, "seed", 0)) + 100000 + int(epoch)
     base_state = controller.current_state()
 
-    def _build_full_probe_edges(edge_seed, budget_state):
-        with _budget_phase_cpu_edge_baseline(args):
-            return _build_attention_edges(
-                args,
-                edge_index_global,
-                num_nodes,
-                device,
-                rw_device,
-                sp_group,
-                sp_src_rank,
-                sp_rank,
-                local_nodes,
-                edge_seed=edge_seed,
-                edge_budget_state=budget_state,
-                adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
-                walk_length_override=budget_state.get("walk_length"),
-            )
+    n_layers = max(1, int(getattr(args, "n_layers", 1)))
+    edge_dst_filter = _expand_probe_idx_for_reception(
+        probe_idx_global, edge_index_global, n_layers,
+    )
 
-    # 1a. Base evaluation on the full graph for seed A.
-    base_edges_a = _build_full_probe_edges(probe_seed_a, base_state)
-    base_loss_a, base_acc_a = _probe_loss_sp(
-        args, model, x_local, local_y, local_probe_idx, base_edges_a,
+    probe_rw_device = _budget_phase_probe_rw_device(rw_device)
+    # Build the dst-filtered probe pools once on src_rank and reuse them across
+    # base + every candidate within this probe epoch.  This is the old fast
+    # path: probe edges are restricted to the validation reception cone, so
+    # each candidate forward processes a tiny fraction of the full graph and
+    # all candidates see the same underlying RW realization (CRN coupling).
+    probe_edge_pools = None
+    if sp_rank == sp_src_rank:
+        probe_edge_pools = _build_probe_edge_pools(
+            args,
+            edge_index_global,
+            num_nodes,
+            probe_rw_device,
+            probe_idx_global,
+            edge_seed=probe_seed,
+            adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
+            walk_length_override=base_state.get("walk_length"),
+            edge_dst_filter=edge_dst_filter,
+        )
+
+    def _probe_edges(budget_state):
+        return _build_probe_attention_edges(
+            args,
+            edge_index_global,
+            num_nodes,
+            device,
+            probe_rw_device,
+            sp_group,
+            sp_src_rank,
+            sp_rank,
+            local_nodes,
+            probe_idx_global,
+            edge_seed=probe_seed,
+            edge_budget_state=budget_state,
+            adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
+            edge_pools=probe_edge_pools,
+            walk_length_override=budget_state.get("walk_length"),
+            edge_dst_filter=edge_dst_filter,
+        )
+
+    base_edges = _probe_edges(base_state)
+    base_loss, base_acc = _probe_loss_sp(
+        args, model, x_local, local_y, local_probe_idx, base_edges,
         device, amp_dtype, sp_group, sp_world_size,
     )
-    base_count = _edge_count(base_edges_a)
-    del base_edges_a
-
-    # 1b. Base evaluation on the full graph for seed B; this estimates the
-    # per-epoch edge-sampling noise floor.
-    base_edges_b = _build_full_probe_edges(probe_seed_b, base_state)
-    base_loss_b, base_acc_b = _probe_loss_sp(
-        args, model, x_local, local_y, local_probe_idx, base_edges_b,
-        device, amp_dtype, sp_group, sp_world_size,
-    )
-    del base_edges_b
-
-    noise_floor = abs(base_loss_a - base_loss_b) / max(base_loss_a, 1e-6)
-    base_loss = (base_loss_a + base_loss_b) * 0.5
-    base_acc = (base_acc_a + base_acc_b) * 0.5
+    base_count = _edge_count(base_edges)
+    del base_edges
 
     best_kind = None
     best_gain = float("-inf")
@@ -1958,26 +2006,15 @@ def _maybe_update_edge_budget(
     is_lump_epoch = any(k.startswith("lump_") for k in candidates)
 
     for kind, cand_state in candidates.items():
-        cand_edges_a = _build_full_probe_edges(probe_seed_a, cand_state)
-        cand_loss_a, cand_acc_a = _probe_loss_sp(
-            args, model, x_local, local_y, local_probe_idx, cand_edges_a,
+        cand_edges = _probe_edges(cand_state)
+        cand_loss, cand_acc = _probe_loss_sp(
+            args, model, x_local, local_y, local_probe_idx, cand_edges,
             device, amp_dtype, sp_group, sp_world_size,
         )
-        cand_count = _edge_count(cand_edges_a)
-        del cand_edges_a
+        cand_count = _edge_count(cand_edges)
+        del cand_edges
 
-        cand_edges_b = _build_full_probe_edges(probe_seed_b, cand_state)
-        cand_loss_b, cand_acc_b = _probe_loss_sp(
-            args, model, x_local, local_y, local_probe_idx, cand_edges_b,
-            device, amp_dtype, sp_group, sp_world_size,
-        )
-        del cand_edges_b
-
-        gain_a = (base_loss_a - cand_loss_a) / max(base_loss_a, 1e-6)
-        gain_b = (base_loss_b - cand_loss_b) / max(base_loss_b, 1e-6)
-        gain = (gain_a + gain_b) * 0.5
-        cand_loss = (cand_loss_a + cand_loss_b) * 0.5
-        cand_acc = (cand_acc_a + cand_acc_b) * 0.5
+        gain = (base_loss - cand_loss) / max(base_loss, 1e-6)
         probe_rows.append(
             {
                 "kind": kind,
@@ -1996,23 +2033,37 @@ def _maybe_update_edge_budget(
             best_loss = cand_loss
             best_count = cand_count
 
-    if args.rank == 0:
-        def _budget_pair(state):
-            return (
-                int(state.get("real_edges_per_query", 0)),
-                int(state.get("rw_edges_per_query", 0)),
-            )
+    def _budget_pair(state):
+        return (
+            int(state.get("real_edges_per_query", 0)),
+            int(state.get("rw_edges_per_query", 0)),
+        )
 
-        winner_by_loss = min(probe_rows, key=lambda row: row["loss"])
-        winner_by_acc = max(probe_rows, key=lambda row: row["acc"])
+    winner_by_loss = min(probe_rows, key=lambda row: row["loss"])
+    winner_by_acc = max(probe_rows, key=lambda row: row["acc"])
+    require_agreement = bool(getattr(args, "adaptive_edge_budget_require_loss_acc_agreement", True))
+    # "Agreement" means both metrics pick the same non-base candidate.
+    # If either metric prefers `current` (i.e. "no candidate improves on the
+    # base") we treat it as disagreement too — that side is voting STAY.
+    loss_acc_agree = (
+        winner_by_loss["kind"] == winner_by_acc["kind"]
+        and winner_by_loss["kind"] != "current"
+    )
+    threshold = float(getattr(args, "adaptive_edge_budget_gain_threshold", 0.0))
+    gain_passes = best_gain > threshold
+    commit_ok = gain_passes and (loss_acc_agree or not require_agreement)
+    disagree_blocked = require_agreement and gain_passes and not loss_acc_agree
+
+    if args.rank == 0:
         cur_real, cur_rw = _budget_pair(base_state)
         loss_real, loss_rw = _budget_pair(winner_by_loss["state"])
         acc_real, acc_rw = _budget_pair(winner_by_acc["state"])
         print(
             f"  ↳ BudgetCtrl probe epoch={epoch} current=({cur_real},{cur_rw}) "
-            f"noise_floor={noise_floor:.8e} "
+            f"threshold={threshold:.8e} "
             f"winner_by_loss={winner_by_loss['kind']}({loss_real},{loss_rw}) "
-            f"winner_by_acc={winner_by_acc['kind']}({acc_real},{acc_rw})"
+            f"winner_by_acc={winner_by_acc['kind']}({acc_real},{acc_rw}) "
+            f"agree={loss_acc_agree}"
         )
         for row in probe_rows:
             real_budget, rw_budget = _budget_pair(row["state"])
@@ -2020,7 +2071,7 @@ def _maybe_update_edge_budget(
             print(
                 f"     - {row['kind']:<13} budget=({real_budget},{rw_budget}) "
                 f"loss={row['loss']:.6f} acc={row['acc']:.6f} "
-                f"gain={gain_text} full_edges={row['edges']}"
+                f"gain={gain_text} probe_edges={row['edges']}"
             )
 
     # Check Condition for Release or Continued Update
@@ -2039,41 +2090,46 @@ def _maybe_update_edge_budget(
                     "freezing budget."
                 )
             return
-        if best_gain > noise_floor:
+        if commit_ok:
             controller.auto_hold_released = True
             controller.auto_hold_neg_inf_streak = 0
             if args.rank == 0:
                 print(
                     "  ↳ BudgetCtrl [AutoHoldReleased] via significant rel_gain: "
-                    f"{best_gain:.8e} > noise_floor={noise_floor:.8e}"
+                    f"{best_gain:.8e} > threshold={threshold:.8e}"
                 )
         else:
             if args.rank == 0:
+                reason = "acc_loss_disagree" if disagree_blocked else "below_threshold"
                 print(
                     f"  ↳ BudgetCtrl [AutoHold] epoch={epoch} searching... "
-                    f"best_rel_gain_found={best_gain:.8e} (noise_floor={noise_floor:.8e}) "
+                    f"best_rel_gain_found={best_gain:.8e} (threshold={threshold:.8e}) "
+                    f"reason={reason} "
                     f"neg_inf_streak={controller.auto_hold_neg_inf_streak}/"
                     f"{controller.auto_hold_neg_inf_freeze_after}"
                 )
             return
 
-    controller.update(best_kind if best_gain > noise_floor else None,
-                      best_gain, best_state if best_gain > noise_floor else None,
-                      threshold=noise_floor)
+    controller.update(best_kind if commit_ok else None,
+                      best_gain, best_state if commit_ok else None,
+                      threshold=threshold)
 
     if args.rank == 0:
-        actual_move = best_kind if best_gain > noise_floor else "STAY"
+        if commit_ok:
+            actual_move = best_kind
+        else:
+            actual_move = "STAY"
         cur_budget = controller.current_state()
         lump_tag = " [lump-check]" if is_lump_epoch else ""
+        disagree_tag = " [acc_loss_disagree]" if disagree_blocked else ""
         pending_tag = ""
         if controller._pending_wins > 0:
-            required = max(1, min(controller._n_budget_updates, controller._max_confirm_rounds))
-            pending_tag = f" [confirm {controller._pending_wins}/{required}]"
+            pending_tag = f" [confirm {controller._pending_wins}/1]"
         print(
-            f"  ↳ BudgetCtrl update epoch={epoch}{lump_tag} move={actual_move}{pending_tag} rel_gain={best_gain:.8e} "
-            f"noise_floor={noise_floor:.8e} "
+            f"  ↳ BudgetCtrl update epoch={epoch}{lump_tag}{disagree_tag} move={actual_move}{pending_tag} rel_gain={best_gain:.8e} "
+            f"threshold={threshold:.8e} "
             f"new_budget=({cur_budget['real_edges_per_query']},{cur_budget['rw_edges_per_query']}) "
-            f"probe_loss={best_loss:.4f} full_edges={best_count}"
+            f"probe_loss={best_loss:.4f} probe_edges={best_count}"
         )
 
 
@@ -2089,7 +2145,7 @@ def _fixed_torch_cpu_seed(seed: int):
 
 def _build_merged_edges(args, edge_index_global, num_nodes, final_device, rw_device, nodes_per_rank,
                         edge_seed=None, edge_budget_state=None, adaptive_edge_budget_cfg=None,
-                        walk_length_override=None):
+                        walk_length_override=None, dedup_rw_against_real=False):
     parts = []
     final_torch_device = torch.device(final_device)
     real_edge_sampling_device = _resolve_real_edge_sampling_device(final_torch_device, rw_device)
@@ -2121,12 +2177,23 @@ def _build_merged_edges(args, edge_index_global, num_nodes, final_device, rw_dev
                 device=rw_device,
                 walk_length=wl,
                 walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
-                min_hop=2,
+                min_hop=int(getattr(args, "min_hop", 2)),
             ),
             device=rw_device,
         )
         if isinstance(rw_heads, list):
             rw_heads = _merge_edge_index_list(rw_heads)
+        if (
+            dedup_rw_against_real
+            and rw_heads is not None
+            and rw_heads.numel() > 0
+            and int(getattr(args, "min_hop", 2)) <= 1
+        ):
+            rw_heads = profile_call(
+                "edge_rw_dedup",
+                lambda: _subtract_edge_index(rw_heads, edge_index_global, num_nodes),
+                device=rw_device,
+            )
     rw_heads = _resolve_rw_edges_for_state(
         args,
         rw_heads,
@@ -2198,6 +2265,7 @@ def _make_merged_edge_cache_key(
     edge_budget_state,
     adaptive_edge_budget_cfg,
     walk_length_override,
+    dedup_rw_against_real: bool = False,
 ) -> tuple:
     """Build a hashable cache key that fully determines the merged edge output."""
     real_budget = _get_real_edge_budget(args, edge_budget_state, adaptive_edge_budget_cfg)
@@ -2217,6 +2285,8 @@ def _make_merged_edge_cache_key(
         int(getattr(args, "num_heads", 1)),
         str(getattr(args, "model", "")),
         int(getattr(args, "num_global_node", 0)),
+        bool(dedup_rw_against_real),
+        int(getattr(args, "min_hop", 2)),
     )
 
 
@@ -2237,7 +2307,7 @@ def _build_and_broadcast_edges(args, edge_index_global, num_nodes, device, rw_de
                                sp_src_rank, sp_rank, nodes_per_rank, edge_seed=None,
                                edge_budget_state=None, adaptive_edge_budget_cfg=None,
                                walk_length_override=None, edge_policy=None,
-                               force_broadcast=None):
+                               force_broadcast=None, dedup_rw_against_real=False):
     # ---------------------------------------------------------------------------
     # O3 Optimization: Rank-Local Edge Construction (eliminates edge broadcast).
     #
@@ -2268,7 +2338,7 @@ def _build_and_broadcast_edges(args, edge_index_global, num_nodes, device, rw_de
         cache_key = _make_merged_edge_cache_key(
             args, edge_index_global, num_nodes, rw_build_device, resolved_policy,
             nodes_per_rank, edge_seed, edge_budget_state, adaptive_edge_budget_cfg,
-            walk_length_override,
+            walk_length_override, dedup_rw_against_real,
         )
         if cache_key in _MERGED_EDGE_CACHE:
             profile_call("edge_build_local", lambda: None, device=device, payload_bytes=0)
@@ -2299,6 +2369,7 @@ def _build_and_broadcast_edges(args, edge_index_global, num_nodes, device, rw_de
                     edge_budget_state=edge_budget_state,
                     adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
                     walk_length_override=walk_length_override,
+                    dedup_rw_against_real=dedup_rw_against_real,
                 ),
                 device=device,
             )
@@ -2316,7 +2387,7 @@ def _build_and_broadcast_edges(args, edge_index_global, num_nodes, device, rw_de
             _make_merged_edge_cache_key(
                 args, edge_index_global, num_nodes, rw_build_device, resolved_policy,
                 nodes_per_rank, edge_seed, edge_budget_state, adaptive_edge_budget_cfg,
-                walk_length_override,
+                walk_length_override, dedup_rw_against_real,
             ) if edge_seed is not None else None
         )
         if _bcast_cache_key is not None and _bcast_cache_key in _MERGED_EDGE_CACHE:
@@ -2338,6 +2409,7 @@ def _build_and_broadcast_edges(args, edge_index_global, num_nodes, device, rw_de
                     edge_budget_state=edge_budget_state,
                     adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
                     walk_length_override=walk_length_override,
+                    dedup_rw_against_real=dedup_rw_against_real,
                 ),
                 device=device,
             )
@@ -2372,7 +2444,7 @@ def _build_attention_edges(args, edge_index_global, num_nodes, device, rw_device
                            sp_src_rank, sp_rank, nodes_per_rank, edge_seed=None,
                            edge_budget_state=None, adaptive_edge_budget_cfg=None,
                            walk_length_override=None, edge_policy=None,
-                           force_broadcast=None):
+                           force_broadcast=None, dedup_rw_against_real=False):
     return _build_and_broadcast_edges(
         args,
         edge_index_global,
@@ -2389,6 +2461,7 @@ def _build_attention_edges(args, edge_index_global, num_nodes, device, rw_device
         walk_length_override=walk_length_override,
         edge_policy=edge_policy,
         force_broadcast=force_broadcast,
+        dedup_rw_against_real=dedup_rw_against_real,
     )
 
 
