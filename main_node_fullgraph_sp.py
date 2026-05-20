@@ -428,6 +428,9 @@ def _profile_multi_tier_edge_policy(
 
     cpu_before = _get_process_rss_mib()
     gpu_peak_abs = 0
+    cpu_delta_bytes = 0
+    prep_time = 0.0
+    _policy_oom = False
     if torch.cuda.is_available() and device.startswith("cuda"):
         torch.cuda.synchronize(device)
         torch.cuda.reset_peak_memory_stats(device)
@@ -454,12 +457,31 @@ def _profile_multi_tier_edge_policy(
         if torch.cuda.is_available() and device.startswith("cuda"):
             gpu_peak_abs = int(torch.cuda.max_memory_allocated(device))
         cpu_delta_bytes = max(int(((_get_process_rss_mib() - cpu_before) * (1024 ** 2))), 0)
+    except torch.cuda.OutOfMemoryError as _oom:
+        # Profiling a single edge_policy OOM'd. Mark this policy as
+        # infeasible (return None) so the caller skips it and continues
+        # with the next candidate; do NOT propagate to main loop.
+        _policy_oom = True
+        if args.rank == 0:
+            print(
+                f"[multi_tier] OOM while profiling edge_policy={policy!r}; "
+                f"marking infeasible and continuing with other policies. "
+                f"({_oom})"
+            )
     finally:
         if "edge_index_probe" in locals():
             del edge_index_probe
         if probe_cached and probe_edge_index_global is not edge_index_global:
             del probe_edge_index_global
+        # Aggressive cleanup so the next policy starts with a fresh allocator.
+        import gc as _gc
+        _gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
         _cuda_empty_cache(args)
+        if _policy_oom:
+            return None
 
     prep_time = _sp_group_max(
         float(prep_time),
@@ -775,28 +797,13 @@ def main():
     dynamic_edges = _use_rw_edges(args, adaptive_edge_budget_cfg=adaptive_edge_budget_cfg) or random_blocks_dynamic
     real_edge_sampling_device = _resolve_real_edge_sampling_device(device, rw_device)
     cpu_real_edge_sampling = real_edge_sampling_device.type == "cpu" and device.startswith("cuda")
-    allow_cpu_rank_local_prefetch = bool(
-        getattr(args, "allow_cpu_rank_local_prefetch", False)
-    )
 
     def _set_runtime_edge_policy_for_phase(*, budget_phase_active: bool) -> None:
         # Once multi_tier finishes calibration and applies its synced ACTIVE
         # plan, preserve that runtime edge policy across later epochs.
         if bool(getattr(args, "_runtime_edge_policy_locked", False)):
             return
-        if budget_phase_active:
-            args._runtime_edge_policy = EDGE_POLICY_CPU_BROADCAST
-            args._runtime_force_edge_broadcast = True
-            return
-        if cpu_real_edge_sampling:
-            if allow_cpu_rank_local_prefetch:
-                # Experimental path for measuring whether CPU-side prefetch can
-                # hide edge construction. Real-edge sampling and RW stay on CPU,
-                # but we preserve the deterministic rank-local path so the
-                # prefetched CPU cache entry can be reused next epoch.
-                args._runtime_edge_policy = EDGE_POLICY_CPU_RANK_LOCAL_PREFETCH
-                args._runtime_force_edge_broadcast = False
-                return
+        if budget_phase_active or cpu_real_edge_sampling:
             args._runtime_edge_policy = EDGE_POLICY_CPU_BROADCAST
             args._runtime_force_edge_broadcast = True
             return
@@ -982,6 +989,10 @@ def main():
     loss_ema = None
     epoch_wall_time_sum = 0.0
     epoch_wall_time_count = 0
+    eval_time_sum = 0.0
+    eval_time_count = 0
+    # First eval skipped as warm-up (cuDNN autotune / allocator).
+    _eval_warmup_done = False
     edge_broadcast_ms_sum = 0.0
     edge_broadcast_bytes_sum = 0
     edge_broadcast_epoch_count = 0
@@ -1050,7 +1061,6 @@ def main():
             return False
         if (
             not use_epoch_seed
-            or bool(getattr(args, "disable_edge_prefetch", False))
             or profile_sp_comm
             or not _prefetch_cache_compatible()
             or not _prefetch_topology_plan_stable()
@@ -1420,6 +1430,7 @@ def main():
         _oom_exc = None
         _MAX_OOM_RETRIES = 3
         _oom_retries = 0
+        _epoch_skipped_due_to_oom = False
         while True:
             local_oom = False
             try:
@@ -1444,34 +1455,103 @@ def main():
             # will surface as a timeout rather than a local OOM flag.
             if not _sp_any_oom(local_oom):
                 break   # success
+            # Aggressive cleanup before retry. The failed step may have left
+            # autograd graph nodes, partial forward activations, and stray
+            # .grad tensors alive in the CUDA caching allocator's reserved
+            # segments. Plain empty_cache() only reclaims unused reserved
+            # blocks — for the retry to actually find a large enough
+            # contiguous block we have to:
+            #   1. drop every gradient reference (autograd backward graphs
+            #      hold cyclic refs to saved tensors via grad accumulators);
+            #   2. drain in-flight CUDA work via synchronize so half-allocated
+            #      tensors from the failed step are actually released;
+            #   3. run gc twice (cyclic ref breakdown) with empty_cache in
+            #      between to flush both Python objects and CUDA reservations;
+            #   4. ipc_collect to release any cross-process IPC handles
+            #      (no-op in single-process, free in distributed).
             optimizer.zero_grad(set_to_none=True)
-            torch.cuda.empty_cache()
+            for _p in model.parameters():
+                if _p.grad is not None:
+                    _p.grad = None
+            if torch.cuda.is_available():
+                try:
+                    torch.cuda.synchronize(device)
+                except Exception:
+                    # Stream may carry secondary errors from the OOM; we've
+                    # already captured the original exception, so swallow
+                    # noise here and continue cleanup.
+                    pass
             gc.collect()
-            # Try to downgrade the tier plan and retry (multi_tier ACTIVE only).
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            # OOM fallback: in ACTIVE state, demote one keep_mha/retain tier;
+            # in CALIBRATE_* states, disable the tier currently under probe
+            # and advance the state machine. WARMUP_RECOMPUTE / DEFERRED
+            # have no fallback — even all-recompute does not fit.
             _mt_mgr = getattr(model, "_comm_ckpt", None) if _is_multi_tier else None
             _can_fallback = (
                 _mt_mgr is not None
-                and _mt_mgr.is_active()
                 and _oom_retries < _MAX_OOM_RETRIES
             )
             if not _can_fallback:
-                if local_oom:
-                    raise _oom_exc
-                raise RuntimeError("multi_tier: peer rank reported OOM; aborting.")
-            _demoted = _mt_mgr.apply_oom_fallback(
-                device, sp_group=sp_group, sp_world_size=sp_world_size
-            )
-            if not _demoted:
-                # All layers already T0_RECOMPUTE — nothing left to fall back to.
-                if local_oom:
-                    raise _oom_exc
-                raise RuntimeError("multi_tier: OOM with all layers at T0_RECOMPUTE.")
+                # No multi_tier fallback or retries exhausted. Final safety
+                # net: drop this step (no gradient update), continue training
+                # at the next epoch. Allocator state often recovers across
+                # epochs, and adaptive budget probe may produce a smaller
+                # edge_index_eval shortly. Worst case we lose a few steps.
+                if args.rank == 0:
+                    _reason = ("OOM with no further fallback"
+                               if local_oom else "peer rank reported OOM")
+                    print(
+                        f"[multi_tier] {_reason} at epoch {epoch} "
+                        f"after {_oom_retries} retries; dropping this step."
+                    )
+                _epoch_skipped_due_to_oom = True
+                break
+            if _mt_mgr.is_active():
+                _recovered = _mt_mgr.apply_oom_fallback(
+                    device, sp_group=sp_group, sp_world_size=sp_world_size
+                )
+                _recovery_kind = "tier-demote"
+            else:
+                _recovered = _mt_mgr.mark_current_calibration_infeasible(device)
+                _recovery_kind = "calibration-skip"
+            if not _recovered:
+                # All tiers already at T0 (or OOM in WARMUP/DEFERRED) — no
+                # plan adjustment can help. Drop the step and continue.
+                if args.rank == 0:
+                    print(
+                        f"[multi_tier] OOM at epoch {epoch} with no remaining "
+                        f"tier fallback (state={_mt_mgr.state_name}); "
+                        f"dropping this step."
+                    )
+                _epoch_skipped_due_to_oom = True
+                break
             _oom_retries += 1
             if args.rank == 0:
                 print(
-                    f"[multi_tier] OOM at epoch {epoch} "
-                    f"(retry {_oom_retries}/{_MAX_OOM_RETRIES}); retrying with demoted plan."
+                    f"[multi_tier] OOM at epoch {epoch} ({_recovery_kind}); "
+                    f"retry {_oom_retries}/{_MAX_OOM_RETRIES}; "
+                    f"new state={_mt_mgr.state_name}."
                 )
+
+        # OOM safety net: if the retry loop exhausted its budget without
+        # being able to complete a step, _run_fwd_bwd_opt() never returned
+        # valid outputs. Skip the rest of this epoch (no eval, no prefetch,
+        # no logging) and let the next epoch try again with a (hopefully)
+        # cleaner allocator state.
+        if _epoch_skipped_due_to_oom:
+            if sp_world_size > 1 and dist.is_initialized():
+                # Re-sync ranks so the next epoch starts together.
+                try:
+                    dist.barrier(group=sp_group)
+                except Exception:
+                    pass
+            continue
 
         # Notify comm-aware checkpointer that this step is complete.
         # Must happen after optimizer.step() so that optimizer state (lazily
@@ -1703,10 +1783,12 @@ def main():
 
         eval_time = 0.0
         if epoch % args.eval_every == 0:
-            t_eval = time.time()
             _eval_cached_ei = (
                 _exphormer_eval_ei.to(device) if _exphormer_eval_ei is not None else None
             )
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(device)
+            t_eval = time.perf_counter()
             accs = _eval_sp(
                 args,
                 model,
@@ -1729,7 +1811,16 @@ def main():
                 edge_budget_state=edge_budget_controller.current_state(),
                 adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
             )
-            eval_time = time.time() - t_eval
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(device)
+            eval_time = time.perf_counter() - t_eval
+            if args.rank == 0:
+                # Skip first eval as warm-up.
+                if not _eval_warmup_done:
+                    _eval_warmup_done = True
+                else:
+                    eval_time_sum += eval_time
+                    eval_time_count += 1
 
             if args.rank == 0 and accs is not None:
                 train_acc = accs.get("train", 0.0)
@@ -1775,6 +1866,7 @@ def main():
             local_num_nodes,
             amp_dtype,
             sp_world_size,
+            training_epoch_edge_seed=epoch_edge_seed,
         )
         adjust_time = time.time() - t_adjust_start
         total_adjustment_time += adjust_time
@@ -1891,6 +1983,16 @@ def main():
             )
         else:
             print("Avg epoch wall time (excluding epoch 1): n/a")
+        if eval_time_count > 0:
+            mean_eval_s = eval_time_sum / eval_time_count
+            fullgraph_thr = num_nodes / mean_eval_s if mean_eval_s > 0 else 0.0
+            print(
+                f"Avg inference time per eval (excluding warm-up): "
+                f"{mean_eval_s*1000:.2f} ms  "
+                f"({num_nodes} nodes, throughput={fullgraph_thr:,.0f} nodes/s)"
+            )
+        else:
+            print("Avg inference time per eval: n/a")
         if edge_budget_controller.enabled:
             print(f"Timing: bootstrap={total_bootstrap_time:.2f}s  adjustment={total_adjustment_time:.2f}s")
         print(f"{'=' * 72}")

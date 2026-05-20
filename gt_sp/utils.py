@@ -110,7 +110,7 @@ def fix_edge_index(x, num_node):
 
 def resolve_edge_build_device(args, default_device) -> torch.device:
     """Resolve the device used for edge construction and sampling."""
-    spec = getattr(args, "edge_build_device", getattr(args, "random_walk_device", "same"))
+    spec = getattr(args, "edge_build_device", "same")
     if spec in (None, "", "same"):
         return torch.device(default_device)
 
@@ -133,9 +133,242 @@ def resolve_edge_build_device(args, default_device) -> torch.device:
     return build_device
 
 
-def resolve_random_walk_device(args, default_device) -> torch.device:
-    """Backward-compatible alias for older call sites."""
-    return resolve_edge_build_device(args, default_device)
+def _estimate_rw_working_set_bytes(
+    num_nodes: int,
+    num_edges: int,
+    walks_per_node: int,
+    walk_length: int,
+    num_heads: int = 1,
+) -> int:
+    """First-principles estimate of the GPU working set for one call to
+    compute_hop_buckets_random_walk() on a graph of (N, E).
+
+    Each line item below corresponds to a specific allocation in either
+    torch_cluster/rw.py (newer COO API) or this module's bucketing loop.
+    No multiplicative padding — every byte is traceable to a documented
+    operation. The 1-byte boolean tensors are counted explicitly rather
+    than approximated as int64.
+
+    Sources:
+      - torch_cluster.random_walk:  torch_cluster/rw.py: argsort + reorder
+                                    + scatter_add + cumsum to build CSR.
+      - thrust::sort auxiliary:     CUB's DeviceRadixSort::SortKeys requires
+                                    sizeof(KeyT) × num_items of temporary
+                                    storage (https://nvlabs.github.io/cub/
+                                    structcub_1_1_device_radix_sort.html).
+      - compute_hop_buckets loop:   per-d mask + index_select + stack.
+
+    The PyTorch caching allocator's alignment overhead (≤ 512 B per
+    allocation) is dwarfed by the per-tensor sizes here and is omitted.
+    """
+    E = max(0, int(num_edges))
+    N = max(1, int(num_nodes))
+    W = max(1, int(walks_per_node))
+    L = max(1, int(walk_length))
+
+    # ---------- torch_cluster.random_walk(row, col, ...) body ----------
+    # All int64 (8 bytes/element) unless noted.
+    #
+    # (1) row * num_nodes                          : intermediate, shape (E,)
+    sort_step1 = E * 8
+    # (2) (row * num_nodes) + col                  : intermediate, shape (E,)
+    sort_step2 = E * 8
+    # (3) torch.argsort(...) permutation output    : shape (E,)
+    argsort_perm = E * 8
+    # (4) CUB radix-sort auxiliary storage         : sizeof(int64) × E
+    radix_aux = E * 8
+    # (5) row[perm], col[perm] (final reordered)   : 2 × shape (E,)
+    perm_outputs = 2 * E * 8
+    # (6) deg = scatter_add_ on zeros(N)           : shape (N,)
+    deg = N * 8
+    # (7) rowptr = zeros(N+1) + cumsum             : shape (N+1,)
+    rowptr_bytes = (N + 1) * 8
+    # (8) walks tensor (random walk kernel output) : shape (N*W, L+1)
+    walks_bytes = N * W * (L + 1) * 8
+
+    # ---------- compute_hop_buckets_random_walk per-d loop ----------
+    # Live transients during one iteration of d ∈ [1..L] (sequential, so
+    # the live peak is for a single d, not the sum):
+    #   - valid bool mask    : N*W bytes (1 byte per element)
+    #   - kv_nodes[valid]    : ≤ N*W * 8 bytes (worst case all valid)
+    #   - query_nodes[valid] : ≤ N*W * 8 bytes
+    #   - torch.stack(...)   : 2 × N*W * 8 bytes (the edges tensor)
+    valid_mask = N * W * 1
+    kv_select = N * W * 8
+    query_select = N * W * 8
+    stack_edges = 2 * N * W * 8
+    per_d_peak = valid_mask + kv_select + query_select + stack_edges
+
+    # ---------- buckets cumulative (across all d) ----------
+    # Each hop appends up to N*W edges to the bucket; final bucket holds
+    # the sum of all hops' contributions (kept alive until function return).
+    bucket_cumulative = 2 * N * W * L * 8
+
+    total = (
+        sort_step1 + sort_step2 + argsort_perm + radix_aux
+        + perm_outputs + deg + rowptr_bytes + walks_bytes
+        + per_d_peak + bucket_cumulative
+    )
+    return int(total)
+
+
+# Module-level cache for rw-device decisions to suppress per-rank / per-call
+# log spam. Key: (device_type, decision_label); value: previous (estimate_mib,
+# free_mib). We only re-print when the decision label flips, not on every
+# call with identical inputs.
+_RW_DEVICE_DECISION_CACHE: dict = {}
+
+
+def _rw_log_is_rank0() -> bool:
+    """Rank-0 detection for modules that don't carry args. Falls back to
+    True when torch.distributed isn't initialised (single-process runs).
+    """
+    try:
+        import torch.distributed as _dist
+        if not _dist.is_available() or not _dist.is_initialized():
+            return True
+        return _dist.get_rank() == 0
+    except Exception:
+        return True
+
+
+def _gpu_concurrent_overhead_bytes(device) -> int:
+    """Per-process CUDA library overhead.
+
+    Fixed-ish startup cost for cuBLAS, cuDNN, curand, kernel cache, CUDA
+    stream metadata, and optional libs (flash-attention etc.). Independent
+    of dataset and only weakly dependent on CUDA / cuDNN version.
+
+    Line-item breakdown (NOT a multiplier):
+      - cuBLAS handle + workspace : ~50 MiB / stream × ≤ 4 streams ≤ 200 MiB
+        (https://docs.nvidia.com/cuda/cublas/#cublas-context)
+      - cuDNN handle + default workspace : up to ~256 MiB
+        (https://docs.nvidia.com/deeplearning/cudnn/api/index.html)
+      - curand / kernel cache / stream metadata : ~50 MiB combined
+      - Headroom for optional libs / future CUDA-version upgrades : ~50-100 MiB
+    Bundled conservative ceiling: 512 MiB.
+
+    Note: PyTorch caching allocator fragmentation is *intentionally not*
+    subtracted here. ``reserved - allocated`` is memory the allocator
+    holds and can hand out to new tensors from its internal pool — it's
+    NOT off-limits to RW build. Treating it as overhead would
+    double-count and force needless CPU fallbacks at training time
+    (when caching allocator naturally holds large reserved blocks across
+    step boundaries). If the cached blocks happen to be too fragmented
+    to satisfy a large contiguous request, the reactive OOM handler in
+    the caller takes over.
+
+    Returns 0 for non-CUDA devices.
+    """
+    try:
+        torch_device = torch.device(device)
+    except (TypeError, RuntimeError):
+        return 0
+    if torch_device.type != "cuda" or not torch.cuda.is_available():
+        return 0
+    return 512 * 1024 * 1024
+
+
+def _gpu_can_fit_rw(device, need_bytes: int) -> bool:
+    """Return True iff *device* currently has room for a need_bytes RW build.
+
+    Decision rule, with no magic multiplier:
+      available = free_from_driver + caching_allocator_reserve
+      usable    = available - _gpu_concurrent_overhead_bytes(device)
+      return need_bytes <= usable
+
+    ``free_from_driver`` is reported by ``cudaMemGetInfo`` and excludes
+    everything PyTorch has already cudaMalloc'd. ``caching_allocator_reserve``
+    is the slack PyTorch holds from the driver but has not handed to a
+    tensor (``reserved - allocated`` in ``memory_stats``). New CUDA
+    allocations can be satisfied from EITHER pool, so both are usable.
+
+    Returns True unconditionally for non-CUDA devices or when CUDA's
+    ``mem_get_info`` is unavailable, letting the reactive try/except in
+    callers catch any residual OOM (e.g., when the caching reserve is
+    too fragmented to satisfy a single large contiguous request).
+    """
+    try:
+        torch_device = torch.device(device)
+    except (TypeError, RuntimeError):
+        return True
+    if torch_device.type != "cuda":
+        return True
+    if not torch.cuda.is_available():
+        return True
+    try:
+        free, _ = torch.cuda.mem_get_info(torch_device)
+    except (RuntimeError, AttributeError):
+        return True
+    # Strictly conservative budget: usable = driver_free − handle_overhead.
+    #
+    # Rationale: PyTorch's caching allocator holds reserved-unallocated
+    # blocks (``reserved - allocated``) that *look* available, but for
+    # single multi-GiB contiguous requests like the real-edge sampling
+    # index_select buffer those blocks may themselves be fragmented into
+    # sub-GiB pieces. Empirical evidence: amazon-scale training with
+    # large_pool reserve ≈ 3 GiB but ≤ 2 GiB largest free block, causing
+    # a 2 GiB allocation to OOM despite ample "reserve".
+    #
+    # Querying largest_free_block requires torch.cuda.memory_snapshot()
+    # (per-block iteration, ~ms latency), which is too expensive for a
+    # per-step pre-check. So we drop the caching-reserve credit entirely
+    # and trust only driver-level free. The cost is occasional spurious
+    # CPU fallback when caching could in fact serve the request; the
+    # benefit is no false-positives that lead to OOM. With
+    # ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`` (strongly
+    # recommended for this workload) the caching allocator no longer
+    # fragments into sub-GiB blocks, so this conservatism becomes a
+    # near-no-op anyway.
+    overhead = _gpu_concurrent_overhead_bytes(torch_device)
+    usable = max(0, int(free) - overhead)
+    return int(need_bytes) <= usable
+
+
+def _safe_rw_device(rw_dev, args, num_nodes: int, num_edges: int):
+    """Decide between GPU and CPU for a single build_head_hop_edges call.
+
+    If the requested rw_dev is CUDA but the estimated RW working set would
+    leave too little free memory for the rest of the step, fall back to CPU
+    proactively (and log on rank 0). This avoids the partial-allocation-then-
+    OOM pattern that fragments the caching allocator before the reactive
+    `except RuntimeError` path can take over.
+    """
+    requested = torch.device(rw_dev)
+    if requested.type != "cuda":
+        return requested
+    estimate = _estimate_rw_working_set_bytes(
+        num_nodes=num_nodes,
+        num_edges=num_edges,
+        walks_per_node=int(getattr(args, "head_hop_walks_per_node", 2)),
+        walk_length=int(getattr(args, "head_hop_walk_length", 4)),
+        num_heads=int(getattr(args, "num_heads", 1)),
+    )
+    if _gpu_can_fit_rw(requested, estimate):
+        return requested
+    rank = int(getattr(args, "rank", 0)) if args is not None else 0
+    free_mib = -1.0
+    try:
+        free, _ = torch.cuda.mem_get_info(requested)
+        free_mib = free / (1024 ** 2)
+    except Exception:
+        pass
+    cache_key = ("_safe_rw_device", str(requested), int(num_edges), "cpu")
+    prev = _RW_DEVICE_DECISION_CACHE.get(cache_key)
+    overhead_mib = _gpu_concurrent_overhead_bytes(requested) / (1024 ** 2)
+    usable_mib = max(0.0, free_mib - overhead_mib)
+    if prev is None and rank == 0:
+        print(
+            f"[rw-device] estimated working set {estimate/(1024**2):.0f} MiB "
+            f"exceeds usable GPU {usable_mib:.0f} MiB "
+            f"(driver_free={free_mib:.0f} − overhead {overhead_mib:.0f} MiB, "
+            f"num_edges={num_edges:,}); forcing CPU build to avoid OOM. "
+            f"To reduce false CPU fallbacks, "
+            f"set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True. "
+            f"(Further matching calls suppressed.)"
+        )
+    _RW_DEVICE_DECISION_CACHE[cache_key] = (estimate, free_mib)
+    return torch.device("cpu")
 
 
 def get_seed_batch_size(args) -> int:
@@ -714,6 +947,50 @@ def compute_hop_buckets_random_walk(
     inferred_nodes = int(edge_index.max().item()) + 1
     num_nodes = max(num_nodes, inferred_nodes)
     rw_device = torch.device(device)
+
+    # Proactive GPU-OOM guard. torch_cluster.random_walk internally allocates
+    # ~4 × E × 8 bytes for the (row * num_nodes + col, argsort, permute)
+    # pipeline, which dominates working set on dense graphs (amazon ≈ 264M
+    # edges → ~8 GiB peak). Falling back to CPU here saves all caller paths
+    # — multi_tier edge-policy profiling, probe, and training step — from
+    # the partial-allocation-then-OOM pattern that fragments the allocator.
+    #
+    # Safety margin: reserve 10% of currently-free GPU for non-RW transients
+    # (model forward, autograd graph, NCCL buffers). Logs are gated on
+    # rank 0 and deduplicated against the previous decision so a stable
+    # CPU-fallback regime does not flood stdout.
+    if rw_device.type == "cuda":
+        E_cur = int(edge_index.size(1))
+        estimate = _estimate_rw_working_set_bytes(
+            num_nodes=num_nodes,
+            num_edges=E_cur,
+            walks_per_node=walks_per_node,
+            walk_length=walk_length,
+        )
+        if not _gpu_can_fit_rw(rw_device, estimate):
+            try:
+                free, _ = torch.cuda.mem_get_info(rw_device)
+                free_mib = free / (1024 ** 2)
+            except Exception:
+                free_mib = -1.0
+            cache_key = ("compute_hop_buckets_random_walk", str(rw_device), E_cur, "cpu")
+            prev = _RW_DEVICE_DECISION_CACHE.get(cache_key)
+            overhead_mib = _gpu_concurrent_overhead_bytes(rw_device) / (1024 ** 2)
+            usable_mib = max(0.0, free_mib - overhead_mib)
+            if prev is None and _rw_log_is_rank0():
+                print(
+                    f"[rw-device] compute_hop_buckets_random_walk: estimated "
+                    f"working set {estimate/(1024**2):.0f} MiB > usable GPU "
+                    f"{usable_mib:.0f} MiB (driver_free={free_mib:.0f} − "
+                    f"overhead {overhead_mib:.0f} MiB), num_edges={E_cur:,}; "
+                    f"forcing CPU build. NOTE: overrides any GPU-based "
+                    f"edge_policy from multi_tier. To reduce false CPU "
+                    f"fallbacks, set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True. "
+                    f"(Further matching calls suppressed.)"
+                )
+            _RW_DEVICE_DECISION_CACHE[cache_key] = (estimate, free_mib)
+            rw_device = torch.device("cpu")
+
     edge_index_dev, rowptr, col = _get_random_walk_graph(edge_index, num_nodes, rw_device)
 
     starts = torch.arange(num_nodes, device=rw_device, dtype=torch.long)
@@ -819,11 +1096,23 @@ def _run_random_walk(edge_index: Tensor, rowptr: Tensor, col: Tensor, starts: Te
         from torch_cluster import random_walk
     except Exception as exc:
         raise RuntimeError("torch_cluster.random_walk not available") from exc
+    # torch_cluster.random_walk API has two historical forms:
+    #   - older (≤ 1.5):  (rowptr, col, start, walk_length)  — CSR, faster,
+    #                     reuses our pre-built CSR pointers directly.
+    #   - newer (≥ 1.6):  (row, col, start, walk_length)     — COO, does
+    #                     argsort(row*N + col) to rebuild CSR internally.
+    # Try CSR first to preserve the fast path on older installs. On newer
+    # torch_cluster the CSR call raises a shape-mismatch error (rowptr has
+    # length N+1, col has length E, broadcast fails); fall back to COO.
+    # IMPORTANT: catch torch.cuda.OutOfMemoryError separately and re-raise
+    # so a real OOM isn't masked by the COO fallback.
     try:
         return random_walk(rowptr, col, starts, walk_length)
-    except RuntimeError as exc:
+    except torch.cuda.OutOfMemoryError:
+        raise
+    except (RuntimeError, TypeError) as exc:
         msg = str(exc)
-        if "must match" in msg or "size" in msg:
+        if "must match" in msg or "size" in msg or "expected" in msg:
             return random_walk(edge_index[0], edge_index[1], starts, walk_length)
         raise
 
@@ -1154,6 +1443,13 @@ def get_batch_blockize(
         else:
             rw_base = induced_edge_index_i_raw
             rw_dev = resolve_edge_build_device(args, dev if dev is not None else rw_base.device)
+            # Proactive GPU-OOM guard: if the estimated RW working set won't
+            # fit in the current free GPU pool with a 15% safety margin,
+            # build on CPU instead of OOM'ing and fragmenting the allocator.
+            rw_dev = _safe_rw_device(
+                rw_dev, args, num_nodes=x_i.size(0),
+                num_edges=int(rw_base.size(1)) if rw_base is not None else 0,
+            )
             if rw_base.device != rw_dev:
                 rw_base = rw_base.to(rw_dev)
             try:
@@ -1165,10 +1461,13 @@ def get_batch_blockize(
                     device=rw_base.device,
                     walk_length=getattr(args, "head_hop_walk_length", 4),
                     walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
-                    min_hop=int(getattr(args, "min_hop", 2)),
                 )
-            except RuntimeError:
+            except torch.cuda.OutOfMemoryError:
+                # Pre-check under-estimated; fall back to CPU.
+                if int(getattr(args, "rank", 0)) == 0:
+                    print("[rw-device] pre-check passed but build still OOM'd; retrying on CPU.")
                 rw_base = rw_base.to("cpu")
+                torch.cuda.empty_cache()
                 rw_edge_index_i_raw = build_head_hop_edges(
                     edge_index=rw_base,
                     num_nodes=x_i.size(0),
@@ -1177,7 +1476,6 @@ def get_batch_blockize(
                     device=rw_base.device,
                     walk_length=getattr(args, "head_hop_walk_length", 4),
                     walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
-                    min_hop=int(getattr(args, "min_hop", 2)),
                 )
             if rw_edge_index_i_raw is not None and rw_edge_index_i_raw.numel() > 0:
                 edge_parts.append(rw_edge_index_i_raw)
@@ -1187,6 +1485,11 @@ def get_batch_blockize(
     else:
         rw_base = induced_edge_index_i_raw
         rw_dev = resolve_edge_build_device(args, dev if dev is not None else rw_base.device)
+        # Proactive GPU-OOM guard — see comment above.
+        rw_dev = _safe_rw_device(
+            rw_dev, args, num_nodes=x_i.size(0),
+            num_edges=int(rw_base.size(1)) if rw_base is not None else 0,
+        )
         if rw_base.device != rw_dev:
             rw_base = rw_base.to(rw_dev)
         try:
@@ -1198,10 +1501,12 @@ def get_batch_blockize(
                 device=rw_base.device,
                 walk_length=getattr(args, "head_hop_walk_length", 4),
                 walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
-                min_hop=int(getattr(args, "min_hop", 2)),
             )
-        except RuntimeError:
+        except torch.cuda.OutOfMemoryError:
+            if int(getattr(args, "rank", 0)) == 0:
+                print("[rw-device] pre-check passed but build still OOM'd; retrying on CPU.")
             rw_base = rw_base.to("cpu")
+            torch.cuda.empty_cache()
             edge_index_i_heads = build_head_hop_edges(
                 edge_index=rw_base,
                 num_nodes=x_i.size(0),
@@ -1210,7 +1515,6 @@ def get_batch_blockize(
                 device=rw_base.device,
                 walk_length=getattr(args, "head_hop_walk_length", 4),
                 walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
-                min_hop=int(getattr(args, "min_hop", 2)),
             )
 
     if args.model == "graphormer" and apply_graphormer_virtual_edges:

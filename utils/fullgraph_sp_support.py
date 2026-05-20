@@ -787,7 +787,6 @@ class _AdaptiveEdgeBudgetConfig:
     block_size: int
     warmup_epochs: Optional[int]
     patience: int
-    gain_threshold: float
     max_total_edges_per_query: int
     static_seed_epochs: int
 
@@ -911,7 +910,6 @@ def _resolve_adaptive_edge_budget_config(args, valid_size: int) -> _AdaptiveEdge
         block_size=max(1, block_size),
         warmup_epochs=warmup_epochs,
         patience=patience,
-        gain_threshold=float(getattr(args, "adaptive_edge_budget_gain_threshold", 0.0)),
         max_total_edges_per_query=max(0, int(getattr(args, "max_total_edges_per_query", 0))),
         static_seed_epochs=static_seed_epochs,
     )
@@ -1128,6 +1126,50 @@ def _resolve_real_edges_for_state(
         return None
 
     build_device = torch.device(device)
+
+    # Proactive GPU-OOM guard for real-edge sampling. The minhash-mask
+    # path inside _sample_edges_per_query_random_minhash_mask needs a few
+    # single-shot int64 allocations of size E (E ≈ |edge_index_global|),
+    # the largest being min_key.index_select(0, dst) and the rand_key
+    # tensor — each ~8 × E bytes. On amazon (E = 264M) that's ~2 GiB
+    # contiguous each. If usable large_pool memory can't fit a single
+    # such allocation, demote sampling to CPU to avoid OOM partway
+    # through the build. Uses the same per-large_pool accounting as the
+    # RW pre-check (no magic multipliers).
+    if build_device.type == "cuda":
+        E_real = int(edge_index_global.size(1))
+        single_alloc = max(0, E_real) * 8  # int64
+        # Sampling allocates ~3-4 such tensors live concurrently; require
+        # headroom for at least 4 of them so partway allocs don't OOM.
+        sampling_estimate = 4 * single_alloc
+        from gt_sp.utils import (
+            _gpu_can_fit_rw as _gpu_can_fit,
+            _gpu_concurrent_overhead_bytes,
+            _rw_log_is_rank0,
+            _RW_DEVICE_DECISION_CACHE,
+        )
+        if not _gpu_can_fit(build_device, sampling_estimate):
+            cache_key = ("real_edge_sampling", str(build_device), E_real, "cpu")
+            prev = _RW_DEVICE_DECISION_CACHE.get(cache_key)
+            if prev is None and _rw_log_is_rank0():
+                try:
+                    free, _ = torch.cuda.mem_get_info(build_device)
+                    free_mib = free / (1024 ** 2)
+                except Exception:
+                    free_mib = -1.0
+                overhead_mib = _gpu_concurrent_overhead_bytes(build_device) / (1024 ** 2)
+                print(
+                    f"[rw-device] real-edge sampling: peak single alloc "
+                    f"{single_alloc/(1024**2):.0f} MiB × 4 concurrent = "
+                    f"{sampling_estimate/(1024**2):.0f} MiB exceeds usable GPU "
+                    f"(free={free_mib:.0f} MiB − overhead {overhead_mib:.0f} MiB); "
+                    f"forcing CPU sampling for E={E_real:,}. NOTE: this "
+                    f"overrides any GPU-based edge_policy announced by "
+                    f"multi_tier ACTIVE. (Further matching calls suppressed.)"
+                )
+            _RW_DEVICE_DECISION_CACHE[cache_key] = (sampling_estimate, 0)
+            build_device = torch.device("cpu")
+
     if edge_index_global.device == build_device:
         real_edges = edge_index_global
     else:
@@ -1272,6 +1314,73 @@ def _filter_by_dst_csr(csr: _DstEdgeCSR, dst_nodes: torch.Tensor) -> torch.Tenso
     return csr.sorted_edge_index[:, base + local_offset]
 
 
+def _build_or_retrieve_full_rw_pool(
+    args,
+    edge_index_global,
+    num_nodes,
+    rw_device,
+    walk_length,
+    walks_per_node,
+    num_heads,
+    edge_seed,
+):
+    """Build the full-graph RW pool, or retrieve it from a single-slot cache
+    when the same epoch's training step has already built it.
+
+    Cache key (everything that influences the RW realization):
+      (id(edge_index_global), num_nodes, walk_length, walks_per_node,
+       num_heads, edge_seed, rw_device).
+
+    Why this exists: training and probe were independently rebuilding the
+    full pool every epoch (~40-60s on amazon-scale graphs) under different
+    seeds. By sharing one seed per epoch and one cached pool, probe and
+    training observe the same RW realization → candidate-vs-base
+    comparisons become CRN-coupled at the pool level (not just the
+    per-candidate sample level), maximising signal-to-noise.
+
+    Cross-epoch resampling is preserved: the next epoch's training step
+    overwrites the cache with a new ``edge_seed``-keyed entry.
+    """
+    cache_key = (
+        id(edge_index_global),
+        int(num_nodes),
+        int(walk_length),
+        int(walks_per_node),
+        int(num_heads),
+        int(edge_seed) if edge_seed is not None else None,
+        str(rw_device),
+    )
+    cached = getattr(args, "_cached_full_rw_pool", None)
+    if cached is not None and cached.get("key") == cache_key:
+        return cached["pool"]
+
+    rw_torch_device = torch.device(rw_device)
+    seed_ctx = (
+        _fixed_torch_cpu_seed(edge_seed)
+        if edge_seed is not None and rw_torch_device.type == "cpu"
+        else contextlib.nullcontext()
+    )
+    with seed_ctx:
+        pool = profile_call(
+            "edge_rw_build",
+            lambda: build_head_hop_edges(
+                edge_index=edge_index_global,
+                num_nodes=num_nodes,
+                num_heads=num_heads,
+                num_groups=1,
+                device=rw_device,
+                walk_length=walk_length,
+                walks_per_node=walks_per_node,
+            ),
+            device=rw_device,
+        )
+    if isinstance(pool, list):
+        pool = _merge_edge_index_list(pool)
+
+    args._cached_full_rw_pool = {"key": cache_key, "pool": pool}
+    return pool
+
+
 def _build_probe_edge_pools(
     args,
     edge_index_global,
@@ -1310,29 +1419,27 @@ def _build_probe_edge_pools(
                 args,
                 walk_length_override=walk_length_override,
             )
-            rw_pool = build_head_hop_edges(
-                edge_index=edge_index_global,
+            # Use the shared cache so probe inherits training's just-built
+            # full pool (CRN-coupling at the realization level). Key
+            # alignment: edge_seed here must match training's epoch seed.
+            rw_pool = _build_or_retrieve_full_rw_pool(
+                args,
+                edge_index_global=edge_index_global,
                 num_nodes=num_nodes,
-                num_heads=args.num_heads,
-                num_groups=1,
-                device=rw_device,
+                rw_device=rw_device,
                 walk_length=wl,
                 walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
-                min_hop=int(getattr(args, "min_hop", 2)),
+                num_heads=args.num_heads,
+                edge_seed=edge_seed,
             )
-            if isinstance(rw_pool, list):
-                rw_pool = _merge_edge_index_list(rw_pool)
             if rw_pool is not None:
                 rw_pool = _filter_edge_index_by_dst(rw_pool, dst_filter)
                 rw_pool = rw_pool.to(dtype=torch.long, device="cpu")
-            # Probe-only dedup: when min_hop<=1 the RW pool can overlap with the
-            # real pool at d=1; remove that overlap so the probe's marginal-gain
-            # estimate of RW budget isn't inflated by edges already covered by
-            # real edges. Training-time edge construction is unaffected.
+            # Probe-only dedup: remove RW edges already covered by real edges so
+            # the probe's marginal-gain estimate of the RW budget isn't inflated
+            # by overlap. Training-time edge construction is unaffected.
             if (
-                bool(getattr(args, "probe_dedup_rw_against_real", True))
-                and int(getattr(args, "min_hop", 2)) <= 1
-                and rw_pool is not None
+                rw_pool is not None
                 and rw_pool.numel() > 0
                 and real_pool is not None
                 and real_pool.numel() > 0
@@ -1444,7 +1551,6 @@ class _AdaptiveEdgeBudgetController:
         self.block_size = int(config.block_size)
         self.max_total = int(config.max_total_edges_per_query)
         self.warmup_epochs = None if config.warmup_epochs is None else int(config.warmup_epochs)
-        self.gain_threshold = float(config.gain_threshold)
         self.patience = int(config.patience)
         self.bad_rounds = 0
         self.seen_positive_gain = False
@@ -1533,18 +1639,14 @@ class _AdaptiveEdgeBudgetController:
         if "walk_length" in state:
             self.walk_length = int(state["walk_length"])
 
-    def update(self, choice, best_gain, next_state=None, threshold=None):
-        effective_threshold = threshold if threshold is not None else self.gain_threshold
+    def required_confirm_rounds(self) -> int:
+        return min(self._n_budget_updates + 1, self._max_confirm_rounds)
+
+    def update(self, choice, best_gain, next_state=None):
         if best_gain > 0.0:
             self.seen_positive_gain = True
         if next_state is not None and choice is not None:
-            is_expand = choice in ("real_up", "rw_up")
-            # Single-shot commit: the loss/acc agreement + threshold gate in
-            # _maybe_update_edge_budget is the filter we trust. Once a
-            # candidate clears both metrics on a single probe epoch, commit
-            # immediately rather than waiting for additional confirmation
-            # rounds.
-            required = 1
+            required = self.required_confirm_rounds()
             if choice == self._pending_kind:
                 self._pending_wins += 1
             else:
@@ -1569,7 +1671,7 @@ class _AdaptiveEdgeBudgetController:
         self._pending_wins = 0
         if not self.seen_positive_gain:
             return
-        if best_gain <= effective_threshold:
+        if best_gain <= 0.0:
             self.bad_rounds += 1
             if self.bad_rounds >= self.patience:
                 self.frozen = True
@@ -1917,6 +2019,7 @@ def _maybe_update_edge_budget(
     local_nodes,
     amp_dtype,
     sp_world_size,
+    training_epoch_edge_seed=None,
 ):
     if (
         (not controller.enabled)
@@ -1930,12 +2033,37 @@ def _maybe_update_edge_budget(
         controller.frozen = True
         return
 
-    probe_seed = int(getattr(args, "seed", 0)) + 100000 + int(epoch)
+    # Use the SAME edge_seed the training step used in this epoch, so probe
+    # observes the same RW realization AND the per-candidate edge sampling
+    # uses the same minhash seeds as training. With identical seeds, base
+    # vs real_up vs rw_up candidate edge sets are *nested* (top-K vs
+    # top-K+block from the same ranking) — the candidate gain measures
+    # exactly the marginal effect of adding `block_size` edges, with zero
+    # noise from independent random subsetting. Falls back to the old
+    # independent probe seed when training_epoch_edge_seed is unknown
+    # (e.g., when called without the new kwarg by older callers).
+    if training_epoch_edge_seed is not None:
+        probe_seed = int(training_epoch_edge_seed)
+    else:
+        probe_seed = int(getattr(args, "seed", 0)) + 100000 + int(epoch)
     base_state = controller.current_state()
 
     n_layers = max(1, int(getattr(args, "n_layers", 1)))
+
+    # Build a dst-indexed CSR over edge_index_global once and cache it on the
+    # controller. The CSR is graph-topology only (no seed / no budget) and lets
+    # _expand_probe_idx_for_reception and _filter_by_dst_csr each replace an
+    # O(|E|) torch.isin scan with an O(|frontier| × avg_deg) gather. On products
+    # this swaps tens-of-million-edge scans for few-hundred-thousand-edge
+    # gathers per BFS layer. CPU-only, no GPU footprint.
+    edge_index_csr = getattr(controller, "_edge_csr", None)
+    if edge_index_csr is None:
+        edge_index_csr = _build_dst_csr(edge_index_global, num_nodes)
+        controller._edge_csr = edge_index_csr
+
     edge_dst_filter = _expand_probe_idx_for_reception(
         probe_idx_global, edge_index_global, n_layers,
+        edge_index_csr=edge_index_csr,
     )
 
     probe_rw_device = _budget_phase_probe_rw_device(rw_device)
@@ -1956,6 +2084,7 @@ def _maybe_update_edge_budget(
             adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
             walk_length_override=base_state.get("walk_length"),
             edge_dst_filter=edge_dst_filter,
+            edge_index_csr=edge_index_csr,
         )
 
     def _probe_edges(budget_state):
@@ -2040,30 +2169,17 @@ def _maybe_update_edge_budget(
         )
 
     winner_by_loss = min(probe_rows, key=lambda row: row["loss"])
-    winner_by_acc = max(probe_rows, key=lambda row: row["acc"])
-    require_agreement = bool(getattr(args, "adaptive_edge_budget_require_loss_acc_agreement", True))
-    # "Agreement" means both metrics pick the same non-base candidate.
-    # If either metric prefers `current` (i.e. "no candidate improves on the
-    # base") we treat it as disagreement too — that side is voting STAY.
-    loss_acc_agree = (
-        winner_by_loss["kind"] == winner_by_acc["kind"]
-        and winner_by_loss["kind"] != "current"
-    )
-    threshold = float(getattr(args, "adaptive_edge_budget_gain_threshold", 0.0))
-    gain_passes = best_gain > threshold
-    commit_ok = gain_passes and (loss_acc_agree or not require_agreement)
-    disagree_blocked = require_agreement and gain_passes and not loss_acc_agree
+    # Loss-only decision: commit iff a non-base candidate strictly beats base
+    # on probe loss. No threshold (the progressive-confirmation gate in
+    # controller.update absorbs noise filtering).
+    commit_ok = best_gain > 0.0
 
     if args.rank == 0:
         cur_real, cur_rw = _budget_pair(base_state)
         loss_real, loss_rw = _budget_pair(winner_by_loss["state"])
-        acc_real, acc_rw = _budget_pair(winner_by_acc["state"])
         print(
             f"  ↳ BudgetCtrl probe epoch={epoch} current=({cur_real},{cur_rw}) "
-            f"threshold={threshold:.8e} "
-            f"winner_by_loss={winner_by_loss['kind']}({loss_real},{loss_rw}) "
-            f"winner_by_acc={winner_by_acc['kind']}({acc_real},{acc_rw}) "
-            f"agree={loss_acc_agree}"
+            f"winner_by_loss={winner_by_loss['kind']}({loss_real},{loss_rw})"
         )
         for row in probe_rows:
             real_budget, rw_budget = _budget_pair(row["state"])
@@ -2095,24 +2211,21 @@ def _maybe_update_edge_budget(
             controller.auto_hold_neg_inf_streak = 0
             if args.rank == 0:
                 print(
-                    "  ↳ BudgetCtrl [AutoHoldReleased] via significant rel_gain: "
-                    f"{best_gain:.8e} > threshold={threshold:.8e}"
+                    "  ↳ BudgetCtrl [AutoHoldReleased] via positive rel_gain: "
+                    f"{best_gain:.8e}"
                 )
         else:
             if args.rank == 0:
-                reason = "acc_loss_disagree" if disagree_blocked else "below_threshold"
                 print(
                     f"  ↳ BudgetCtrl [AutoHold] epoch={epoch} searching... "
-                    f"best_rel_gain_found={best_gain:.8e} (threshold={threshold:.8e}) "
-                    f"reason={reason} "
+                    f"best_rel_gain_found={best_gain:.8e} "
                     f"neg_inf_streak={controller.auto_hold_neg_inf_streak}/"
                     f"{controller.auto_hold_neg_inf_freeze_after}"
                 )
             return
 
     controller.update(best_kind if commit_ok else None,
-                      best_gain, best_state if commit_ok else None,
-                      threshold=threshold)
+                      best_gain, best_state if commit_ok else None)
 
     if args.rank == 0:
         if commit_ok:
@@ -2121,13 +2234,14 @@ def _maybe_update_edge_budget(
             actual_move = "STAY"
         cur_budget = controller.current_state()
         lump_tag = " [lump-check]" if is_lump_epoch else ""
-        disagree_tag = " [acc_loss_disagree]" if disagree_blocked else ""
         pending_tag = ""
         if controller._pending_wins > 0:
-            pending_tag = f" [confirm {controller._pending_wins}/1]"
+            pending_tag = (
+                f" [confirm {controller._pending_wins}/"
+                f"{controller.required_confirm_rounds()}]"
+            )
         print(
-            f"  ↳ BudgetCtrl update epoch={epoch}{lump_tag}{disagree_tag} move={actual_move}{pending_tag} rel_gain={best_gain:.8e} "
-            f"threshold={threshold:.8e} "
+            f"  ↳ BudgetCtrl update epoch={epoch}{lump_tag} move={actual_move}{pending_tag} rel_gain={best_gain:.8e} "
             f"new_budget=({cur_budget['real_edges_per_query']},{cur_budget['rw_edges_per_query']}) "
             f"probe_loss={best_loss:.4f} probe_edges={best_count}"
         )
@@ -2145,7 +2259,7 @@ def _fixed_torch_cpu_seed(seed: int):
 
 def _build_merged_edges(args, edge_index_global, num_nodes, final_device, rw_device, nodes_per_rank,
                         edge_seed=None, edge_budget_state=None, adaptive_edge_budget_cfg=None,
-                        walk_length_override=None, dedup_rw_against_real=False):
+                        walk_length_override=None):
     parts = []
     final_torch_device = torch.device(final_device)
     real_edge_sampling_device = _resolve_real_edge_sampling_device(final_torch_device, rw_device)
@@ -2167,33 +2281,19 @@ def _build_merged_edges(args, edge_index_global, num_nodes, final_device, rw_dev
             edge_budget_state=edge_budget_state,
             walk_length_override=walk_length_override,
         )
-        rw_heads = profile_call(
-            "edge_rw_build",
-            lambda: build_head_hop_edges(
-                edge_index=edge_index_global,
-                num_nodes=num_nodes,
-                num_heads=args.num_heads,
-                num_groups=1,
-                device=rw_device,
-                walk_length=wl,
-                walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
-                min_hop=int(getattr(args, "min_hop", 2)),
-            ),
-            device=rw_device,
+        # Training-side RW build also goes through the shared cache: the
+        # built pool is stashed on args and probe will retrieve it
+        # later in this epoch without rebuilding.
+        rw_heads = _build_or_retrieve_full_rw_pool(
+            args,
+            edge_index_global=edge_index_global,
+            num_nodes=num_nodes,
+            rw_device=rw_device,
+            walk_length=wl,
+            walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
+            num_heads=args.num_heads,
+            edge_seed=edge_seed,
         )
-        if isinstance(rw_heads, list):
-            rw_heads = _merge_edge_index_list(rw_heads)
-        if (
-            dedup_rw_against_real
-            and rw_heads is not None
-            and rw_heads.numel() > 0
-            and int(getattr(args, "min_hop", 2)) <= 1
-        ):
-            rw_heads = profile_call(
-                "edge_rw_dedup",
-                lambda: _subtract_edge_index(rw_heads, edge_index_global, num_nodes),
-                device=rw_device,
-            )
     rw_heads = _resolve_rw_edges_for_state(
         args,
         rw_heads,
@@ -2265,7 +2365,6 @@ def _make_merged_edge_cache_key(
     edge_budget_state,
     adaptive_edge_budget_cfg,
     walk_length_override,
-    dedup_rw_against_real: bool = False,
 ) -> tuple:
     """Build a hashable cache key that fully determines the merged edge output."""
     real_budget = _get_real_edge_budget(args, edge_budget_state, adaptive_edge_budget_cfg)
@@ -2285,8 +2384,6 @@ def _make_merged_edge_cache_key(
         int(getattr(args, "num_heads", 1)),
         str(getattr(args, "model", "")),
         int(getattr(args, "num_global_node", 0)),
-        bool(dedup_rw_against_real),
-        int(getattr(args, "min_hop", 2)),
     )
 
 
@@ -2307,7 +2404,7 @@ def _build_and_broadcast_edges(args, edge_index_global, num_nodes, device, rw_de
                                sp_src_rank, sp_rank, nodes_per_rank, edge_seed=None,
                                edge_budget_state=None, adaptive_edge_budget_cfg=None,
                                walk_length_override=None, edge_policy=None,
-                               force_broadcast=None, dedup_rw_against_real=False):
+                               force_broadcast=None):
     # ---------------------------------------------------------------------------
     # O3 Optimization: Rank-Local Edge Construction (eliminates edge broadcast).
     #
@@ -2338,7 +2435,7 @@ def _build_and_broadcast_edges(args, edge_index_global, num_nodes, device, rw_de
         cache_key = _make_merged_edge_cache_key(
             args, edge_index_global, num_nodes, rw_build_device, resolved_policy,
             nodes_per_rank, edge_seed, edge_budget_state, adaptive_edge_budget_cfg,
-            walk_length_override, dedup_rw_against_real,
+            walk_length_override,
         )
         if cache_key in _MERGED_EDGE_CACHE:
             profile_call("edge_build_local", lambda: None, device=device, payload_bytes=0)
@@ -2369,7 +2466,6 @@ def _build_and_broadcast_edges(args, edge_index_global, num_nodes, device, rw_de
                     edge_budget_state=edge_budget_state,
                     adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
                     walk_length_override=walk_length_override,
-                    dedup_rw_against_real=dedup_rw_against_real,
                 ),
                 device=device,
             )
@@ -2387,7 +2483,7 @@ def _build_and_broadcast_edges(args, edge_index_global, num_nodes, device, rw_de
             _make_merged_edge_cache_key(
                 args, edge_index_global, num_nodes, rw_build_device, resolved_policy,
                 nodes_per_rank, edge_seed, edge_budget_state, adaptive_edge_budget_cfg,
-                walk_length_override, dedup_rw_against_real,
+                walk_length_override,
             ) if edge_seed is not None else None
         )
         if _bcast_cache_key is not None and _bcast_cache_key in _MERGED_EDGE_CACHE:
@@ -2409,7 +2505,6 @@ def _build_and_broadcast_edges(args, edge_index_global, num_nodes, device, rw_de
                     edge_budget_state=edge_budget_state,
                     adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
                     walk_length_override=walk_length_override,
-                    dedup_rw_against_real=dedup_rw_against_real,
                 ),
                 device=device,
             )
@@ -2444,7 +2539,7 @@ def _build_attention_edges(args, edge_index_global, num_nodes, device, rw_device
                            sp_src_rank, sp_rank, nodes_per_rank, edge_seed=None,
                            edge_budget_state=None, adaptive_edge_budget_cfg=None,
                            walk_length_override=None, edge_policy=None,
-                           force_broadcast=None, dedup_rw_against_real=False):
+                           force_broadcast=None):
     return _build_and_broadcast_edges(
         args,
         edge_index_global,
@@ -2461,7 +2556,6 @@ def _build_attention_edges(args, edge_index_global, num_nodes, device, rw_device
         walk_length_override=walk_length_override,
         edge_policy=edge_policy,
         force_broadcast=force_broadcast,
-        dedup_rw_against_real=dedup_rw_against_real,
     )
 
 

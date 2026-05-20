@@ -132,21 +132,9 @@ def add_node_common_args(parser, defaults=None):
         help="head hop random walks per node",
     )
     parser.add_argument(
-        "--min_hop",
-        type=int,
-        default=defaults.get("min_hop", 2),
-        help=(
-            "minimum hop distance kept when collecting RW edges; d < min_hop is filtered "
-            "(min_hop=1 keeps 1-hop neighbours like the original behaviour, min_hop=2 skips "
-            "direct neighbours so the RW pool only contains far-distance nodes)."
-        ),
-    )
-    parser.add_argument(
         "--edge_build_device",
-        "--random_walk_device",
-        dest="edge_build_device",
         type=str,
-        default=defaults.get("edge_build_device", defaults.get("random_walk_device", "same")),
+        default=defaults.get("edge_build_device", "same"),
         help="device for edge construction/sampling: same|cpu|cuda|cuda:N",
     )
     parser.add_argument("--rank", type=int, default=defaults.get("rank"))
@@ -223,38 +211,6 @@ def add_node_batch_sp_args(parser, defaults=None):
         type=str,
         default=defaults.get("full_attn_hop_stats_tag", ""),
         help="optional suffix appended to the hop-mass stats directory name",
-    )
-    parser.add_argument(
-        "--full_attn_onehop_eval",
-        action="store_true",
-        default=defaults.get("full_attn_onehop_eval", False),
-        help="run eval-only 1-hop ablation experiments in full attention mode",
-    )
-    parser.add_argument(
-        "--full_attn_onehop_keep_k",
-        type=int,
-        default=defaults.get("full_attn_onehop_keep_k", 4),
-        help="keep top/random K one-hop neighbors per query in the eval-only ablation experiment",
-    )
-    parser.add_argument(
-        "--full_attn_onehop_keep_ratio",
-        type=float,
-        default=defaults.get("full_attn_onehop_keep_ratio", 0.0),
-        help="if > 0, keep this fraction of one-hop neighbors per query (top-attention vs random control) instead of a fixed K",
-    )
-    parser.add_argument(
-        "--full_attn_onehop_eval_splits",
-        type=str,
-        default=defaults.get("full_attn_onehop_eval_splits", "valid"),
-        choices=["valid", "test", "both"],
-        help="which splits to evaluate in the full-attention 1-hop ablation experiment",
-    )
-    parser.add_argument(
-        "--full_attn_onehop_eval_layer_mode",
-        type=str,
-        default=defaults.get("full_attn_onehop_eval_layer_mode", "all"),
-        choices=["last", "all"],
-        help="apply the eval-only 1-hop ablation to the last layer only or to all full-attention layers",
     )
     parser.add_argument("--adaptive_cov_delta", type=float, default=defaults.get("adaptive_cov_delta", 0.03), help="min coverage improvement to reset patience")
 
@@ -369,12 +325,6 @@ def add_node_fullgraph_sp_args(parser, defaults=None):
         help="advanced override; >0 limits online budget updates to the first N epochs, 0 freezes immediately after bootstrap, <0 removes cap",
     )
     parser.add_argument(
-        "--adaptive_edge_budget_gain_threshold",
-        type=float,
-        default=defaults.get("adaptive_edge_budget_gain_threshold", 0),
-        help="advanced override for minimum probe-loss improvement per added edge required to keep expanding the budget",
-    )
-    parser.add_argument(
         "--adaptive_edge_budget_patience",
         type=int,
         default=defaults.get("adaptive_edge_budget_patience", 0),
@@ -385,28 +335,6 @@ def add_node_fullgraph_sp_args(parser, defaults=None):
         type=int,
         default=defaults.get("adaptive_edge_budget_static_seed_epochs", 0),
         help="advanced override; 0 keeps early-epoch edge sampling deterministic for the automatic default number of epochs, <0 disables fixed early-epoch sampling",
-    )
-    parser.add_argument(
-        "--probe_dedup_rw_against_real",
-        action=argparse.BooleanOptionalAction,
-        default=defaults.get("probe_dedup_rw_against_real", True),
-        help=(
-            "during the adaptive edge-budget probe, remove RW edges that already exist in "
-            "the real-edge pool before per-query sampling so the marginal-gain estimate of "
-            "the RW budget is not inflated by 1-hop overlap. Training-time edge construction "
-            "is unaffected (1-hop RW edges remain available when --min_hop=1)."
-        ),
-    )
-    parser.add_argument(
-        "--adaptive_edge_budget_require_loss_acc_agreement",
-        action=argparse.BooleanOptionalAction,
-        default=defaults.get("adaptive_edge_budget_require_loss_acc_agreement", True),
-        help=(
-            "only register a budget move when the loss-winner and accuracy-winner agree on "
-            "the same non-base candidate. Filters out noisy probe epochs where the two "
-            "metrics disagree on direction (typical on small valid sets like arxiv where the "
-            "loss gap between candidates is below the per-seed noise floor)."
-        ),
     )
     parser.add_argument(
         "--include_real_edges",
@@ -424,22 +352,6 @@ def add_node_fullgraph_sp_args(parser, defaults=None):
         action="store_true",
         default=defaults.get("force_edge_broadcast", False),
         help="force the legacy full-graph path where the SP source rank builds sampled edges and broadcasts them to the other SP ranks even when deterministic seeded local construction is available",
-    )
-    parser.add_argument(
-        "--disable_edge_prefetch",
-        action="store_true",
-        default=defaults.get("disable_edge_prefetch", False),
-        help="disable async next-epoch edge prefetch so A/B timing can compare foreground-only edge construction",
-    )
-    parser.add_argument(
-        "--allow_cpu_rank_local_prefetch",
-        action="store_true",
-        default=defaults.get("allow_cpu_rank_local_prefetch", False),
-        help=(
-            "experimental: when training on GPU with --edge_build_device cpu, keep the "
-            "deterministic rank-local edge-build path instead of forcing cpu_broadcast; "
-            "intended only for measuring whether CPU-side edge prefetch can hide build time"
-        ),
     )
     parser.add_argument(
         "--fixed_real_edges_per_query",
