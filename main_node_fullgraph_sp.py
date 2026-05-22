@@ -52,8 +52,6 @@ from utils.fullgraph_sp_support import (
     _build_model,
     _build_optimizer_bundle,
     _bootstrap_initial_edge_budget,
-    _build_nagphormer_rw_csr,
-    _build_rw_hop_features,
     _compute_laplacian_pe,
     _compute_multihop_features,
     _generate_expander_edges,
@@ -574,44 +572,7 @@ def main():
         feature = torch.cat([feature, feature.new_zeros(pad_rows, feature.shape[1])], dim=0)
         y = torch.cat([y, y.new_full((pad_rows,) + y.shape[1:], -1)], dim=0)
 
-    # NAGphormer: pre-compute K-hop neighborhood features once before training.
-    # Done after padding so padded rows are zero-initialised and propagate cleanly.
-    # feature becomes (N_padded, hops+1, d); all downstream slices are correct.
-    _is_nagphormer = (args.model == "nagphormer")
     _is_exphormer = (args.model == "exphormer")
-    _nag_rw_mode = _is_nagphormer and int(getattr(args, "nagphormer_rw_walks", 0)) > 0
-    _nag_rw_ptr = None
-    _nag_rw_col = None
-    _nag_feature_cpu = None   # full (N_padded, d) CPU features kept for per-epoch RW
-    if _is_nagphormer:
-        _nag_pe_dim = int(getattr(args, "pe_dim", 0))
-        _nag_hops = int(args.hops)
-        if _nag_rw_mode:
-            _nag_rw_walks = int(args.nagphormer_rw_walks)
-            if args.rank == 0:
-                print(
-                    f"[nagphormer-rw] Building RW CSR "
-                    f"(N={feature.shape[0]:,}, hops={_nag_hops}, walks={_nag_rw_walks}) …"
-                )
-            _nag_rw_ptr, _nag_rw_col, _row_aug_rw, _col_aug_rw = _build_nagphormer_rw_csr(
-                edge_index_global, feature.shape[0]
-            )
-            # Apply Laplacian PE once (static), then keep the 2-D feature tensor on CPU
-            _nag_feature_cpu = feature.float().cpu()
-            if _nag_pe_dim > 0:
-                if args.rank == 0:
-                    print(f"[nagphormer-rw] Computing Laplacian PE (pe_dim={_nag_pe_dim}) …")
-                lpe = _compute_laplacian_pe(_row_aug_rw, _col_aug_rw, feature.shape[0], _nag_pe_dim)
-                _nag_feature_cpu = torch.cat([_nag_feature_cpu, lpe], dim=1)
-            del _row_aug_rw, _col_aug_rw
-            # feature stays 2-D so _build_model reads feature.shape[-1] = d+pe_dim correctly
-            feature = _nag_feature_cpu
-        else:
-            feature = _compute_multihop_features(
-                edge_index_global, feature.shape[0], feature, _nag_hops,
-                pe_dim=_nag_pe_dim,
-                rank=args.rank,
-            )
 
     # Graphormer / GT NAGphormer-style preprocessing:
     #   hops > 0 : K-hop mean feature smoothing (bidirected+self-loop, same as NAGphormer)
@@ -735,22 +696,10 @@ def main():
         world_size=sp_world_size,
     )
 
-    if _nag_rw_mode:
-        # In RW mode feature is 2-D (N, d+pe_dim); x_local is computed per epoch.
-        # We use a dummy 3-D slice here so the model is initialised with the right
-        # shape, but it will be overwritten at the start of every epoch.
-        _local_nodes_cpu = torch.arange(rank_start, rank_end, dtype=torch.long)
-        x_local = _build_rw_hop_features(
-            _nag_feature_cpu, _nag_rw_ptr, _nag_rw_col,
-            _local_nodes_cpu, _nag_hops, _nag_rw_walks,
-            seed=int(getattr(args, "seed", 0)),
-        ).float().to(device)
-    else:
-        x_local = feature[rank_start:rank_end].float().to(device)
+    x_local = feature[rank_start:rank_end].float().to(device)
     y_eval = y if args.rank == 0 else None
     split_idx_eval = split_idx if args.rank == 0 else None
-    if not _nag_rw_mode:
-        del feature
+    del feature
     if args.rank != 0:
         del y
         del split_idx
@@ -837,13 +786,7 @@ def main():
     _adaptive_edge_decision_done = True  # True = no deferred work needed
 
     _cuda_empty_cache(args)
-    if _is_nagphormer:
-        if args.rank == 0:
-            print(
-                "[edge-cache] Disabled: NAGphormer uses pre-computed multi-hop features; "
-                "edge_index_global is not passed to the model."
-            )
-    elif _is_multi_tier:
+    if _is_multi_tier:
         # ---- multi_tier: measure t_h2d, register with planner, defer --------
         # The _MultiTierResourceManager jointly decides topology cache vs
         # per-layer tier allocation after profiling.  We must not cache here:
@@ -1270,23 +1213,11 @@ def main():
             prefetch_wait_time = time.perf_counter() - _prefetch_wait_start
             _prefetch_future = None
 
-        if _is_nagphormer:
-            # NAGphormer uses pre-computed multi-hop features; no edge building needed.
-            edge_index_rw, rw_time = None, 0.0
-            if _nag_rw_mode:
-                # Re-sample walks every epoch; different seed gives stochastic regularisation.
-                _rw_seed = int(getattr(args, "seed", 0)) + epoch
-                x_local = _build_rw_hop_features(
-                    _nag_feature_cpu, _nag_rw_ptr, _nag_rw_col,
-                    _local_nodes_cpu, _nag_hops, _nag_rw_walks,
-                    seed=_rw_seed,
-                ).float().to(device)
-        else:
-            edge_index_rw, rw_time = _time_step_block(
-                _build_edges_for_epoch,
-                device=device,
-                synchronize_cuda=sync_step_timing,
-            )
+        edge_index_rw, rw_time = _time_step_block(
+            _build_edges_for_epoch,
+            device=device,
+            synchronize_cuda=sync_step_timing,
+        )
 
         # Exphormer: merge expander edges (+ self-loops) into edge_index_rw and attach
         # edge-type labels in row-2 (0 = real/RW/self-loop, 1 = expander).

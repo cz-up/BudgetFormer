@@ -14,7 +14,7 @@ def add_node_common_args(parser, defaults=None):
     )
 
     parser.add_argument("--model", type=str, default=defaults.get("model", "graphormer"),
-                        choices=["graphormer", "gt", "nagphormer", "exphormer", "graphgps"])
+                        choices=["graphormer", "gt", "exphormer", "graphgps"])
     parser.add_argument(
         "--hops",
         type=int,
@@ -46,17 +46,6 @@ def add_node_common_args(parser, defaults=None):
             "once at startup (fixed seed) and merged into the attention edge pool each epoch. "
             "Edge type (0=real/RW, 1=expander) is carried in edge_index row-2 for the "
             "Exphormer model's edge-feature-modulated attention."
-        ),
-    )
-    parser.add_argument(
-        "--nagphormer_rw_walks",
-        type=int,
-        default=defaults.get("nagphormer_rw_walks", 0),
-        help=(
-            "[NAGphormer] Random-walk walks per node per epoch (0 = matrix-power mode). "
-            "When > 0, replaces the static K-hop matrix-power aggregation with W stochastic "
-            "random walks of length K, re-sampled every epoch for implicit regularisation. "
-            "Typical values: 10-50."
         ),
     )
     parser.add_argument("--n_layers", type=int, default=defaults.get("n_layers", 4))
@@ -184,10 +173,6 @@ def add_node_batch_sp_args(parser, defaults=None):
         help="total sequence length here",
     )
 
-    parser.add_argument("--adaptive_walk", action="store_true", default=False, help="enable adaptive tuning of walk length/num walks")
-    parser.add_argument("--adaptive_patience", type=int, default=defaults.get("adaptive_patience", 5), help="epochs without improvement before fixing L/R")
-    parser.add_argument("--adaptive_eval_repeats", type=int, default=defaults.get("adaptive_eval_repeats", 3), help="repeat evaluation and average to reduce randomness")
-    parser.add_argument("--adaptive_embed_batches", type=int, default=defaults.get("adaptive_embed_batches", 5), help="number of train batches to compare L vs L+1")
     parser.add_argument("--full_attn_hop_stats", action="store_true", default=False, help="enable full attention hop-mass stats in val")
     parser.add_argument("--full_attn_hop_mass", type=float, default=0.95, help="target hop mass ratio (e.g., 0.95)")
     parser.add_argument("--full_attn_hop_max_queries", type=int, default=defaults.get("full_attn_hop_max_queries", 64), help="max queries per batch for hop-mass stats")
@@ -212,8 +197,6 @@ def add_node_batch_sp_args(parser, defaults=None):
         default=defaults.get("full_attn_hop_stats_tag", ""),
         help="optional suffix appended to the hop-mass stats directory name",
     )
-    parser.add_argument("--adaptive_cov_delta", type=float, default=defaults.get("adaptive_cov_delta", 0.03), help="min coverage improvement to reset patience")
-
     parser.add_argument(
         "--attn_bias_mode",
         type=str,
@@ -374,7 +357,7 @@ def add_node_fullgraph_sp_args(parser, defaults=None):
     parser.add_argument("--seq_len", type=int, default=defaults.get("seq_len", 0), help="compat arg for shared launch scripts")
 
 
-def normalize_main_node_batch_sp_args(args):
+def normalize_main_node_sp_args(args):
     _normalize_checkpoint_args(args)
     if str(getattr(args, "model", "")).lower() == "gt":
         args.attn_type = "sparse"
@@ -385,7 +368,7 @@ def normalize_main_node_fullgraph_sp_args(args):
     _normalize_checkpoint_args(args)
     _normalize_fixed_edge_budget_args(args)
     _normalize_multi_tier_gpu_memory_limit_args(args)
-    if str(getattr(args, "model", "")).lower() in ("gt", "nagphormer", "exphormer"):
+    if str(getattr(args, "model", "")).lower() in ("gt", "exphormer"):
         args.attn_type = "sparse"
     # graphgps supports both sparse (default) and full attention; preserve user's --attn_type
     if str(getattr(args, "model", "")).lower() == "graphgps":
@@ -395,8 +378,6 @@ def normalize_main_node_fullgraph_sp_args(args):
         args.num_global_node = 0
     elif args.num_global_node not in (0, 1):
         raise ValueError("main_node_fullgraph_sp.py currently supports at most one Graphormer-style virtual node.")
-    if args.model == "nagphormer" and int(getattr(args, "hops", 7)) < 1:
-        raise ValueError("--hops must be >= 1 for NAGphormer.")
     if args.model in ("graphormer", "gt") and int(getattr(args, "hops", 0)) < 0:
         raise ValueError("--hops must be >= 0 for Graphormer/GT (0 = disabled).")
     if str(getattr(args, "dataset", "")).lower() == "ogbn-arxiv":

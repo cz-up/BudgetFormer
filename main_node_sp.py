@@ -34,7 +34,7 @@ from gt_sp.utils import (
 from utils.parser_node_level import (
     add_node_batch_sp_args,
     add_node_common_args,
-    normalize_main_node_batch_sp_args,
+    normalize_main_node_sp_args,
 )
 from utils.split_utils import load_default_split
 from torch_geometric.utils import coalesce
@@ -371,7 +371,7 @@ def main():
     parser = argparse.ArgumentParser(description="TorchGT node-level batch training (SP).")
     add_node_common_args(parser)
     add_node_batch_sp_args(parser)
-    args = normalize_main_node_batch_sp_args(parser.parse_args())
+    args = normalize_main_node_sp_args(parser.parse_args())
 
     # Initialize distributed
     initialize_distributed(args)
@@ -420,6 +420,10 @@ def main():
 
     loss_list = []
     epoch_wall_t_list = []
+    # Inference time: val and test timed independently (CUDA-synced), first
+    # eval skipped as warm-up.
+    val_time_list, test_time_list = [], []
+    _eval_warmup_done = False
     best_epoch = -1
     best_val = 0
     best_test = 0
@@ -489,12 +493,20 @@ def main():
 
         if epoch % args.eval_every == 0:
             stats = None
-            t4 = time.time()
+            # train acc: reported only, NOT counted in inference-time stats
             with fixed_random_seed(args.seed):
                 train_acc = sparse_eval_gpu(args, model, feature, y, split_idx["train"], None, edge_index_global, device)
+            # val inference time
+            t_val = None
             if val_acc is None:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize(device)
+                _t_val_start = time.perf_counter()
                 with fixed_random_seed(args.seed):
                     val_acc = sparse_eval_gpu(args, model, feature, y, split_idx["valid"], None, edge_index_global, device)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize(device)
+                t_val = time.perf_counter() - _t_val_start
             stats_needed = (
                 args.full_attn_hop_stats
                 and args.attn_type == "full"
@@ -527,13 +539,27 @@ def main():
                     "hop-mass stats are collected only in full attention mode."
                 )
 
+            # test inference time
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(device)
+            _t_test_start = time.perf_counter()
             with fixed_random_seed(args.seed):
                 test_acc = sparse_eval_gpu(args, model, feature, y, split_idx["test"], None, edge_index_global, device)
-            t5 = time.time()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(device)
+            t_test = time.perf_counter() - _t_test_start
             if args.rank == 0:
+                # Skip first eval as warm-up.
+                if not _eval_warmup_done:
+                    _eval_warmup_done = True
+                else:
+                    if t_val is not None:
+                        val_time_list.append(t_val)
+                    test_time_list.append(t_test)
                 epoch_wall_so_far = time.time() - t_epoch_start
                 print("------------------------------------------------------------------------------------")
-                print(f'Eval time {t5-t4}s')
+                _val_str = f"val: {t_val*1000:.2f} ms" if t_val is not None else "val: (cached)"
+                print(f"Inference time | {_val_str} | test: {t_test*1000:.2f} ms")
                 print("Epoch: {:03d}, Loss: {:4f}, Train acc: {:.2%}, Val acc: {:.2%}, Test acc: {:.2%}, Epoch Wall Time: {:.3f}s".format(
                     epoch, np.mean(loss_list), train_acc, val_acc, test_acc, epoch_wall_so_far))
                 if stats is not None:
@@ -576,6 +602,27 @@ def main():
 
     if args.rank == 0:
         print(f"Best epoch: {best_epoch}, validation accuracy: {best_val:.2%}, test accuracy: {best_test:.2%}")
+        val_size = int(split_idx["valid"].numel())
+        test_size = int(split_idx["test"].numel())
+        if len(val_time_list) > 0:
+            mean_val_s = float(np.mean(val_time_list))
+            val_thr = val_size / mean_val_s if mean_val_s > 0 else 0.0
+            print(f"Avg val  inference time (excluding warm-up): {mean_val_s*1000:.2f} ms  "
+                  f"({val_size} nodes, throughput={val_thr:,.0f} nodes/s)")
+        else:
+            print("Avg val  inference time: n/a")
+        if len(test_time_list) > 0:
+            mean_test_s = float(np.mean(test_time_list))
+            test_thr = test_size / mean_test_s if mean_test_s > 0 else 0.0
+            print(f"Avg test inference time (excluding warm-up): {mean_test_s*1000:.2f} ms  "
+                  f"({test_size} nodes, throughput={test_thr:,.0f} nodes/s)")
+        else:
+            print("Avg test inference time: n/a")
+        if len(val_time_list) > 0 and len(test_time_list) > 0:
+            mean_sum_s = float(np.mean(val_time_list)) + float(np.mean(test_time_list))
+            combined_thr = (val_size + test_size) / mean_sum_s if mean_sum_s > 0 else 0.0
+            print(f"Avg val+test inference time:                 {mean_sum_s*1000:.2f} ms  "
+                  f"({val_size + test_size} nodes, throughput={combined_thr:,.0f} nodes/s)")
     if torch.cuda.is_available():
         peak_alloc = torch.cuda.max_memory_allocated()
         peak_reserved = torch.cuda.max_memory_reserved()

@@ -29,7 +29,6 @@ from models.exphormer_dist_node_level import Exphormer
 from models.graphgps_dist_node_level import GraphGPS
 from models.graphormer_dist_node_level import Graphormer
 from models.gt_dist_node_level import GT
-from models.nagphormer_dist_node_level import NAGphormer
 from utils.lr import CosineWithWarmupLR, PolynomialDecayLR
 from utils.split_utils import load_default_split
 
@@ -177,93 +176,6 @@ def _compute_multihop_features(edge_index_global, num_nodes, features, hops, pe_
             f"({actual_mib:.1f} MiB)"
         )
     return result
-
-
-def _build_nagphormer_rw_csr(edge_index_global, num_nodes):
-    """Build bidirected+self-loop CSR (indexed by source) for random-walk sampling.
-
-    Returns csr_ptr (N+1,), csr_col (E_aug,), and the augmented (row_aug, col_aug)
-    so callers can reuse them for Laplacian PE without rebuilding the graph.
-    """
-    row = edge_index_global[0].cpu()
-    col = edge_index_global[1].cpu()
-
-    # bidirected dedup
-    row_bi = torch.cat([row, col])
-    col_bi = torch.cat([col, row])
-    idx = row_bi * num_nodes + col_bi
-    idx, perm = torch.sort(idx)
-    mask = torch.ones(idx.size(0), dtype=torch.bool)
-    mask[1:] = idx[1:] != idx[:-1]
-    perm = perm[mask]
-    row_bi = row_bi[perm]
-    col_bi = col_bi[perm]
-
-    # self-loops — every node has at least one neighbour (itself), so walks never get stuck
-    self_nodes = torch.arange(num_nodes, dtype=torch.long)
-    row_aug = torch.cat([row_bi, self_nodes])
-    col_aug = torch.cat([col_bi, self_nodes])
-
-    # sort by source (row) to build CSR ptr
-    order = torch.argsort(row_aug, stable=True)
-    row_sorted = row_aug[order]
-    col_sorted = col_aug[order]
-
-    # bincount → prefix-sum pointer array (N+1,)
-    counts = torch.bincount(row_sorted, minlength=num_nodes)
-    csr_ptr = torch.zeros(num_nodes + 1, dtype=torch.long)
-    torch.cumsum(counts, dim=0, out=csr_ptr[1:])
-
-    return csr_ptr, col_sorted, row_aug, col_aug
-
-
-def _build_rw_hop_features(feature_cpu, csr_ptr, csr_col, local_nodes, hops, walks_per_node, seed=None):
-    """Vectorized stochastic multi-hop aggregation via random walks.
-
-    W = walks_per_node independent walks of length K are started from each node in
-    local_nodes.  At step k the walker picks a uniformly random neighbour (including
-    self-loop, so the walk never gets stuck).  The feature at each hop is the mean
-    over all W walkers at that position.
-
-    Returns: (N_local, hops+1, d) float32 tensor on CPU.
-    """
-    N = local_nodes.size(0)
-    W = int(walks_per_node)
-    d = feature_cpu.size(1)
-
-    if seed is not None:
-        gen = torch.Generator()
-        gen.manual_seed(int(seed))
-    else:
-        gen = None
-
-    # h_0: own node features, repeated for averaging consistency
-    h0 = feature_cpu[local_nodes]          # (N, d)
-    hop_feats = [h0]
-
-    # current walkers: (N, W) — each of the N local nodes has W parallel walkers
-    current = local_nodes.unsqueeze(1).expand(N, W).clone()   # (N, W)
-
-    for _ in range(hops):
-        flat = current.reshape(-1)           # (N*W,)
-        counts = csr_ptr[flat + 1] - csr_ptr[flat]   # number of neighbours (>=1)
-
-        if gen is not None:
-            rand_frac = torch.rand(flat.size(0), generator=gen)
-        else:
-            rand_frac = torch.rand(flat.size(0))
-
-        rand_off = (rand_frac * counts.float()).long().clamp_max(counts - 1)
-        col_idx = csr_ptr[flat] + rand_off
-        next_flat = csr_col[col_idx]         # (N*W,) next node indices
-
-        # mean feature across W walkers for this hop
-        walker_feats = feature_cpu[next_flat].reshape(N, W, d)   # (N, W, d)
-        hop_feats.append(walker_feats.mean(dim=1))               # (N, d)
-
-        current = next_flat.reshape(N, W)
-
-    return torch.stack(hop_feats, dim=1)   # (N, hops+1, d)
 
 
 def _generate_expander_edges(num_nodes, degree, seed=0):
@@ -760,19 +672,6 @@ def _build_model(args, feature, y, device):
             **common,
             num_global_node=0,
             attn_type=getattr(args, "attn_type", "sparse"),
-        ).to(device)
-        _configure_activation_checkpoint(model, allow_adaptive=False)
-    elif args.model == "nagphormer":
-        model = NAGphormer(
-            hops=int(getattr(args, "hops", 7)),
-            n_class=out_dim,
-            input_dim=input_dim,
-            n_layers=args.n_layers,
-            num_heads=args.num_heads,
-            hidden_dim=args.hidden_dim,
-            ffn_dim=args.ffn_dim,
-            dropout_rate=args.dropout_rate,
-            attention_dropout_rate=args.attention_dropout_rate,
         ).to(device)
         _configure_activation_checkpoint(model, allow_adaptive=False)
     else:
@@ -1391,17 +1290,7 @@ def _build_or_retrieve_full_rw_pool(
     )
     cached = getattr(args, "_cached_full_rw_pool", None)
     if cached is not None and cached.get("key") == cache_key:
-        args._last_rw_pool_was_cached = True
         return cached["pool"]
-    # Cache miss: record so the caller's timing breakdown can show
-    # whether the cache is effective.
-    args._last_rw_pool_was_cached = False
-    if int(getattr(args, "rank", 0)) == 0:
-        prev_key = cached.get("key") if cached is not None else None
-        print(
-            f"[rw-cache] MISS: building full RW pool. "
-            f"key={cache_key} prev_key={prev_key}"
-        )
 
     rw_torch_device = torch.device(rw_device)
     seed_ctx = (
@@ -2109,35 +1998,16 @@ def _maybe_update_edge_budget(
 
     n_layers = max(1, int(getattr(args, "n_layers", 1)))
 
-    # ---------- diagnostic timing instrumentation ----------
-    # When investigating where probe time actually goes, we record per-stage
-    # wall time on rank 0 and print a breakdown at the end. CUDA work is
-    # synced before each timestamp so the numbers reflect real cost, not
-    # async dispatch. Comment out / wrap behind a flag once you don't need
-    # the breakdown anymore.
-    _probe_timings = {}
-    _probe_extra = {}
-
-    def _ptime():
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        return time.perf_counter()
-
     # Build a dst-indexed CSR over edge_index_global once and cache it on the
     # controller. The CSR is graph-topology only (no seed / no budget) and lets
     # _expand_probe_idx_for_reception and _filter_by_dst_csr each replace an
     # O(|E|) torch.isin scan with an O(|frontier| × avg_deg) gather. On products
     # this swaps tens-of-million-edge scans for few-hundred-thousand-edge
     # gathers per BFS layer. CPU-only, no GPU footprint.
-    _t = _ptime()
     edge_index_csr = getattr(controller, "_edge_csr", None)
     if edge_index_csr is None:
         edge_index_csr = _build_dst_csr(edge_index_global, num_nodes)
         controller._edge_csr = edge_index_csr
-        _probe_extra["csr_built_now"] = True
-    else:
-        _probe_extra["csr_built_now"] = False
-    _probe_timings["csr_setup"] = _ptime() - _t
 
     # The BFS reception cone is purely a function of
     # (probe_idx_global, edge_index_global, n_layers) — all of which are
@@ -2150,39 +2020,43 @@ def _maybe_update_edge_budget(
         int(num_nodes),
         int(n_layers),
     )
-    _t = _ptime()
     _cached_cone = getattr(controller, "_cached_cone", None)
     if _cached_cone is not None and _cached_cone.get("key") == _deterministic_key:
         edge_dst_filter = _cached_cone["filter"]
-        _probe_extra["cone_was_cached"] = True
     else:
         edge_dst_filter = _expand_probe_idx_for_reception(
             probe_idx_global, edge_index_global, n_layers,
             edge_index_csr=edge_index_csr,
         )
         controller._cached_cone = {"key": _deterministic_key, "filter": edge_dst_filter}
-        _probe_extra["cone_was_cached"] = False
-    _probe_timings["bfs_cone"] = _ptime() - _t
-    _probe_extra["cone_size"] = int(edge_dst_filter.numel())
 
     # Pre-build the cone-filtered real_pool too — same reasoning: it only
     # depends on (edge_index_csr, edge_dst_filter), both fixed across the
     # run. We also cache the *sorted edge keys* of the real_pool so
     # ``_subtract_edge_index`` can skip its dominant cost (re-materialising
     # 264M int64 keys + internal sort) on every probe.
+    # Cache layout: store a bool MASK (size E, ~264 MB on amazon) instead of
+    # the full filtered real_pool tensor (~4.2 GiB). The mask selects which
+    # columns of edge_index_global have dst in the cone. On every probe we
+    # materialize the actual real_pool from the mask on demand — peak
+    # memory during the probe is unchanged, but sustained CPU usage
+    # between probes drops by ~4 GiB. Correctness is bit-identical: the
+    # same edges are produced, just possibly in a different column order
+    # (which the per-dst sampler and sorted-keys subtract don't care about).
     _cached_real_pool = getattr(controller, "_cached_real_pool", None)
     if _cached_real_pool is not None and _cached_real_pool.get("key") == _deterministic_key:
-        _precomputed_real_pool = _cached_real_pool["pool"]
+        _real_mask = _cached_real_pool.get("mask")
         _precomputed_real_pool_sorted_keys = _cached_real_pool.get("sorted_keys")
-        _probe_extra["real_pool_was_cached"] = True
-        _probe_extra["real_pool_sorted_keys_cached"] = (
-            _precomputed_real_pool_sorted_keys is not None
-        )
+        if _real_mask is not None:
+            # Materialize transient real_pool — held only for this probe.
+            _precomputed_real_pool = edge_index_global[:, _real_mask].to(
+                dtype=torch.long, device="cpu"
+            ).contiguous()
+        else:
+            _precomputed_real_pool = None
     else:
         _precomputed_real_pool = None
         _precomputed_real_pool_sorted_keys = None
-        _probe_extra["real_pool_was_cached"] = False
-        _probe_extra["real_pool_sorted_keys_cached"] = False
 
     probe_rw_device = _budget_phase_probe_rw_device(rw_device)
     # Build the dst-filtered probe pools once on src_rank and reuse them across
@@ -2192,7 +2066,6 @@ def _maybe_update_edge_budget(
     # all candidates see the same underlying RW realization (CRN coupling).
     probe_edge_pools = None
     if sp_rank == sp_src_rank:
-        _t = _ptime()
         probe_edge_pools = _build_probe_edge_pools(
             args,
             edge_index_global,
@@ -2207,25 +2080,25 @@ def _maybe_update_edge_budget(
             precomputed_real_pool=_precomputed_real_pool,
             precomputed_real_pool_sorted_keys=_precomputed_real_pool_sorted_keys,
         )
-        _probe_timings["build_pools"] = _ptime() - _t
-        _probe_extra["rw_pool_was_cached"] = bool(
-            getattr(args, "_last_rw_pool_was_cached", False)
-        )
         if probe_edge_pools is not None:
             _real = probe_edge_pools.get("real")
-            _rw = probe_edge_pools.get("rw")
-            _probe_extra["real_pool_edges"] = int(_real.size(1)) if _real is not None else 0
-            _probe_extra["rw_pool_edges"] = int(_rw.size(1)) if _rw is not None else 0
-            # First-time real_pool computed: stash it AND its sorted edge
-            # keys for the next probe epoch. The sort is a one-time ~5-10s
-            # cost on amazon, but saves ~30-50s on every subsequent probe.
+            # First-time real_pool computed: derive a bool MASK over
+            # edge_index_global (264 MB on amazon vs the 4.2 GiB pool
+            # tensor), and cache mask + sorted_keys. Future probes will
+            # materialize the transient real_pool from the mask via
+            # `edge_index_global[:, mask]` — same edges, different column
+            # order, identical sampling/subtract semantics.
             if _precomputed_real_pool is None and _real is not None:
-                _t_keys = _ptime()
                 _sorted_keys = _compute_sorted_edge_keys(_real, num_nodes)
-                _probe_timings["build_real_pool_sorted_keys"] = _ptime() - _t_keys
+                # torch.isin on amazon-scale (264M dst, 1.17M cone): ~5-10s
+                # one-time. Faster than rerunning _filter_by_dst_csr.
+                _real_mask = torch.isin(
+                    edge_index_global[1].to(dtype=torch.long, device="cpu"),
+                    edge_dst_filter.to(dtype=torch.long, device="cpu"),
+                )
                 controller._cached_real_pool = {
                     "key": _deterministic_key,
-                    "pool": _real,
+                    "mask": _real_mask,
                     "sorted_keys": _sorted_keys,
                 }
             # CSR was only needed to *build* cone + real_pool. Once both
@@ -2239,7 +2112,6 @@ def _maybe_update_edge_budget(
                 and getattr(controller, "_cached_real_pool", None) is not None
             ):
                 controller._edge_csr = None
-                _probe_extra["csr_dropped"] = True
 
     def _probe_edges(budget_state):
         return _build_probe_attention_edges(
@@ -2261,15 +2133,11 @@ def _maybe_update_edge_budget(
             edge_dst_filter=edge_dst_filter,
         )
 
-    _t = _ptime()
     base_edges = _probe_edges(base_state)
-    _probe_timings["build_edges_base"] = _ptime() - _t
-    _t = _ptime()
     base_loss, base_acc = _probe_loss_sp(
         args, model, x_local, local_y, local_probe_idx, base_edges,
         device, amp_dtype, sp_group, sp_world_size,
     )
-    _probe_timings["forward_base"] = _ptime() - _t
     base_count = _edge_count(base_edges)
     del base_edges
 
@@ -2293,15 +2161,11 @@ def _maybe_update_edge_budget(
     is_lump_epoch = any(k.startswith("lump_") for k in candidates)
 
     for kind, cand_state in candidates.items():
-        _t = _ptime()
         cand_edges = _probe_edges(cand_state)
-        _probe_timings[f"build_edges_{kind}"] = _ptime() - _t
-        _t = _ptime()
         cand_loss, cand_acc = _probe_loss_sp(
             args, model, x_local, local_y, local_probe_idx, cand_edges,
             device, amp_dtype, sp_group, sp_world_size,
         )
-        _probe_timings[f"forward_{kind}"] = _ptime() - _t
         cand_count = _edge_count(cand_edges)
         del cand_edges
 
@@ -2407,14 +2271,6 @@ def _maybe_update_edge_budget(
             f"new_budget=({cur_budget['real_edges_per_query']},{cur_budget['rw_edges_per_query']}) "
             f"probe_loss={best_loss:.4f} probe_edges={best_count}"
         )
-
-        # ---------- diagnostic timing breakdown ----------
-        if _probe_timings:
-            _total = sum(_probe_timings.values())
-            print(f"  ↳ [probe-timing] total={_total:.2f}s  (extras={_probe_extra})")
-            for _k, _v in _probe_timings.items():
-                _pct = (100.0 * _v / _total) if _total > 0 else 0.0
-                print(f"      {_k:<28s} {_v:8.3f}s  ({_pct:5.1f}%)")
 
 
 @contextlib.contextmanager
@@ -2759,10 +2615,7 @@ def _eval_sp(args, model, x_local, y, split_idx, edge_index_global, num_nodes,
              edge_budget_state=None, adaptive_edge_budget_cfg=None):
     use_rocauc = str(getattr(args, "dataset", "")).lower() == "genius"
 
-    if str(getattr(args, "model", "")) == "nagphormer":
-        # NAGphormer uses pre-computed multi-hop features; no edge_index needed.
-        edge_index_eval = None
-    elif cached_edge_index is None:
+    if cached_edge_index is None:
         with fixed_random_seed(args.seed):
             edge_index_eval = _build_attention_edges(
                 args, edge_index_global, num_nodes, device, rw_device,
