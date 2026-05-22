@@ -217,6 +217,15 @@ def add_node_fullgraph_sp_args(parser, defaults=None):
         help="skip default split files and always use random 60/20/20 split (for fair comparison with baselines)",
     )
     parser.add_argument(
+        "--node_sample_ratio",
+        type=float,
+        default=defaults.get("node_sample_ratio", 1.0),
+        help=(
+            "uniformly sample this fraction of graph vertices before full-graph SP training "
+            "and keep the induced subgraph; 1.0 uses the full graph"
+        ),
+    )
+    parser.add_argument(
         "--activation_checkpoint_mode",
         type=str,
         default=defaults.get("activation_checkpoint_mode"),
@@ -368,6 +377,10 @@ def normalize_main_node_fullgraph_sp_args(args):
     _normalize_checkpoint_args(args)
     _normalize_fixed_edge_budget_args(args)
     _normalize_multi_tier_gpu_memory_limit_args(args)
+    node_sample_ratio = float(getattr(args, "node_sample_ratio", 1.0))
+    if not (0.0 < node_sample_ratio <= 1.0):
+        raise ValueError("--node_sample_ratio must be in (0, 1].")
+    args.node_sample_ratio = node_sample_ratio
     if str(getattr(args, "model", "")).lower() in ("gt", "exphormer"):
         args.attn_type = "sparse"
     # graphgps supports both sparse (default) and full attention; preserve user's --attn_type

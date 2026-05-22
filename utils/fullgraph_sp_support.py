@@ -517,6 +517,58 @@ def _load_default_split(dataset_name: str, root_dir: str, wait_for_rank0: bool =
     )
 
 
+def _sample_induced_subgraph(feature, y, edge_index, split_idx, ratio: float, seed: int, rank: int = 0):
+    ratio = float(ratio)
+    num_nodes = int(feature.shape[0])
+    if ratio >= 1.0:
+        return feature, y, edge_index, num_nodes, split_idx
+
+    sample_nodes = max(1, int(round(num_nodes * ratio)))
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(int(seed))
+    selected = torch.randperm(num_nodes, generator=gen, dtype=torch.long)[:sample_nodes]
+    selected, _ = torch.sort(selected)
+
+    node_mask = torch.zeros(num_nodes, dtype=torch.bool)
+    node_mask[selected] = True
+    old_to_new = torch.full((num_nodes,), -1, dtype=torch.long)
+    old_to_new[selected] = torch.arange(sample_nodes, dtype=torch.long)
+
+    edge_index_cpu = edge_index.cpu()
+    edge_mask = node_mask.index_select(0, edge_index_cpu[0].to(torch.long))
+    edge_mask &= node_mask.index_select(0, edge_index_cpu[1].to(torch.long))
+    edge_index_sampled = old_to_new.index_select(
+        0,
+        edge_index_cpu[:, edge_mask].reshape(-1).to(torch.long),
+    ).reshape(2, -1)
+
+    split_sampled = {}
+    for name, idx in split_idx.items():
+        idx_cpu = idx.cpu().to(torch.long)
+        keep = node_mask.index_select(0, idx_cpu)
+        split_sampled[name] = old_to_new.index_select(0, idx_cpu[keep]).to(dtype=idx.dtype)
+
+    if rank == 0:
+        print(
+            f"[node-sample] ratio={ratio:.4f} seed={int(seed)} "
+            f"N={num_nodes:,}->{sample_nodes:,} "
+            f"E={edge_index.shape[1]:,}->{edge_index_sampled.shape[1]:,}"
+        )
+        print(
+            f"[node-sample] split after induced sampling: "
+            f"train={split_sampled['train'].shape[0]:,}  "
+            f"val={split_sampled['valid'].shape[0]:,}  "
+            f"test={split_sampled['test'].shape[0]:,}"
+        )
+    return (
+        feature.index_select(0, selected),
+        y.index_select(0, selected),
+        edge_index_sampled.contiguous(),
+        sample_nodes,
+        split_sampled,
+    )
+
+
 def _load_data(args):
     data_path = args.dataset_dir + args.dataset
     feature = _torch_load_cpu(data_path + "/x.pt")
@@ -548,6 +600,16 @@ def _load_data(args):
     else:
         if args.rank == 0:
             print(f"[split] Loaded dataset split (split_id={int(getattr(args, 'split_id', 0))}).")
+
+    feature, y, edge_index_global, num_nodes, split_idx = _sample_induced_subgraph(
+        feature,
+        y,
+        edge_index_global,
+        split_idx,
+        float(getattr(args, "node_sample_ratio", 1.0)),
+        int(getattr(args, "seed", 0)),
+        rank=args.rank,
+    )
 
     if args.rank == 0:
         print(args)
