@@ -544,7 +544,25 @@ class _MultiTierResourceManager:
             self._peak_mha = _peak_mha_last   # may be updated after FRONT probe
             m_mha_last = self._fwd_live_mha - self._fwd_live_warmup
             self._m_layer_mha = max(m_mha_last, 1)
-            self._state = self._CALIBRATE_MHA_FRONT
+            # Pre-check: FRONT probe requires first-layer MHA to persist through
+            # the entire backward pass, coexisting with recomputation of all
+            # subsequent layers. Worst-case peak ≈ peak_warmup + m_layer_mha.
+            # If that exceeds 90% of physical GPU, skip the FRONT probe entirely
+            # and use the last-layer measurement — safer than risking an OOM that
+            # dirties the CUDA allocator and cascades into the next training step.
+            _peak_est_front = self._peak_warmup + self._m_layer_mha
+            _physical_gpu = torch.cuda.get_device_properties(device).total_memory
+            if _peak_est_front > int(_physical_gpu * 0.90):
+                if is_r0:
+                    print(
+                        f"[MultiTierManager] Skipping CALIBRATE_MHA_FRONT: "
+                        f"est_peak={_peak_est_front/(1024**2):.0f} MiB > "
+                        f"90% physical ({int(_physical_gpu*0.90)/(1024**2):.0f} MiB). "
+                        f"Using last-layer M_layer^mha={m_mha_last/(1024**2):.1f} MiB."
+                    )
+                self._state = self._CALIBRATE_RETAIN
+            else:
+                self._state = self._CALIBRATE_MHA_FRONT
             if is_r0:
                 print(
                     f"[MultiTierManager] CALIBRATE_MHA (last layer) done: "
@@ -653,11 +671,42 @@ class _MultiTierResourceManager:
     # ------------------------------------------------------------------
 
     def _run_active_plan(self, device, total_gpu: int) -> None:
-        """Search structured R/O/K/N plans under GPU/CPU constraints."""
+        """Search structured R/O/K/N plans under GPU/CPU constraints.
+
+        Feasibility uses two independent memory budgets:
+
+        * **transient_limit** – peak allowed during the edge-build phase.
+          With expandable_segments the build tensors are fully released
+          before the model forward begins, so the two phases never compete
+          for memory simultaneously.  The build phase therefore gets a
+          relaxed limit (97 % of total_gpu vs the conservative peak_limit).
+          Without expandable_segments we fall back to the same peak_limit
+          to avoid fragmentation-driven OOMs.
+
+        * **peak_limit** – peak allowed during the model forward+backward
+          phase (includes activations, edge_persist bytes, etc.).  Always
+          capped at ``total_gpu * (1 - safety_margin)``.
+
+        The primary optimisation objective is minimum estimated step time
+        ``t_est = t_model_est + edge_time``, where ``edge_time`` already
+        accounts for CPU-prefetch overlap with the model.
+        """
         del device
         is_r0 = self._is_rank0()
         cpu_budget = self._available_cpu_bytes()
         peak_limit = max(int(total_gpu * (1.0 - self.safety_margin)), int(self._peak_warmup))
+
+        # Separate transient budget for the edge-build phase.
+        _exp_seg = False
+        try:
+            from gt_sp.utils import _expandable_segments_enabled as _check_exp_seg
+            _exp_seg = _check_exp_seg()
+        except Exception:
+            pass
+        # 97 % leaves a small buffer for measurement noise while still being
+        # significantly more permissive than peak_limit (85 % by default).
+        transient_limit = int(total_gpu * 0.97) if _exp_seg else peak_limit
+
         best_key = None
         best_step_time = float("inf")
         best_model_time = float("inf")
@@ -669,6 +718,8 @@ class _MultiTierResourceManager:
         best_nonpersistent_policy = self.EDGE_GPU_EPHEMERAL
         best_nonpersistent_tiers = [self.T0_RECOMPUTE] * self.n_layers
         best_tiers = [self.T0_RECOMPUTE] * self.n_layers
+        # Per-policy decision log: policy → (status_str, best_t_ms or None)
+        policy_log: dict = {}  # policy -> (status_str, best_t_ms_or_none)
 
         for edge_policy, edge_profile in self._edge_policy_profiles():
             edge_peak = int(edge_profile.get("live_edge_bytes", 0))
@@ -681,8 +732,24 @@ class _MultiTierResourceManager:
             edge_overlap_time = float(edge_profile.get("overlap_time_s", 0.0))
             prep_gpu_peak = int(edge_profile.get("gpu_peak_bytes", 0))
             prep_cpu_delta = int(edge_profile.get("cpu_delta_bytes", 0))
-            if prep_gpu_peak > peak_limit or prep_cpu_delta > cpu_budget:
+
+            # --- Transient feasibility (build phase) ---
+            if prep_gpu_peak > transient_limit:
+                policy_log[edge_policy] = (
+                    f"skip:build_peak={prep_gpu_peak/(1024**2):.0f}>"
+                    f"transient_limit={transient_limit/(1024**2):.0f} MiB",
+                    None,
+                )
                 continue
+            if prep_cpu_delta > cpu_budget:
+                policy_log[edge_policy] = (
+                    f"skip:cpu_delta={prep_cpu_delta/(1024**2):.0f}>"
+                    f"cpu_budget={cpu_budget/(1024**2):.0f} MiB",
+                    None,
+                )
+                continue
+
+            policy_best_t = float("inf")
             for tiers, k_off, cpu_est, peak_est, t_fwd_est, t_bwd_est, t_model_est in self._enumerate_structured_plans(
                 peak_limit=peak_limit,
                 cpu_budget=cpu_budget,
@@ -690,6 +757,7 @@ class _MultiTierResourceManager:
             ):
                 edge_time = edge_serial_time + max(0.0, edge_overlap_time - t_model_est)
                 t_est = t_model_est + edge_time
+                policy_best_t = min(policy_best_t, t_est)
                 key = (
                     t_est,
                     k_off,
@@ -712,6 +780,14 @@ class _MultiTierResourceManager:
                     best_nonpersistent_policy = edge_policy
                     best_nonpersistent_tiers = tiers
 
+            if policy_best_t == float("inf"):
+                policy_log[edge_policy] = (
+                    f"skip:no_feasible_tier(model_peak>peak_limit={peak_limit/(1024**2):.0f} MiB)",
+                    None,
+                )
+            else:
+                policy_log[edge_policy] = ("ok", policy_best_t * 1000.0)
+
         if best_key is None:
             best_policy = best_nonpersistent_policy
             best_tiers = [self.T0_RECOMPUTE] * self.n_layers
@@ -732,18 +808,29 @@ class _MultiTierResourceManager:
             tier_counts = {}
             for t in best_tiers:
                 tier_counts[t] = tier_counts.get(t, 0) + 1
+            # Build per-policy summary line: show estimated step time or skip reason.
+            policy_parts = []
+            for p, (status, best_t_ms) in policy_log.items():
+                if status == "ok":
+                    marker = " [SELECTED]" if p == best_policy else ""
+                    policy_parts.append(f"{p}:{best_t_ms:.0f}ms{marker}")
+                else:
+                    policy_parts.append(f"{p}:{status}")
             print(
                 f"[MultiTierManager] ACTIVE plan: "
                 f"edge_policy={best_policy}  "
                 f"tiers={tier_counts}  "
                 f"peak_limit={peak_limit/(1024**2):.0f} MiB  "
+                f"transient_limit={transient_limit/(1024**2):.0f} MiB"
+                f"{'(relaxed)' if _exp_seg else ''}  "
                 f"net_delta(mha/retain)={(self._peak_mha - self._peak_warmup)/(1024**2):+.1f}"
                 f"/{(self._peak_retain - self._peak_warmup)/(1024**2):+.1f} MiB  "
                 f"est_T_step={best_step_time*1000:.0f} ms "
                 f"(model={best_model_time*1000:.0f} ms "
                 f"fwd={best_fwd_time*1000:.0f} ms "
                 f"bwd={best_bwd_time*1000:.0f} ms "
-                f"edge_prep={best_edge_prep_time*1000:.0f} ms)"
+                f"edge_prep={best_edge_prep_time*1000:.0f} ms)\n"
+                f"[MultiTierManager]   policy candidates: {' | '.join(policy_parts)}"
             )
 
     def _enumerate_structured_plans(self, peak_limit: int, cpu_budget: int, edge_peak: int):
@@ -883,6 +970,89 @@ class _MultiTierResourceManager:
                 f"edge_policy={self._edge_policy} tiers={tier_counts}"
             )
 
+    def reconsider_with_actual_timing(
+        self,
+        actual_t_model_s: float,
+        actual_prefetch_wait_s: float,
+        switch_threshold_s: float = 0.5,
+    ) -> bool:
+        """Re-evaluate the ACTIVE plan using observed runtime timing.
+
+        Called after several ACTIVE epochs when a CPU-prefetch policy is
+        selected.  The profiling-time overlap estimate can be wrong because:
+          (a) actual model time differs from calibration (different tier mix,
+              GPU-only pressure without competing CPU build);
+          (b) actual CPU build time is slower than profiling (system load,
+              memory pressure from enlarged RSS).
+
+        Using the *observed* ``actual_t_model_s`` + ``actual_prefetch_wait_s``
+        gives a fair, apples-to-apples comparison with GPU policies.
+
+        Returns True if the plan was updated (caller should re-apply the edge
+        placement decision).  Returns False when no switch is warranted or
+        this manager is not in ACTIVE state.
+        """
+        if self._state != self._ACTIVE:
+            return False
+        current_policy = self._edge_policy
+        _CPU_PREFETCH = (self.EDGE_CPU_BROADCAST_PREFETCH, self.EDGE_CPU_RANK_LOCAL_PREFETCH)
+        if current_policy not in _CPU_PREFETCH:
+            return False
+        if not self._edge_profiles:
+            return False
+
+        # Actual effective step time under the current CPU-prefetch plan:
+        #   t_step = t_model + prefetch_wait + stage_time
+        current_profile = self._edge_profiles.get(current_policy, {})
+        stage_time = float(current_profile.get("serial_time_s", 0.0))
+        actual_cpu_t_step = float(actual_t_model_s) + float(actual_prefetch_wait_s) + stage_time
+
+        # Best GPU alternative: t_step = t_model + gpu_build_time (serial, no overlap)
+        best_gpu_policy = None
+        best_gpu_t_step = float("inf")
+        for gpu_pol in (self.EDGE_GPU_EPHEMERAL, self.EDGE_GPU_PERSIST):
+            prof = self._edge_profiles.get(gpu_pol)
+            if prof is None:
+                continue
+            gpu_serial = float(prof.get("serial_time_s", prof.get("prep_time_s", 0.0)))
+            gpu_t_step = float(actual_t_model_s) + gpu_serial
+            if gpu_t_step < best_gpu_t_step:
+                best_gpu_t_step = gpu_t_step
+                best_gpu_policy = gpu_pol
+
+        if best_gpu_policy is None:
+            return False
+
+        gain_s = actual_cpu_t_step - best_gpu_t_step
+        is_r0 = self._is_rank0()
+        if gain_s <= switch_threshold_s:
+            if is_r0:
+                print(
+                    f"[MultiTierManager] adaptive-timing check: "
+                    f"current={current_policy} actual_t={actual_cpu_t_step*1000:.0f} ms "
+                    f"(model={actual_t_model_s*1000:.0f} ms + wait={actual_prefetch_wait_s*1000:.0f} ms + stage={stage_time*1000:.0f} ms) "
+                    f"vs best_gpu={best_gpu_policy} est_t={best_gpu_t_step*1000:.0f} ms — "
+                    f"gain={gain_s*1000:.0f} ms < threshold={switch_threshold_s*1000:.0f} ms, keeping current plan."
+                )
+            return False
+
+        # GPU is significantly better → switch, keeping same tier configuration.
+        if is_r0:
+            tier_counts = {}
+            for t in self._modes:
+                tier_counts[t] = tier_counts.get(t, 0) + 1
+            print(
+                f"[MultiTierManager] adaptive-timing switch: "
+                f"{current_policy} actual_t={actual_cpu_t_step*1000:.0f} ms "
+                f"(model={actual_t_model_s*1000:.0f} ms + wait={actual_prefetch_wait_s*1000:.0f} ms + stage={stage_time*1000:.0f} ms) "
+                f"→ {best_gpu_policy} est_t={best_gpu_t_step*1000:.0f} ms "
+                f"(saving ~{gain_s*1000:.0f} ms/epoch). "
+                f"Tiers unchanged: {tier_counts}."
+            )
+        self._edge_policy = best_gpu_policy
+        self._cache_edge = best_gpu_policy == self.EDGE_GPU_PERSIST
+        return True
+
     def override_cache_decision(self, cache: bool) -> None:
         """Apply the cross-rank-synced topology cache decision."""
         if self._state != self._ACTIVE:
@@ -938,6 +1108,13 @@ class _MultiTierResourceManager:
                     f"T1 failed → heavier T4 also unfit. Disabling both. "
                     f"Finalising ACTIVE plan (all-recompute)."
                 )
+            # Flush the caching allocator before finalising so the immediately
+            # following retry step starts from a clean memory state, not the
+            # fragmented state left behind by the OOM.
+            import gc as _gc
+            _gc.collect()
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
             self._run_active_plan(device, total_gpu)
             return True
 
@@ -949,6 +1126,10 @@ class _MultiTierResourceManager:
                     f"[MultiTierManager] OOM in {self.state_name}: "
                     f"T4_RETAIN disabled. Finalising ACTIVE plan with T0/T1."
                 )
+            import gc as _gc
+            _gc.collect()
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
             self._run_active_plan(device, total_gpu)
             return True
 

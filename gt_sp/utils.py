@@ -218,6 +218,16 @@ def _estimate_rw_working_set_bytes(
 # call with identical inputs.
 _RW_DEVICE_DECISION_CACHE: dict = {}
 
+def _clear_rw_device_cache() -> None:
+    """Clear the RW-device decision cache so the next call re-evaluates GPU memory."""
+    _RW_DEVICE_DECISION_CACHE.clear()
+
+
+def _expandable_segments_enabled() -> bool:
+    """Return True if PYTORCH_CUDA_ALLOC_CONF enables expandable_segments."""
+    conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+    return "expandable_segments:True" in conf or "expandable_segments:true" in conf
+
 
 def _rw_log_is_rank0() -> bool:
     """Rank-0 detection for modules that don't carry args. Falls back to
@@ -300,26 +310,27 @@ def _gpu_can_fit_rw(device, need_bytes: int) -> bool:
         free, _ = torch.cuda.mem_get_info(torch_device)
     except (RuntimeError, AttributeError):
         return True
-    # Strictly conservative budget: usable = driver_free − handle_overhead.
+    # Budget: usable = driver_free [+ reserved_slack] − handle_overhead.
     #
-    # Rationale: PyTorch's caching allocator holds reserved-unallocated
-    # blocks (``reserved - allocated``) that *look* available, but for
-    # single multi-GiB contiguous requests like the real-edge sampling
-    # index_select buffer those blocks may themselves be fragmented into
-    # sub-GiB pieces. Empirical evidence: amazon-scale training with
-    # large_pool reserve ≈ 3 GiB but ≤ 2 GiB largest free block, causing
-    # a 2 GiB allocation to OOM despite ample "reserve".
+    # Without expandable_segments the caching allocator's reserved-but-not-
+    # allocated blocks may be too fragmented to satisfy a single multi-GiB
+    # contiguous request, so we conservatively ignore them.
     #
-    # Querying largest_free_block requires torch.cuda.memory_snapshot()
-    # (per-block iteration, ~ms latency), which is too expensive for a
-    # per-step pre-check. So we drop the caching-reserve credit entirely
-    # and trust only driver-level free. The cost is occasional spurious
-    # CPU fallback when caching could in fact serve the request; the
-    # benefit is no false-positives that lead to OOM. With
-    # ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`` (strongly
-    # recommended for this workload) the caching allocator no longer
-    # fragments into sub-GiB blocks, so this conservatism becomes a
-    # near-no-op anyway.
+    # With expandable_segments:True the allocator grows existing segments
+    # in-place; there are no sub-GiB fragment boundaries for large requests,
+    # so the full reserved_slack is reliably usable and we add it back in.
+    # This prevents spurious CPU fallbacks after a previous allocation round
+    # (e.g. a prior policy profiling run) left a large reserved-but-freed
+    # block that the driver hasn't reclaimed yet.
+    if _expandable_segments_enabled():
+        try:
+            reserved_slack = max(
+                0,
+                torch.cuda.memory_reserved(torch_device) - torch.cuda.memory_allocated(torch_device),
+            )
+            free = free + reserved_slack
+        except Exception:
+            pass
     overhead = _gpu_concurrent_overhead_bytes(torch_device)
     usable = max(0, int(free) - overhead)
     return int(need_bytes) <= usable
@@ -770,12 +781,40 @@ def _merge_edge_index_list(edge_list: List[Tensor]) -> Tensor:
 
 
 def _get_random_walk_graph(edge_index: Tensor, num_nodes: int, device) -> tuple[Tensor, Tensor, Tensor]:
+    """Return (placeholder, rowptr, col) for the given edge_index on *device*.
+
+    Only rowptr and col (CSR) are cached — the COO edge_index_dev is NOT
+    stored because col is identical to the coalesced edge_index[1] and row
+    can be reconstructed from rowptr on demand (saves ~2×E×8 bytes per cache
+    entry, ≈ 4 GiB on amazon).  Callers receive a zero-shape placeholder
+    tensor for ``edge_index_dev`` so that ``.new_zeros()`` and device-pinning
+    still work; ``_run_random_walk`` uses only rowptr/col for the fast CSR
+    path and reconstructs row from rowptr for the rare COO fallback.
+
+    If a CPU CSR is already cached and *device* is CUDA, rowptr and col are
+    H2D-transferred instead of rebuilt from scratch (avoids the 6×E×8-byte
+    sort/argsort pipeline).
+    """
     dev = torch.device(device)
     key = (int(edge_index.data_ptr()), int(edge_index.size(1)), int(num_nodes), dev.type, dev.index)
     cached = _RANDOM_WALK_GRAPH_CACHE.get(key)
     if cached is not None:
         return cached
 
+    # GPU target: if CPU CSR already built, H2D-transfer rowptr+col only.
+    if dev.type == "cuda":
+        cpu_key = (int(edge_index.data_ptr()), int(edge_index.size(1)), int(num_nodes), "cpu", None)
+        cpu_cached = _RANDOM_WALK_GRAPH_CACHE.get(cpu_key)
+        if cpu_cached is not None:
+            _, rowptr_cpu, col_cpu = cpu_cached
+            rowptr = rowptr_cpu.to(dev)
+            col = col_cpu.to(dev)
+            placeholder = torch.empty((2, 0), dtype=edge_index.dtype, device=dev)
+            cached = (placeholder, rowptr, col)
+            _RANDOM_WALK_GRAPH_CACHE[key] = cached
+            return cached
+
+    # Build CSR from scratch on the target device.
     edge_index_dev = edge_index if edge_index.device == dev else edge_index.to(dev)
     adj = SparseTensor(
         row=edge_index_dev[0],
@@ -783,7 +822,9 @@ def _get_random_walk_graph(edge_index: Tensor, num_nodes: int, device) -> tuple[
         sparse_sizes=(num_nodes, num_nodes),
     ).coalesce()
     rowptr, col, _ = adj.csr()
-    cached = (edge_index_dev, rowptr, col)
+    # Store a placeholder instead of edge_index_dev — see docstring.
+    placeholder = torch.empty((2, 0), dtype=edge_index.dtype, device=dev)
+    cached = (placeholder, rowptr, col)
     _RANDOM_WALK_GRAPH_CACHE[key] = cached
     return cached
 
@@ -961,12 +1002,31 @@ def compute_hop_buckets_random_walk(
     # CPU-fallback regime does not flood stdout.
     if rw_device.type == "cuda":
         E_cur = int(edge_index.size(1))
-        estimate = _estimate_rw_working_set_bytes(
-            num_nodes=num_nodes,
-            num_edges=E_cur,
-            walks_per_node=walks_per_node,
-            walk_length=walk_length,
-        )
+        # The dominant GPU cost is building the CSR (SparseTensor.coalesce +
+        # argsort) — 6 × E × 8 bytes on large graphs.  After the first call,
+        # _get_random_walk_graph caches the CSR on CPU and can H2D transfer
+        # rowptr + col to GPU without any sorting.  In that case, only the
+        # walk tensors + transient H2D buffers need to fit, not the full
+        # sort pipeline.  Use a reduced estimate when the CPU CSR is cached.
+        _cpu_csr_key = (int(edge_index.data_ptr()), E_cur, num_nodes, "cpu", None)
+        if _cpu_csr_key in _RANDOM_WALK_GRAPH_CACHE:
+            N_cur = max(1, int(num_nodes))
+            W = max(1, int(walks_per_node))
+            L = max(1, int(walk_length))
+            col_h2d = E_cur * 8          # H2D col array (transient, largest piece)
+            estimate = int(
+                col_h2d
+                + N_cur * W * (L + 1) * 8    # walks tensor
+                + N_cur * W * 33              # per-d peak (mask+2×select+stack)
+                + 2 * N_cur * W * L * 8       # bucket_cumulative
+            )
+        else:
+            estimate = _estimate_rw_working_set_bytes(
+                num_nodes=num_nodes,
+                num_edges=E_cur,
+                walks_per_node=walks_per_node,
+                walk_length=walk_length,
+            )
         if not _gpu_can_fit_rw(rw_device, estimate):
             try:
                 free, _ = torch.cuda.mem_get_info(rw_device)
@@ -982,10 +1042,10 @@ def compute_hop_buckets_random_walk(
                     f"[rw-device] compute_hop_buckets_random_walk: estimated "
                     f"working set {estimate/(1024**2):.0f} MiB > usable GPU "
                     f"{usable_mib:.0f} MiB (driver_free={free_mib:.0f} − "
-                    f"overhead {overhead_mib:.0f} MiB), num_edges={E_cur:,}; "
-                    f"forcing CPU build. NOTE: overrides any GPU-based "
-                    f"edge_policy from multi_tier. To reduce false CPU "
-                    f"fallbacks, set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True. "
+                    f"overhead {overhead_mib:.0f} MiB), "
+                    f"num_edges={E_cur:,}; forcing CPU build. NOTE: this overrides "
+                    f"only the RW build device; topology policies such as gpu_persist "
+                    f"may still cache edge_index_global on GPU. "
                     f"(Further matching calls suppressed.)"
                 )
             _RW_DEVICE_DECISION_CACHE[cache_key] = (estimate, free_mib)
@@ -995,7 +1055,30 @@ def compute_hop_buckets_random_walk(
 
     starts = torch.arange(num_nodes, device=rw_device, dtype=torch.long)
     starts = starts.repeat_interleave(walks_per_node)
-    walks = _run_random_walk(edge_index_dev, rowptr, col, starts, walk_length)
+    try:
+        walks = _run_random_walk(edge_index_dev, rowptr, col, starts, walk_length)
+    except (torch.cuda.OutOfMemoryError, RuntimeError) as _gpu_walk_exc:
+        if rw_device.type != "cuda":
+            raise
+        # GPU walk failed (OOM or COO fallback unavailable with placeholder
+        # edge_index from the CPU→GPU H2D cache path).  Evict the stale GPU
+        # CSR entry, clear the device decision cache so the next epoch
+        # re-evaluates, and retry the whole walk on CPU.
+        _bad_key = (
+            int(edge_index.data_ptr()), int(edge_index.size(1)),
+            int(num_nodes), rw_device.type, rw_device.index,
+        )
+        _RANDOM_WALK_GRAPH_CACHE.pop(_bad_key, None)
+        _RW_DEVICE_DECISION_CACHE.clear()
+        if _rw_log_is_rank0():
+            print(
+                f"[rw-device] GPU walk failed ({type(_gpu_walk_exc).__name__}); "
+                f"evicting GPU CSR cache and retrying on CPU."
+            )
+        rw_device = torch.device("cpu")
+        edge_index_dev, rowptr, col = _get_random_walk_graph(edge_index, num_nodes, rw_device)
+        starts = starts.to(rw_device)
+        walks = _run_random_walk(edge_index_dev, rowptr, col, starts, walk_length)
 
     buckets = [edge_index_dev.new_zeros((2, 0), dtype=edge_index_dev.dtype) for _ in range(num_buckets)]
     query_nodes = walks[:, 0]
@@ -1113,7 +1196,14 @@ def _run_random_walk(edge_index: Tensor, rowptr: Tensor, col: Tensor, starts: Te
     except (RuntimeError, TypeError) as exc:
         msg = str(exc)
         if "must match" in msg or "size" in msg or "expected" in msg:
-            return random_walk(edge_index[0], edge_index[1], starts, walk_length)
+            # Newer torch_cluster (≥ 1.6) requires COO.  edge_index is now
+            # always a zero-shape placeholder, so reconstruct row from rowptr.
+            n_nodes = int(rowptr.numel()) - 1
+            row = torch.repeat_interleave(
+                torch.arange(n_nodes, dtype=rowptr.dtype, device=rowptr.device),
+                rowptr[1:] - rowptr[:-1],
+            )
+            return random_walk(row, col, starts, walk_length)
         raise
 
 

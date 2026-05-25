@@ -53,6 +53,7 @@ from utils.fullgraph_sp_runtime import (
     _print_peak_gpu_memory,
     _print_rank0_training_summary,
     _print_training_header,
+    _pre_profile_gpu_cleanup,
     _profile_multi_tier_edge_policy,
     _should_force_ckpt_sync_timers,
     _should_sync_step_timers,
@@ -95,6 +96,50 @@ from utils.parser_node_level import (
     add_node_fullgraph_sp_args,
     normalize_main_node_fullgraph_sp_args,
 )
+
+
+def _parse_force_multi_tier_plan(spec: str, n_layers: int):
+    """Parse --force_multi_tier_plan spec into (edge_policy, modes) or None on error.
+
+    Format: "<edge_policy>:<tier_config>"
+    tier_config: "recompute" | "keep_mha=N" | "retain=N"
+    N = number of layers (from the back) to apply the non-recompute tier.
+    """
+    _VALID_POLICIES = {
+        EDGE_POLICY_GPU_PERSIST,
+        EDGE_POLICY_GPU_EPHEMERAL,
+        EDGE_POLICY_CPU_BROADCAST_PREFETCH,
+        EDGE_POLICY_CPU_RANK_LOCAL_PREFETCH,
+    }
+    try:
+        parts = spec.strip().split(":", 1)
+        if len(parts) != 2:
+            raise ValueError("expected '<edge_policy>:<tier_config>'")
+        edge_policy, tier_spec = parts[0].strip(), parts[1].strip()
+        if edge_policy not in _VALID_POLICIES:
+            raise ValueError(f"unknown edge_policy {edge_policy!r}")
+        if tier_spec == "recompute":
+            modes = ["recompute"] * n_layers
+        elif tier_spec.startswith("keep_mha="):
+            k = int(tier_spec.split("=", 1)[1])
+            if not (0 <= k <= n_layers):
+                raise ValueError(f"keep_mha={k} out of range [0, {n_layers}]")
+            modes = ["recompute"] * (n_layers - k) + ["keep_mha"] * k
+        elif tier_spec.startswith("retain="):
+            k = int(tier_spec.split("=", 1)[1])
+            if not (0 <= k <= n_layers):
+                raise ValueError(f"retain={k} out of range [0, {n_layers}]")
+            modes = ["recompute"] * (n_layers - k) + ["retain"] * k
+        else:
+            raise ValueError(f"unknown tier_config {tier_spec!r}")
+        print(
+            f"[force_multi_tier_plan] Overriding planner: "
+            f"edge_policy={edge_policy}  tiers={modes}"
+        )
+        return edge_policy, modes
+    except Exception as exc:
+        print(f"[force_multi_tier_plan] WARNING: could not parse {spec!r}: {exc}; ignoring override.")
+        return None
 
 
 def main():
@@ -413,6 +458,15 @@ def main():
     _multi_tier_edge_profiled = not _is_multi_tier
     # Track whether we have applied the post-ACTIVE topology decision.
     _multi_tier_decision_done = not _is_multi_tier  # True = no deferred work needed
+    # Adaptive-timing feedback: accumulate actual fwd/bwd/prefetch_wait after
+    # the ACTIVE plan is set to detect cases where the profiling-time overlap
+    # estimate was wrong (e.g. actual CPU build is slower under training load).
+    _mt_adapt_fwd_sum = 0.0
+    _mt_adapt_bwd_sum = 0.0
+    _mt_adapt_wait_sum = 0.0
+    _mt_adapt_count = 0
+    _MT_ADAPT_WARMUP = 3   # epochs to collect before first check
+    _MT_ADAPT_INTERVAL = 5 # re-check every N epochs after that
     # For adaptive/multi_tier checkpoint + adaptive edge budget: track whether we
     # have already notified the checkpointer that the edge budget is frozen.
     # For all other cases (no deferred calibration), treat as already done.
@@ -586,9 +640,19 @@ def main():
                             "[multi_tier] CPU prefetch policies disabled because edge_index_global "
                             "is not CPU-resident for this run."
                         )
+                # Profile ephemeral before persist so the ephemeral measurement
+                # sees the cleanest possible GPU state (persist pre-caches 4+ GiB
+                # which, even after cleanup, can leave driver accounting stale and
+                # trigger a spurious CPU-RW fallback in the ephemeral probe).
+                _GPU_POLICIES = (EDGE_POLICY_GPU_EPHEMERAL, EDGE_POLICY_GPU_PERSIST)
+                # cpu_delta threshold: a GPU policy whose cpu_delta exceeds half
+                # the estimated RW working set was likely contaminated by a CPU
+                # RW fallback and gets one clean retry.
+                _RW_WORKING_SET_MIB = 12000  # rough estimate; guards retry logic
+                _CPU_CONTAMINATION_THRESHOLD_MIB = _RW_WORKING_SET_MIB * 0.5
                 for policy in (
-                    EDGE_POLICY_GPU_PERSIST,
                     EDGE_POLICY_GPU_EPHEMERAL,
+                    EDGE_POLICY_GPU_PERSIST,
                     EDGE_POLICY_CPU_RANK_LOCAL_PREFETCH,
                     EDGE_POLICY_CPU_BROADCAST_PREFETCH,
                 ):
@@ -602,7 +666,12 @@ def main():
                             enabled=False,
                         )
                         continue
-                    metrics = _profile_multi_tier_edge_policy(
+                    # For GPU policies: flush caching allocator + reset RW cache
+                    # before each probe so prior policy's memory footprint does
+                    # not skew the device-selection check.
+                    if policy in _GPU_POLICIES and device.startswith("cuda"):
+                        _pre_profile_gpu_cleanup(device)
+                    _profile_kwargs = dict(
                         args=args,
                         policy=policy,
                         edge_index_global=edge_index_global,
@@ -619,6 +688,26 @@ def main():
                         precise_step_timing=sync_step_timing,
                         sp_initialized=sp_world_size > 1 and dist.is_initialized(),
                     )
+                    metrics = _profile_multi_tier_edge_policy(**_profile_kwargs)
+                    # Contamination check: a GPU policy with large cpu_delta
+                    # indicates the RW fell back to CPU (GPU was still dirty from
+                    # the previous probe).  Retry once after a second cleanup pass.
+                    if (
+                        metrics is not None
+                        and policy in _GPU_POLICIES
+                        and device.startswith("cuda")
+                        and metrics["cpu_delta_bytes"] / (1024 ** 2) > _CPU_CONTAMINATION_THRESHOLD_MIB
+                    ):
+                        if args.rank == 0:
+                            print(
+                                f"[multi_tier] edge_policy={policy}: cpu_delta="
+                                f"{metrics['cpu_delta_bytes'] / (1024**2):.0f} MiB suggests "
+                                f"CPU-RW fallback during probe; retrying after cleanup."
+                            )
+                        _pre_profile_gpu_cleanup(device)
+                        metrics_retry = _profile_multi_tier_edge_policy(**_profile_kwargs)
+                        if metrics_retry is not None:
+                            metrics = metrics_retry
                     if metrics is None:
                         _mt_prof_mgr.set_edge_policy_profile(
                             policy,
@@ -683,6 +772,17 @@ def main():
                     print(f"[edge-prefetch] background build failed; foreground build will be used: {exc}")
             prefetch_wait_time = time.perf_counter() - _prefetch_wait_start
             _prefetch_future = None
+
+        # Release reserved-but-unused GPU allocator blocks before edge build so
+        # the RW device check sees a realistic free-memory estimate.  This is the
+        # main-training path only — the probe inside _maybe_update_edge_budget
+        # intentionally does NOT get this flush, keeping its device check
+        # conservative (model activations + probe RW + probe forward must all fit).
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
 
         edge_index_rw, rw_time = _time_step_block(
             _build_edges_for_epoch,
@@ -992,6 +1092,25 @@ def main():
                     model, args, edge_index_global, edge_index_gpu_cached,
                     device=device, sp_group=sp_group, sp_world_size=sp_world_size,
                 )
+                # --force_multi_tier_plan override (for ablation / manual testing).
+                # Format: "<edge_policy>:<tier_config>"
+                # Examples: "gpu_persist:recompute"  "gpu_ephemeral:keep_mha=2"
+                _force_plan = str(getattr(args, "force_multi_tier_plan", "") or "")
+                if _force_plan and _mt_ckpt is not None:
+                    _forced = _parse_force_multi_tier_plan(_force_plan, _mt_ckpt.n_layers)
+                    if _forced is not None:
+                        _forced_policy, _forced_modes = _forced
+                        _mt_ckpt._apply_synced_active_plan(
+                            modes=_forced_modes,
+                            edge_policy=_forced_policy,
+                            device=device,
+                            group=sp_group if sp_world_size > 1 else None,
+                        )
+                        # Keep edge_index_global/gpu_cached consistent with forced policy.
+                        edge_index_global, edge_index_gpu_cached = _apply_multi_tier_active_plan(
+                            model, args, edge_index_global, edge_index_gpu_cached,
+                            device=device, sp_group=sp_group, sp_world_size=sp_world_size,
+                        )
 
         loss_val = loss.item()
         loss_ema = loss_val if loss_ema is None else 0.9 * loss_ema + 0.1 * loss_val
@@ -1012,68 +1131,6 @@ def main():
                 edge_broadcast_epoch_count += 1
 
         eval_time = 0.0
-        if epoch % args.eval_every == 0:
-            _eval_cached_ei = (
-                _exphormer_eval_ei.to(device) if _exphormer_eval_ei is not None else None
-            )
-            if torch.cuda.is_available():
-                torch.cuda.synchronize(device)
-            t_eval = time.perf_counter()
-            accs = _eval_sp(
-                args,
-                model,
-                x_local,
-                y_eval,
-                split_idx_eval,
-                edge_index_global,
-                num_nodes,
-                device,
-                rw_device,
-                sp_group,
-                sp_src_rank,
-                sp_rank,
-                sp_world_size,
-                rank_start,
-                rank_end,
-                local_num_nodes,
-                amp_dtype=amp_dtype,
-                cached_edge_index=_eval_cached_ei,
-                edge_budget_state=edge_budget_controller.current_state(),
-                adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
-            )
-            if torch.cuda.is_available():
-                torch.cuda.synchronize(device)
-            eval_time = time.perf_counter() - t_eval
-            if args.rank == 0:
-                # Skip first eval as warm-up.
-                if not _eval_warmup_done:
-                    _eval_warmup_done = True
-                else:
-                    eval_time_sum += eval_time
-                    eval_time_count += 1
-
-            if args.rank == 0 and accs is not None:
-                train_acc = accs.get("train", 0.0)
-                val_acc = accs.get("valid", 0.0)
-                test_acc = accs.get("test", 0.0)
-                _use_rocauc = str(getattr(args, "dataset", "")).lower() == "genius"
-                _fmt = (lambda v: f"{v:.4f}") if _use_rocauc else (lambda v: f"{v:.2%}")
-                _metric_name = "ROC-AUC" if _use_rocauc else "Acc"
-                print(f"  ↳ Eval ({eval_time:.2f}s) [{_metric_name}] | Train={_fmt(train_acc)}  Val={_fmt(val_acc)}  Test={_fmt(test_acc)}")
-                if val_acc > best_val:
-                    best_train_at_best_val = train_acc
-                    best_val = val_acc
-                    best_test_at_best_val = test_acc
-                    best_epoch = epoch
-                    if args.save_model:
-                        torch.save(model.state_dict(), os.path.join(args.model_dir, f"{args.dataset}_fg_sp.pkl"))
-                print(
-                    f"  ↳ Best by Val: epoch={best_epoch}  "
-                    f"train={_fmt(best_train_at_best_val)}  "
-                    f"val={_fmt(best_val)}  "
-                    f"test={_fmt(best_test_at_best_val)}"
-                )
-            del accs
 
         t_adjust_start = time.time()
         _maybe_update_edge_budget(
@@ -1151,6 +1208,8 @@ def main():
         if sp_world_size > 1:
             dist.barrier(group=sp_group)
 
+        # eval_time is 0.0 here (eval has not run yet), so epoch_wall_time
+        # correctly measures training-only time excluding eval.
         epoch_wall_time = time.time() - t_epoch - eval_time
         if sp_world_size > 1 and dist.is_initialized():
             epoch_wall_time_t = torch.tensor(
@@ -1161,6 +1220,63 @@ def main():
         if epoch > 1:
             epoch_wall_time_sum += epoch_wall_time
             epoch_wall_time_count += 1
+
+        # Adaptive-timing feedback for multi_tier CPU-prefetch policies.
+        # Accumulate actual timing and periodically re-evaluate whether the
+        # profiling-time overlap estimate is still accurate.
+        if _is_multi_tier and _multi_tier_decision_done:
+            _mt_adapt_fwd_sum += fwd_time
+            _mt_adapt_bwd_sum += bwd_time
+            _mt_adapt_wait_sum += prefetch_wait_time
+            _mt_adapt_count += 1
+            _do_adapt_check = (
+                _mt_adapt_count == _MT_ADAPT_WARMUP
+                or (_mt_adapt_count > _MT_ADAPT_WARMUP and (_mt_adapt_count - _MT_ADAPT_WARMUP) % _MT_ADAPT_INTERVAL == 0)
+            )
+            if _do_adapt_check:
+                _mt_ckpt_adapt = getattr(model, "_comm_ckpt", None)
+                if _mt_ckpt_adapt is not None and _mt_ckpt_adapt.is_active():
+                    # Only the src SP rank submits the CPU prefetch, so only
+                    # it accumulates non-zero prefetch_wait_time.  Non-src
+                    # ranks have wait_sum=0 and would compute gain < 0 →
+                    # wouldn't switch, causing a NCCL deadlock when the src
+                    # rank enters _apply_multi_tier_active_plan and the others
+                    # don't.  Fix: MAX all_reduce the wait sum so every rank
+                    # uses the src's true observed wait before deciding.
+                    _synced_wait_sum = _mt_adapt_wait_sum
+                    if sp_world_size > 1 and dist.is_initialized():
+                        _wt = torch.tensor(
+                            [_mt_adapt_wait_sum], device=device, dtype=torch.float64
+                        )
+                        dist.all_reduce(_wt, op=dist.ReduceOp.MAX, group=sp_group)
+                        _synced_wait_sum = float(_wt.item())
+                    _avg_t_model = (_mt_adapt_fwd_sum + _mt_adapt_bwd_sum) / _mt_adapt_count
+                    _avg_wait = _synced_wait_sum / _mt_adapt_count
+                    _switched = _mt_ckpt_adapt.reconsider_with_actual_timing(
+                        actual_t_model_s=_avg_t_model,
+                        actual_prefetch_wait_s=_avg_wait,
+                    )
+                    if _switched:
+                        # Drain any in-flight CPU-prefetch future — it was
+                        # built for the old policy and will be a cache miss
+                        # after the switch. Waiting here (at most ~10s) avoids
+                        # wasting a full epoch stall at the next epoch's start.
+                        if _prefetch_future is not None:
+                            try:
+                                _prefetch_future.result()
+                            except Exception:
+                                pass
+                            _prefetch_future = None
+                        # Re-apply edge placement to match the updated policy.
+                        edge_index_global, edge_index_gpu_cached = _apply_multi_tier_active_plan(
+                            model, args, edge_index_global, edge_index_gpu_cached,
+                            device=device, sp_group=sp_group, sp_world_size=sp_world_size,
+                        )
+                        # Reset accumulators so next window reflects the new policy.
+                        _mt_adapt_fwd_sum = 0.0
+                        _mt_adapt_bwd_sum = 0.0
+                        _mt_adapt_wait_sum = 0.0
+                        _mt_adapt_count = 0
 
         if args.rank == 0:
             timer_fields = (
@@ -1183,6 +1299,69 @@ def main():
                     print(line)
                 for line in _format_edge_cardinality(comm_profile):
                     print(line)
+
+        if epoch % args.eval_every == 0:
+            _eval_cached_ei = (
+                _exphormer_eval_ei.to(device) if _exphormer_eval_ei is not None else None
+            )
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(device)
+            t_eval = time.perf_counter()
+            accs = _eval_sp(
+                args,
+                model,
+                x_local,
+                y_eval,
+                split_idx_eval,
+                edge_index_global,
+                num_nodes,
+                device,
+                rw_device,
+                sp_group,
+                sp_src_rank,
+                sp_rank,
+                sp_world_size,
+                rank_start,
+                rank_end,
+                local_num_nodes,
+                amp_dtype=amp_dtype,
+                cached_edge_index=_eval_cached_ei,
+                edge_budget_state=edge_budget_controller.current_state(),
+                adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
+            )
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(device)
+            eval_time = time.perf_counter() - t_eval
+            if args.rank == 0:
+                # Skip first eval as warm-up.
+                if not _eval_warmup_done:
+                    _eval_warmup_done = True
+                else:
+                    eval_time_sum += eval_time
+                    eval_time_count += 1
+
+            if args.rank == 0 and accs is not None:
+                train_acc = accs.get("train", 0.0)
+                val_acc = accs.get("valid", 0.0)
+                test_acc = accs.get("test", 0.0)
+                _use_rocauc = str(getattr(args, "dataset", "")).lower() == "genius"
+                _fmt = (lambda v: f"{v:.4f}") if _use_rocauc else (lambda v: f"{v:.2%}")
+                _metric_name = "ROC-AUC" if _use_rocauc else "Acc"
+                print(f"  ↳ Eval ({eval_time:.2f}s) [{_metric_name}] | Train={_fmt(train_acc)}  Val={_fmt(val_acc)}  Test={_fmt(test_acc)}")
+                if val_acc > best_val:
+                    best_train_at_best_val = train_acc
+                    best_val = val_acc
+                    best_test_at_best_val = test_acc
+                    best_epoch = epoch
+                    if args.save_model:
+                        torch.save(model.state_dict(), os.path.join(args.model_dir, f"{args.dataset}_fg_sp.pkl"))
+                print(
+                    f"  ↳ Best by Val: epoch={best_epoch}  "
+                    f"train={_fmt(best_train_at_best_val)}  "
+                    f"val={_fmt(best_val)}  "
+                    f"test={_fmt(best_test_at_best_val)}"
+                )
+            del accs
 
     _prefetch_pool.shutdown(wait=False)
 

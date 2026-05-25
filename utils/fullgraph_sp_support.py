@@ -1124,8 +1124,8 @@ def _resolve_real_edges_for_state(
                     f"{single_alloc/(1024**2):.0f} MiB × 4 concurrent = "
                     f"{sampling_estimate/(1024**2):.0f} MiB exceeds usable GPU "
                     f"(free={free_mib:.0f} MiB − overhead {overhead_mib:.0f} MiB); "
-                    f"forcing CPU sampling for E={E_real:,}. NOTE: this "
-                    f"overrides any GPU-based edge_policy announced by "
+                    f"forcing CPU sampling for E={E_real:,}. "
+                    f"NOTE: this overrides any GPU-based edge_policy announced by "
                     f"multi_tier ACTIVE. (Further matching calls suppressed.)"
                 )
             _RW_DEVICE_DECISION_CACHE[cache_key] = (sampling_estimate, 0)
@@ -1153,16 +1153,49 @@ def _resolve_real_edges_for_state(
         dst_stats = _get_edge_dst_stats(real_edges)
 
     if _random_block_sampling_enabled(args, adaptive_edge_budget_cfg):
-        real_edges = profile_call(
-            "edge_real_sample",
-            lambda: _sample_edges_per_query_random(
-                real_edges,
-                real_budget,
-                _edge_block_seed(args, edge_seed, 17),
-                dst_stats=dst_stats,
-            ),
-            device=build_device,
-        )
+        try:
+            real_edges = profile_call(
+                "edge_real_sample",
+                lambda: _sample_edges_per_query_random(
+                    real_edges,
+                    real_budget,
+                    _edge_block_seed(args, edge_seed, 17),
+                    dst_stats=dst_stats,
+                ),
+                device=build_device,
+            )
+        except torch.cuda.OutOfMemoryError as _oom:
+            # Proactive estimate passed (empty_cache freed allocator blocks) but
+            # CUDA fragmentation still caused the allocation to fail mid-way.
+            # Evict decision cache so the proactive check uses updated free memory
+            # next epoch, then fall back to CPU for this call.
+            if build_device.type == "cuda":
+                torch.cuda.empty_cache()
+                from gt_sp.utils import _RW_DEVICE_DECISION_CACHE, _rw_log_is_rank0
+                E_real = int(edge_index_global.size(1))
+                evict_key = ("real_edge_sampling", str(build_device), E_real, "cpu")
+                _RW_DEVICE_DECISION_CACHE.pop(evict_key, None)
+                if _rw_log_is_rank0():
+                    print(
+                        f"[rw-device] real-edge sampling OOM on GPU "
+                        f"({type(_oom).__name__}); falling back to CPU. "
+                        f"Decision cache evicted — will re-check GPU next epoch."
+                    )
+                build_device = torch.device("cpu")
+                real_edges = real_edges.cpu()
+                dst_stats = _get_edge_dst_stats(real_edges)
+                real_edges = profile_call(
+                    "edge_real_sample",
+                    lambda: _sample_edges_per_query_random(
+                        real_edges,
+                        real_budget,
+                        _edge_block_seed(args, edge_seed, 17),
+                        dst_stats=dst_stats,
+                    ),
+                    device=build_device,
+                )
+            else:
+                raise
     return real_edges
 
 
@@ -2195,6 +2228,13 @@ def _maybe_update_edge_budget(
             edge_dst_filter=edge_dst_filter,
         )
 
+    # Free allocator-reserved-but-unused GPU blocks before probe runs so the
+    # model forward inside _probe_loss_sp sees a realistic usable budget.
+    # SP training is symmetric: all ranks have the same activation footprint,
+    # so OOM inside a probe is always symmetric — no NCCL deadlock risk.
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     base_edges = _probe_edges(base_state)
     base_loss, base_acc = _probe_loss_sp(
         args, model, x_local, local_y, local_probe_idx, base_edges,
@@ -2224,10 +2264,31 @@ def _maybe_update_edge_budget(
 
     for kind, cand_state in candidates.items():
         cand_edges = _probe_edges(cand_state)
-        cand_loss, cand_acc = _probe_loss_sp(
-            args, model, x_local, local_y, local_probe_idx, cand_edges,
-            device, amp_dtype, sp_group, sp_world_size,
-        )
+        # Release allocator blocks from the previous probe before the next
+        # one so fragmentation from the base/prior probe doesn't skew this run.
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        try:
+            cand_loss, cand_acc = _probe_loss_sp(
+                args, model, x_local, local_y, local_probe_idx, cand_edges,
+                device, amp_dtype, sp_group, sp_world_size,
+            )
+        except torch.cuda.OutOfMemoryError:
+            # Candidate budget does not fit current GPU state. Clean up and
+            # skip — treating it as strictly worse than the base budget.
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            del cand_edges
+            from gt_sp.utils import _rw_log_is_rank0
+            if _rw_log_is_rank0():
+                _cand_real = cand_state.get("real_edges_per_query", "?")
+                _cand_rw = cand_state.get("rw_edges_per_query", "?")
+                print(
+                    f"[probe] candidate {kind!r} "
+                    f"(real={_cand_real}, rw={_cand_rw}) OOM during forward; "
+                    f"skipping (treated as infeasible)."
+                )
+            continue
         cand_count = _edge_count(cand_edges)
         del cand_edges
 

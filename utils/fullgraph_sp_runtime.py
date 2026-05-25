@@ -13,7 +13,7 @@ import time
 import torch
 import torch.distributed as dist
 
-from gt_sp.utils import clear_random_walk_graph_cache
+from gt_sp.utils import clear_random_walk_graph_cache, _clear_rw_device_cache
 from utils.fullgraph_sp_support import (
     EDGE_POLICY_CPU_BROADCAST,
     EDGE_POLICY_CPU_BROADCAST_PREFETCH,
@@ -214,6 +214,20 @@ def _edge_seed_for_epoch(epoch: int, *, args, use_epoch_seed: bool, adaptive_edg
     if epoch <= adaptive_edge_budget_cfg.static_seed_epochs:
         return args.seed
     return args.seed + epoch
+
+
+def _pre_profile_gpu_cleanup(device: str) -> None:
+    """Best-effort GPU cleanup before profiling a policy.
+
+    Clears the PyTorch caching allocator and resets the RW-device decision
+    cache so that each policy sees an uncontaminated GPU memory estimate.
+    """
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize(device)
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    _clear_rw_device_cache()
 
 
 def _profile_multi_tier_edge_policy(
