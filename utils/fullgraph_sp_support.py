@@ -2070,6 +2070,14 @@ def _maybe_update_edge_budget(
         or epoch <= int(getattr(args, "warmup_updates", 5))
         or (controller.warmup_epochs is not None and epoch > controller.warmup_epochs)
     ):
+        if controller.frozen:
+            # Probe caches are never consulted after freeze — drop them so the
+            # ~120 MB real_pool mask and the full RW pool don't sit unused for
+            # the rest of training.
+            controller._cached_real_pool = None
+            controller._cached_cone = None
+            if hasattr(args, "_cached_full_rw_pool"):
+                args._cached_full_rw_pool = None
         return
 
     if local_probe_idx is None or probe_idx_global is None or probe_idx_global.numel() == 0:

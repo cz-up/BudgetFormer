@@ -1152,13 +1152,19 @@ def _run_random_walk(edge_index: Tensor, rowptr: Tensor, col: Tensor, starts: Te
                 g = _DGL_GRAPH_CACHE.get(key)
                 if g is None:
                     num_nodes = int(rowptr.numel()) - 1
-                    # Reconstruct COO from coalesced CSR so the graph topology
-                    # exactly matches what _get_random_walk_graph built (no duplicates).
-                    src = torch.repeat_interleave(
-                        torch.arange(num_nodes, dtype=torch.long),
-                        rowptr[1:] - rowptr[:-1],
-                    )
-                    g = _dgl.graph((src, col.long()), num_nodes=num_nodes, device="cpu")
+                    try:
+                        # DGL ≥ 1.0: build directly from CSR (rowptr, col).
+                        # Avoids the ~E×8-byte repeat_interleave(arange(N)) src
+                        # tensor and DGL stores only CSR internally — saves ~2 GiB
+                        # persistent memory vs the COO path on ogbn-products scale.
+                        g = _dgl.from_csr(rowptr.long(), col.long(), edge_ids=None)
+                    except (TypeError, AttributeError):
+                        # Older DGL: fall back to COO construction.
+                        src = torch.repeat_interleave(
+                            torch.arange(num_nodes, dtype=torch.long),
+                            rowptr[1:] - rowptr[:-1],
+                        )
+                        g = _dgl.graph((src, col.long()), num_nodes=num_nodes, device="cpu")
                     _DGL_GRAPH_CACHE[key] = g
                 traces, _ = _dgl.sampling.random_walk(g, starts.long(), length=walk_length)
                 # DGL fills dead-end steps with -1; torch_cluster repeats the
