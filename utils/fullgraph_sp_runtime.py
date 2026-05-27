@@ -743,7 +743,9 @@ def _prepare_exphormer_edges(args, edge_index_global, pad_num_nodes: int, num_no
     exphormer_eval_ei = None
     expander_degree = int(getattr(args, "expander_degree", 0))
     if expander_degree <= 0:
-        return expander_edge_index_cpu, exphormer_eval_ei
+        # eval_ei is built on-the-fly at eval time to avoid a persistent ~3 GB
+        # CPU allocation throughout training.
+        return expander_edge_index_cpu, exphormer_eval_ei  # (None, None)
 
     if args.rank == 0:
         print(
@@ -758,26 +760,9 @@ def _prepare_exphormer_edges(args, edge_index_global, pad_num_nodes: int, num_no
     if args.rank == 0:
         print(f"[exphormer] Expander edges: {expander_edge_index_cpu.shape[1]:,}")
 
-    self_nodes = torch.arange(num_nodes, dtype=torch.long)
-    self_loops_cpu = torch.stack([self_nodes, self_nodes], dim=0)
-    n_real = edge_index_global.shape[1]
-    n_self = num_nodes
-    n_exp = expander_edge_index_cpu.shape[1]
-    real_self_type = torch.zeros(n_real + n_self, dtype=torch.long)
-    exp_type_cpu = torch.ones(n_exp, dtype=torch.long)
-    exphormer_eval_ei = torch.cat(
-        [
-            torch.cat([edge_index_global.cpu(), self_loops_cpu, expander_edge_index_cpu], dim=1),
-            torch.cat([real_self_type, exp_type_cpu]).unsqueeze(0),
-        ],
-        dim=0,
-    )
-    if args.rank == 0:
-        print(
-            f"[exphormer] Eval edge_index: real={n_real:,} + self-loops={n_self:,} "
-            f"+ expander={n_exp:,} = {exphormer_eval_ei.shape[1]:,}"
-        )
-    return expander_edge_index_cpu, exphormer_eval_ei
+    # eval_ei is built on-the-fly at eval time to avoid a persistent ~3 GB
+    # CPU allocation throughout training.
+    return expander_edge_index_cpu, exphormer_eval_ei  # eval_ei = None
 
 
 def _print_training_header(

@@ -199,7 +199,7 @@ def main():
         feature, y, num_nodes, sp_world_size
     )
     feature = _preprocess_graphormer_features(args, feature, edge_index_global)
-    _expander_edge_index_cpu, _exphormer_eval_ei = _prepare_exphormer_edges(
+    _expander_edge_index_cpu, _ = _prepare_exphormer_edges(
         args, edge_index_global, pad_num_nodes, num_nodes
     )
 
@@ -790,10 +790,11 @@ def main():
             synchronize_cuda=sync_step_timing,
         )
 
-        # Exphormer: merge expander edges (+ self-loops) into edge_index_rw and attach
-        # edge-type labels in row-2 (0 = real/RW/self-loop, 1 = expander).
-        # Self-loops match original Exphormer (prep.add_self_loops=True); every node
-        # can attend to itself. ExphormerCoreAttention reads row-2 for score modulation.
+        # Exphormer edge-type assembly.
+        # Mode A (--expander_degree > 0): fixed expander as type 1, RW/real as type 0.
+        # Mode B (default, no explicit expander): RW as type 1, real as type 0
+        #   — edge_index_rw already has row-2 type info from _build_merged_edges;
+        #   only self-loops need to be appended here as type 0.
         if _expander_edge_index_cpu is not None and edge_index_rw is not None:
             _exp = _expander_edge_index_cpu.to(edge_index_rw.device)
             # Strip existing row-2 (hop counts) if present — Exphormer uses row-2 for type
@@ -810,6 +811,22 @@ def main():
                 torch.cat([_ei_with_self, _exp], dim=1),
                 torch.cat([_real_type, _exp_type]).unsqueeze(0),
             ], dim=0)  # (3, E_real + N_self + E_exp)
+        elif (
+            args.model == "exphormer"
+            and int(getattr(args, "expander_degree", 0)) <= 0
+            and edge_index_rw is not None
+        ):
+            # Mode B: edge_index_rw is already [3, E_real+E_rw] (real=0, rw=1).
+            # Append self-loops as type 0 so every node attends to itself.
+            _ei = edge_index_rw[:2]
+            _existing_types = edge_index_rw[2]
+            _self_nn = torch.arange(num_nodes, dtype=torch.long, device=_ei.device)
+            _self_loops_d = torch.stack([_self_nn, _self_nn], dim=0)
+            _self_types = torch.zeros(num_nodes, dtype=torch.long, device=_ei.device)
+            edge_index_rw = torch.cat([
+                torch.cat([_ei, _self_loops_d], dim=1),
+                torch.cat([_existing_types, _self_types]).unsqueeze(0),
+            ], dim=0)  # (3, E_real + E_rw + N_self)
         # Submit N+1 prefetch as soon as the current epoch's edge build is done.
         # This allows the CPU worker to overlap with the current epoch's GPU
         # forward/backward when the next epoch's budget and edge policy are
@@ -1301,9 +1318,33 @@ def main():
                     print(line)
 
         if epoch % args.eval_every == 0:
-            _eval_cached_ei = (
-                _exphormer_eval_ei.to(device) if _exphormer_eval_ei is not None else None
-            )
+            if args.model == "exphormer":
+                _expander_deg = int(getattr(args, "expander_degree", 0))
+                _ei_cpu = (
+                    edge_index_global
+                    if edge_index_global.device.type == "cpu"
+                    else edge_index_global.cpu()
+                )
+                _self_nn = torch.arange(num_nodes, dtype=torch.long)
+                _self_loops = torch.stack([_self_nn, _self_nn], dim=0)
+                if _expander_deg <= 0:
+                    _n_real_self = _ei_cpu.shape[1] + num_nodes
+                    _all_eval = torch.cat([_ei_cpu, _self_loops], dim=1)
+                    _eval_types = torch.zeros(_n_real_self, dtype=torch.long)
+                else:
+                    _n_real_self = _ei_cpu.shape[1] + num_nodes
+                    _n_exp = _expander_edge_index_cpu.shape[1]
+                    _all_eval = torch.cat([_ei_cpu, _self_loops, _expander_edge_index_cpu], dim=1)
+                    _eval_types = torch.cat([
+                        torch.zeros(_n_real_self, dtype=torch.long),
+                        torch.ones(_n_exp, dtype=torch.long),
+                    ])
+                _eval_ei_cpu = torch.cat([_all_eval, _eval_types.unsqueeze(0)], dim=0)
+                del _all_eval, _eval_types
+                _eval_cached_ei = _eval_ei_cpu.to(device)
+                del _eval_ei_cpu
+            else:
+                _eval_cached_ei = None
             if torch.cuda.is_available():
                 torch.cuda.synchronize(device)
             t_eval = time.perf_counter()

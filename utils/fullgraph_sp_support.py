@@ -52,6 +52,9 @@ _GRAPHORMER_VARIANTS = {
     "graphormer": Graphormer,
 }
 _GRAPHORMER_VIRTUAL_NODE_MODELS = frozenset(_GRAPHORMER_VARIANTS)
+# Exphormer models that use real-edge type 0 / RW-edge type 1 encoding when
+# no explicit --expander_degree is provided.
+_EXPHORMER_MODELS = frozenset({"exphormer"})
 
 
 def _compute_laplacian_pe(row_aug, col_aug, num_nodes, pe_dim):
@@ -1504,7 +1507,6 @@ def _assemble_edges_from_pools(
     edge_budget_state=None,
     adaptive_edge_budget_cfg=None,
 ):
-    parts = []
     real_edges = edge_pools.get("real")
     rw_edges = edge_pools.get("rw")
     real_edges, rw_edges = _sample_random_edge_blocks_with_state(
@@ -1515,11 +1517,33 @@ def _assemble_edges_from_pools(
         edge_budget_state=edge_budget_state,
         adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
     )
+
+    # Exphormer RW mode: real=type 0, rw=type 1; return [3, E] with type row.
+    if (
+        args.model in _EXPHORMER_MODELS
+        and int(getattr(args, "expander_degree", 0)) <= 0
+    ):
+        n_real = real_edges.size(1) if real_edges is not None and real_edges.numel() > 0 else 0
+        n_rw   = rw_edges.size(1)   if rw_edges   is not None and rw_edges.numel()   > 0 else 0
+        parts_e = [x for x in [real_edges, rw_edges] if x is not None and x.numel() > 0]
+        if not parts_e:
+            template = edge_pools.get("real") or edge_pools.get("rw")
+            empty = template.new_zeros((3, 0), dtype=torch.long) if template is not None \
+                    else torch.zeros((3, 0), dtype=torch.long)
+            return empty.contiguous()
+        all_edges = torch.cat(parts_e, dim=1)
+        types = torch.cat([
+            torch.zeros(n_real, dtype=torch.long, device=all_edges.device),
+            torch.ones(n_rw,   dtype=torch.long, device=all_edges.device),
+        ])
+        return torch.cat([all_edges, types.unsqueeze(0)], dim=0).contiguous()
+
+    # Default: deduplicated merge into [2, E].
+    parts = []
     if real_edges is not None and real_edges.numel() > 0:
         parts.append(real_edges)
     if rw_edges is not None and rw_edges.numel() > 0:
         parts.append(rw_edges)
-
     merged = _merge_edge_index_list(parts)
     if merged is None:
         template = edge_pools.get("real")
@@ -2465,7 +2489,28 @@ def _build_merged_edges(args, edge_index_global, num_nodes, final_device, rw_dev
         parts.append(real_edges)
     if rw_heads is not None:
         parts.append(rw_heads)
+    _exphormer_rw_mode = (
+        args.model in _EXPHORMER_MODELS
+        and int(getattr(args, "expander_degree", 0)) <= 0
+    )
+
     def _assemble():
+        if _exphormer_rw_mode:
+            # real=type 0, rw=type 1; return [3, E_real+E_rw] with type row.
+            # No dedup-merge: real and rw edges carry distinct types so they
+            # must be kept separate for the edge_type_emb in ExphormerCoreAttention.
+            n_real = real_edges.size(1) if real_edges is not None and real_edges.numel() > 0 else 0
+            n_rw   = rw_heads.size(1)   if rw_heads   is not None and rw_heads.numel()   > 0 else 0
+            parts_e = [x for x in [real_edges, rw_heads] if x is not None and x.numel() > 0]
+            if not parts_e:
+                return edge_index_global.new_zeros((3, 0), dtype=torch.long).to(final_torch_device)
+            all_edges = torch.cat(parts_e, dim=1)
+            types = torch.cat([
+                torch.zeros(n_real, dtype=torch.long, device=all_edges.device),
+                torch.ones(n_rw,   dtype=torch.long, device=all_edges.device),
+            ])
+            return torch.cat([all_edges, types.unsqueeze(0)], dim=0)
+        # Default: deduplicated merge into [2, E].
         merged_local = _merge_edge_index_list(parts)
         if merged_local is None:
             merged_local = edge_index_global.new_zeros((2, 0), dtype=torch.long).to(final_torch_device)
@@ -2493,9 +2538,11 @@ def _resolve_walk_length(args, edge_budget_state=None, walk_length_override=None
 def _broadcast_edges(merged_cpu, device, sp_group, sp_src_rank, sp_rank):
     if sp_rank == sp_src_rank:
         merged = merged_cpu.to(device=device, dtype=torch.long, non_blocking=(merged_cpu.device.type == "cpu"))
-        size_t = torch.tensor([merged.shape[1]], device=device, dtype=torch.long)
+        # Broadcast both row count (2 or 3) and column count so receivers can
+        # allocate the right shape for typed edge tensors (Exphormer row-2 types).
+        size_t = torch.tensor([merged.shape[0], merged.shape[1]], device=device, dtype=torch.long)
     else:
-        size_t = torch.empty(1, device=device, dtype=torch.long)
+        size_t = torch.empty(2, device=device, dtype=torch.long)
         merged = None
 
     if dist.is_initialized():
@@ -2503,7 +2550,10 @@ def _broadcast_edges(merged_cpu, device, sp_group, sp_src_rank, sp_rank):
             nonlocal merged
             dist.broadcast(size_t, sp_src_rank, group=sp_group)
             if sp_rank != sp_src_rank:
-                merged = torch.empty((2, int(size_t.item())), device=device, dtype=torch.long)
+                merged = torch.empty(
+                    (int(size_t[0].item()), int(size_t[1].item())),
+                    device=device, dtype=torch.long,
+                )
             dist.broadcast(merged, sp_src_rank, group=sp_group)
 
         payload_bytes = int(merged_cpu.numel() * merged_cpu.element_size()) if merged_cpu is not None else 0
@@ -2683,9 +2733,9 @@ def _build_and_broadcast_edges(args, edge_index_global, num_nodes, device, rw_de
                 )
             if _bcast_cache_key is not None:
                 _store_merged_edge_cache(_bcast_cache_key, merged)
-        size_t = torch.tensor([merged.shape[1]], device=device, dtype=torch.long)
+        size_t = torch.tensor([merged.shape[0], merged.shape[1]], device=device, dtype=torch.long)
     else:
-        size_t = torch.empty(1, device=device, dtype=torch.long)
+        size_t = torch.empty(2, device=device, dtype=torch.long)
         merged = None
 
     if dist.is_initialized():
@@ -2693,7 +2743,10 @@ def _build_and_broadcast_edges(args, edge_index_global, num_nodes, device, rw_de
             nonlocal merged
             dist.broadcast(size_t, sp_src_rank, group=sp_group)
             if sp_rank != sp_src_rank:
-                merged = torch.empty((2, int(size_t.item())), device=device, dtype=torch.long)
+                merged = torch.empty(
+                    (int(size_t[0].item()), int(size_t[1].item())),
+                    device=device, dtype=torch.long,
+                )
             dist.broadcast(merged, sp_src_rank, group=sp_group)
 
         payload_bytes = int(merged.numel() * merged.element_size()) if merged is not None else 0
