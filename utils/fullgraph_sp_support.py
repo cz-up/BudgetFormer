@@ -20,6 +20,7 @@ from gt_sp.utils import (
     _merge_edge_index_list,
     adjust_edge_index_nomerge,
     build_head_hop_edges,
+    clear_random_walk_graph_cache,
     fixed_random_seed_cpu,
     fix_edge_index,
     fixed_random_seed,
@@ -35,7 +36,7 @@ from utils.split_utils import load_default_split
 _MINHASH_SAMPLE_K_LIMIT = 8
 
 # Deterministic merged-edge cache.  When edge_seed is fixed across calls (e.g.
-# during static-seed epochs or bootstrap), the full walk+merge computation
+# during static-seed epochs), the full walk+merge computation
 # produces an identical CPU tensor every time.  We cache it here to avoid
 # re-running the expensive build; the value is always stored on CPU so that
 # GPU-resident entries from the rank-local path don't pin HBM permanently.
@@ -1307,8 +1308,8 @@ class _DstEdgeCSR:
     """CSR indexed by destination node for O(probe_size × avg_degree) edge filtering.
 
     Replaces O(E) torch.isin scans when repeatedly querying a small probe set
-    against a large static edge_index (e.g. edge_index_global during bootstrap
-    and adaptive budget updates).
+    against a large static edge_index (e.g. edge_index_global during adaptive
+    budget updates).
     """
     sorted_edge_index: torch.Tensor  # [2, E] sorted by dst, on CPU
     row_ptr: torch.Tensor            # [num_nodes + 1] cumulative counts, on CPU
@@ -1626,9 +1627,7 @@ class _AdaptiveEdgeBudgetController:
         self.auto_hold_neg_inf_streak = 0
         self.auto_hold_neg_inf_freeze_after = 5
         self.baseline_acc = -1.0
-        self.bootstrap_baseline_loss = float("inf")
-        self.bootstrap_baseline_acc = -1.0
-        
+
         self.frozen = not self.enabled
         if not self.enabled:
             self.real_budget = self.max_total
@@ -2039,33 +2038,6 @@ def _train_one_epoch_with_budget(
     del edge_index, out_local, loss, local_y_eff, valid_train_mask, local_train_idx_eff
 
 
-def _bootstrap_initial_edge_budget(
-    args,
-    adaptive_edge_budget_cfg,
-    controller,
-    model,
-    x_local,
-    local_y,
-    local_train_idx,
-    probe_idx_global,
-    local_probe_idx,
-    edge_index_global,
-    num_nodes,
-    device,
-    rw_device,
-    sp_group,
-    sp_src_rank,
-    sp_rank,
-    local_nodes,
-    amp_dtype,
-    sp_world_size,
-    grad_reducer,
-    edge_index_csr=None,
-):
-    # Bootstrap search phase removed; initial budget defaults to adaptive controller start state.
-    return None
-
-
 def _maybe_update_edge_budget(
     args,
     adaptive_edge_budget_cfg,
@@ -2095,17 +2067,22 @@ def _maybe_update_edge_budget(
         or (controller.warmup_epochs is not None and epoch > controller.warmup_epochs)
     ):
         if controller.frozen:
-            # Probe caches are never consulted after freeze — drop them so the
-            # ~120 MB real_pool mask and the full RW pool don't sit unused for
-            # the rest of training.
-            controller._cached_real_pool = None
-            controller._cached_cone = None
+            # Defensive re-null of controller-owned probe caches in case any
+            # post-freeze code path re-attached them.  IMPORTANT: do NOT call
+            # _release_probe_caches_on_freeze here — it clears global module
+            # caches (_MERGED_EDGE_CACHE / _RANDOM_WALK_GRAPH_CACHE /
+            # _DGL_GRAPH_CACHE) which the post-freeze prefetch path needs.
+            # The one-time full cleanup already ran at the moment of freezing.
+            setattr(controller, "_cached_real_pool", None)
+            setattr(controller, "_cached_cone", None)
+            setattr(controller, "_edge_csr", None)
             if hasattr(args, "_cached_full_rw_pool"):
                 args._cached_full_rw_pool = None
         return
 
     if local_probe_idx is None or probe_idx_global is None or probe_idx_global.numel() == 0:
         controller.frozen = True
+        _release_probe_caches_on_freeze(controller, args)
         return
 
     # Use the SAME edge_seed the training step used in this epoch, so probe
@@ -2386,6 +2363,7 @@ def _maybe_update_edge_budget(
                     f"{controller.auto_hold_neg_inf_streak} epochs; "
                     "freezing budget."
                 )
+            _release_probe_caches_on_freeze(controller, args)
             return
         if commit_ok:
             controller.auto_hold_released = True
@@ -2426,6 +2404,11 @@ def _maybe_update_edge_budget(
             f"new_budget=({cur_budget['real_edges_per_query']},{cur_budget['rw_edges_per_query']}) "
             f"probe_loss={best_loss:.4f} probe_edges={best_count}"
         )
+
+    # Patience-based freeze inside controller.update() does not have access to
+    # `args`, so the cleanup is triggered here right after update() returns.
+    if controller.frozen:
+        _release_probe_caches_on_freeze(controller, args)
 
 
 @contextlib.contextmanager
@@ -2617,6 +2600,55 @@ def clear_merged_edge_cache() -> None:
     _MERGED_EDGE_CACHE.clear()
 
 
+def _glibc_malloc_trim() -> None:
+    """Force glibc to return freed pages to the OS (Linux+glibc only).
+
+    On Linux+glibc, ``free()`` does not call ``munmap`` for small/medium
+    allocations — freed memory stays in the process's arena pool and is
+    visible in ``/proc/self/statm`` RSS forever.  ``malloc_trim(0)`` walks
+    the arenas and ``madvise(MADV_DONTNEED)``s the free pages, so RSS
+    reflects the true working set.
+
+    Cheap on systems with little to trim (<10 ms typical), more expensive
+    after large allocations are freed (~100-500 ms on multi-GB arenas).
+    No-op on macOS / musl libc.
+    """
+    try:
+        import ctypes as _ctypes
+        _ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
+
+
+def _release_probe_caches_on_freeze(controller, args=None) -> None:
+    """Drop probe-only CPU caches the moment the adaptive budget freezes.
+
+    Called at every freeze trigger so the budget-search working set
+    (~5-10 GiB on amazon: real_pool mask, dst-CSR, cached cone, full RW
+    pool, merged-edge cache) does not sit around through the rest of
+    training and through multi_tier calibration.  Idempotent.
+
+    Lowers `cur` RSS immediately; lowers future `peak` only insofar as
+    subsequent transients no longer pile onto a high baseline (the prior
+    peak already recorded by the kernel cannot be undone).
+
+    The final ``malloc_trim(0)`` is the critical step on Linux+glibc:
+    Python's ``gc.collect()`` only releases Python objects, and free()
+    typically keeps freed arenas in the process's address space.
+    ``malloc_trim`` forces glibc to ``madvise(MADV_DONTNEED)`` free pages
+    so /proc/self/statm RSS actually drops.  No-op on macOS / musl.
+    """
+    setattr(controller, "_cached_real_pool", None)
+    setattr(controller, "_cached_cone", None)
+    setattr(controller, "_edge_csr", None)
+    if args is not None and hasattr(args, "_cached_full_rw_pool"):
+        args._cached_full_rw_pool = None
+    clear_random_walk_graph_cache()
+    clear_merged_edge_cache()
+    gc.collect()
+    _glibc_malloc_trim()
+
+
 def _build_and_broadcast_edges(args, edge_index_global, num_nodes, device, rw_device, sp_group,
                                sp_src_rank, sp_rank, nodes_per_rank, edge_seed=None,
                                edge_budget_state=None, adaptive_edge_budget_cfg=None,
@@ -2647,7 +2679,7 @@ def _build_and_broadcast_edges(args, edge_index_global, num_nodes, device, rw_de
         # fixed_random_seed handles both CPU and CUDA RNG (covers gpu rw_device).
         #
         # Cache: when the same (seed, budget, walk, graph, policy) key recurs
-        # (e.g. during static-seed epochs or bootstrap), skip the expensive
+        # (e.g. during static-seed epochs), skip the expensive
         # walk+merge and return the stored CPU tensor moved to the target device.
         cache_key = _make_merged_edge_cache_key(
             args, edge_index_global, num_nodes, rw_build_device, resolved_policy,

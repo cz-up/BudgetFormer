@@ -71,7 +71,6 @@ from utils.fullgraph_sp_support import (
     _build_attention_edges,
     _build_model,
     _build_optimizer_bundle,
-    _bootstrap_initial_edge_budget,
     _cuda_empty_cache,
     _eval_sp,
     _measure_edge_h2d_time,
@@ -82,6 +81,7 @@ from utils.fullgraph_sp_support import (
     _load_data,
     _maybe_update_edge_budget,
     _random_block_sampling_enabled,
+    _release_probe_caches_on_freeze,
     _resolve_adaptive_edge_budget_config,
     _resolve_amp_dtype,
     _resolve_device,
@@ -225,7 +225,9 @@ def main():
     if fixed_edge_budget_state is not None:
         edge_budget_controller.set_state(fixed_edge_budget_state)
         edge_budget_controller.frozen = True
-    total_bootstrap_time = 0.0
+        # Fixed budget path never builds probe caches, but call the helper to
+        # keep this branch symmetric with the adaptive-freeze paths.
+        _release_probe_caches_on_freeze(edge_budget_controller, args)
     total_adjustment_time = 0.0
     probe_idx_global = None
     local_probe_idx = None
@@ -260,32 +262,6 @@ def main():
     if args.rank != 0:
         del y
         del split_idx
-    if edge_budget_controller.enabled:
-        t_bs_start = time.time()
-        initial_budget_state = _bootstrap_initial_edge_budget(
-            args,
-            adaptive_edge_budget_cfg,
-            edge_budget_controller,
-            model,
-            x_local,
-            local_y,
-            local_train_idx,
-            probe_idx_global,
-            local_probe_idx,
-            edge_index_global,
-            num_nodes,
-            device,
-            rw_device,
-            sp_group,
-            sp_src_rank,
-            sp_rank,
-            local_num_nodes,
-            amp_dtype,
-            sp_world_size,
-            grad_reducer,
-        )
-        total_bootstrap_time += (time.time() - t_bs_start)
-        edge_budget_controller.set_state(initial_budget_state)
 
     random_blocks_dynamic = (
         _random_block_sampling_enabled(args, adaptive_edge_budget_cfg)
@@ -464,9 +440,23 @@ def main():
     _mt_adapt_fwd_sum = 0.0
     _mt_adapt_bwd_sum = 0.0
     _mt_adapt_wait_sum = 0.0
+    # Track the single largest observed prefetch wait so we can exclude it from
+    # the average passed to reconsider_with_actual_timing().  The first epoch
+    # after ACTIVE has a one-time CSR+DGL build cost (~5s on snap-patents) that
+    # would otherwise dominate a small-sample mean and spuriously trigger the
+    # CPU→GPU switch; this max-sample outlier rejection gives steady-state.
+    _mt_adapt_wait_max = 0.0
     _mt_adapt_count = 0
     _MT_ADAPT_WARMUP = 3   # epochs to collect before first check
     _MT_ADAPT_INTERVAL = 5 # re-check every N epochs after that
+    # Disable further adaptive-timing checks once we have N consecutive
+    # confirmations that the current CPU-prefetch policy is fine.  Repeated
+    # re-checks every INTERVAL epochs after that are pure overhead — the
+    # decision has stabilised.  Switching to GPU also disables checks (the
+    # mechanism is one-way CPU→GPU only).
+    _MT_ADAPT_KEEP_CONFIRM = 2
+    _mt_adapt_keep_streak = 0
+    _mt_adapt_check_disabled = False
     # For adaptive/multi_tier checkpoint + adaptive edge budget: track whether we
     # have already notified the checkpointer that the edge budget is frozen.
     # For all other cases (no deferred calibration), treat as already done.
@@ -608,7 +598,38 @@ def main():
         sync_step_timing = precise_step_timing or _should_force_ckpt_sync_timers(model)
 
         if _is_multi_tier and dynamic_edges and not _multi_tier_edge_profiled and _budget_frozen_notified:
+            # When --force_multi_tier_plan is set, the edge-policy choice is
+            # predetermined and the per-candidate profile is pure overhead
+            # (each cpu_*_prefetch probe can add several GiB to CPU peak on
+            # large graphs).  Inject zeroed profiles so the planner state
+            # machine still reaches ACTIVE, then skip the costly profiling loop.
+            _force_plan_str = str(getattr(args, "force_multi_tier_plan", "") or "")
             _mt_prof_mgr = getattr(model, "_comm_ckpt", None)
+            if _force_plan_str and _mt_prof_mgr is not None:
+                if args.rank == 0:
+                    print(
+                        f"[multi_tier] --force_multi_tier_plan={_force_plan_str!r} set; "
+                        "skipping edge-policy profile to avoid the CPU peak it would cause."
+                    )
+                for _p in (
+                    EDGE_POLICY_GPU_EPHEMERAL,
+                    EDGE_POLICY_GPU_PERSIST,
+                    EDGE_POLICY_CPU_RANK_LOCAL_PREFETCH,
+                    EDGE_POLICY_CPU_BROADCAST_PREFETCH,
+                ):
+                    _mt_prof_mgr.set_edge_policy_profile(
+                        _p,
+                        prep_time_s=0.0,
+                        gpu_peak_bytes=0,
+                        cpu_delta_bytes=0,
+                        live_edge_bytes=0,
+                        enabled=False,
+                    )
+                _multi_tier_edge_profiled = True
+                if profile_sp_comm:
+                    reset_comm_profiler()
+                # Skip the remainder of the profile block.
+                _mt_prof_mgr = None
             if _mt_prof_mgr is not None:
                 candidate_policies = []
                 if device.startswith("cuda"):
@@ -1117,11 +1138,9 @@ def main():
                     _forced = _parse_force_multi_tier_plan(_force_plan, _mt_ckpt.n_layers)
                     if _forced is not None:
                         _forced_policy, _forced_modes = _forced
-                        _mt_ckpt._apply_synced_active_plan(
-                            modes=_forced_modes,
+                        _mt_ckpt.override_active_plan(
                             edge_policy=_forced_policy,
-                            device=device,
-                            group=sp_group if sp_world_size > 1 else None,
+                            modes=_forced_modes,
                         )
                         # Keep edge_index_global/gpu_cached consistent with forced policy.
                         edge_index_global, edge_index_gpu_cached = _apply_multi_tier_active_plan(
@@ -1192,6 +1211,11 @@ def main():
             if _budget_is_stable:
                 _budget_frozen_notified = True
                 _set_runtime_edge_policy_for_phase(budget_phase_active=False)
+                # Drop probe-only caches the moment we leave budget-search.  This
+                # is also done inside _maybe_update_edge_budget at the various
+                # internal freeze points, but here it also covers the warmup-cap
+                # stable branch where the controller itself never set .frozen.
+                _release_probe_caches_on_freeze(edge_budget_controller, args)
                 _ckpt_mgr = getattr(model, "_comm_ckpt", None)
                 if _ckpt_mgr is not None and hasattr(model, "comm_aware_notify_budget_frozen"):
                     model.comm_aware_notify_budget_frozen(
@@ -1241,10 +1265,12 @@ def main():
         # Adaptive-timing feedback for multi_tier CPU-prefetch policies.
         # Accumulate actual timing and periodically re-evaluate whether the
         # profiling-time overlap estimate is still accurate.
-        if _is_multi_tier and _multi_tier_decision_done:
+        if _is_multi_tier and _multi_tier_decision_done and not _mt_adapt_check_disabled:
             _mt_adapt_fwd_sum += fwd_time
             _mt_adapt_bwd_sum += bwd_time
             _mt_adapt_wait_sum += prefetch_wait_time
+            if prefetch_wait_time > _mt_adapt_wait_max:
+                _mt_adapt_wait_max = prefetch_wait_time
             _mt_adapt_count += 1
             _do_adapt_check = (
                 _mt_adapt_count == _MT_ADAPT_WARMUP
@@ -1261,14 +1287,25 @@ def main():
                     # don't.  Fix: MAX all_reduce the wait sum so every rank
                     # uses the src's true observed wait before deciding.
                     _synced_wait_sum = _mt_adapt_wait_sum
+                    _synced_wait_max = _mt_adapt_wait_max
                     if sp_world_size > 1 and dist.is_initialized():
                         _wt = torch.tensor(
-                            [_mt_adapt_wait_sum], device=device, dtype=torch.float64
+                            [_mt_adapt_wait_sum, _mt_adapt_wait_max],
+                            device=device,
+                            dtype=torch.float64,
                         )
                         dist.all_reduce(_wt, op=dist.ReduceOp.MAX, group=sp_group)
-                        _synced_wait_sum = float(_wt.item())
+                        _synced_wait_sum = float(_wt[0].item())
+                        _synced_wait_max = float(_wt[1].item())
                     _avg_t_model = (_mt_adapt_fwd_sum + _mt_adapt_bwd_sum) / _mt_adapt_count
-                    _avg_wait = _synced_wait_sum / _mt_adapt_count
+                    # Exclude the largest single wait observation (one-time
+                    # cold-start cost for CPU CSR/DGL build).  Falls back to
+                    # the plain mean when only one sample exists.
+                    if _mt_adapt_count > 1:
+                        _avg_wait = (_synced_wait_sum - _synced_wait_max) / (_mt_adapt_count - 1)
+                    else:
+                        _avg_wait = _synced_wait_sum / _mt_adapt_count
+                    _pre_check_policy = _mt_ckpt_adapt.edge_policy
                     _switched = _mt_ckpt_adapt.reconsider_with_actual_timing(
                         actual_t_model_s=_avg_t_model,
                         actual_prefetch_wait_s=_avg_wait,
@@ -1289,11 +1326,35 @@ def main():
                             model, args, edge_index_global, edge_index_gpu_cached,
                             device=device, sp_group=sp_group, sp_world_size=sp_world_size,
                         )
+                        # We just left a CPU-prefetch policy for a GPU one; the
+                        # adaptive-timing mechanism is one-way (no GPU→CPU
+                        # switch path exists), so future checks would be pure
+                        # overhead.  Disable them.
+                        _mt_adapt_check_disabled = True
+                        _mt_adapt_keep_streak = 0
                         # Reset accumulators so next window reflects the new policy.
                         _mt_adapt_fwd_sum = 0.0
                         _mt_adapt_bwd_sum = 0.0
                         _mt_adapt_wait_sum = 0.0
+                        _mt_adapt_wait_max = 0.0
                         _mt_adapt_count = 0
+                    elif _pre_check_policy in (
+                        EDGE_POLICY_CPU_RANK_LOCAL_PREFETCH,
+                        EDGE_POLICY_CPU_BROADCAST_PREFETCH,
+                    ):
+                        # Genuine "CPU is fine" decision (vs the early-return
+                        # path inside reconsider for non-CPU policies which
+                        # also returns False but does not represent a real
+                        # check).  Count consecutive confirmations.
+                        _mt_adapt_keep_streak += 1
+                        if _mt_adapt_keep_streak >= _MT_ADAPT_KEEP_CONFIRM:
+                            _mt_adapt_check_disabled = True
+                            if args.rank == 0:
+                                print(
+                                    f"[MultiTierManager] adaptive-timing checks disabled: "
+                                    f"{_mt_adapt_keep_streak} consecutive checks confirm "
+                                    f"{_pre_check_policy} is optimal; stopping further re-evaluation."
+                                )
 
         if args.rank == 0:
             timer_fields = (
@@ -1423,7 +1484,6 @@ def main():
         eval_time_count=eval_time_count,
         num_nodes=num_nodes,
         edge_budget_controller=edge_budget_controller,
-        total_bootstrap_time=total_bootstrap_time,
         total_adjustment_time=total_adjustment_time,
     )
     _print_peak_gpu_memory(args, device)

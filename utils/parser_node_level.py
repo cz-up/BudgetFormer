@@ -281,6 +281,20 @@ def add_node_fullgraph_sp_args(parser, defaults=None):
         ),
     )
     parser.add_argument(
+        "--force_multi_tier_plan",
+        type=str,
+        default=defaults.get("force_multi_tier_plan", ""),
+        help=(
+            "ablation override: bypass the multi_tier planner and force a specific "
+            "edge_policy + tier configuration. Format: '<edge_policy>:<tier_config>'. "
+            "edge_policy ∈ {gpu_persist, gpu_ephemeral, cpu_rank_local_prefetch, "
+            "cpu_broadcast_prefetch}; tier_config ∈ {recompute, keep_mha=N, retain=N} "
+            "where N counts layers from the back. "
+            "Example: 'cpu_rank_local_prefetch:keep_mha=2' or 'gpu_persist:recompute'. "
+            "Empty (default) means let the planner choose."
+        ),
+    )
+    parser.add_argument(
         "--random_edge_blocks",
         action="store_true",
         default=defaults.get("random_edge_blocks", False),
@@ -314,7 +328,7 @@ def add_node_fullgraph_sp_args(parser, defaults=None):
         "--adaptive_edge_budget_warmup_epochs",
         type=int,
         default=defaults.get("adaptive_edge_budget_warmup_epochs", -1),
-        help="advanced override; >0 limits online budget updates to the first N epochs, 0 freezes immediately after bootstrap, <0 removes cap",
+        help="advanced override; >0 limits online budget updates to the first N epochs, 0 freezes immediately, <0 removes cap",
     )
     parser.add_argument(
         "--adaptive_edge_budget_patience",

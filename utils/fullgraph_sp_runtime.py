@@ -676,6 +676,22 @@ def _apply_multi_tier_active_plan(
                     f"falling back to edge_policy={_fallback_policy}."
                 )
     else:
+        # If a prior pass (typically the planner's initial choice of
+        # gpu_persist before a --force_multi_tier_plan override) left
+        # edge_index_global on the GPU, demote it back to CPU.  None of the
+        # non-persistent policies want a GPU-resident topology, and leaving
+        # it on GPU breaks _prefetch_cache_compatible() for CPU-prefetch
+        # policies (it checks edge_index_global.device.type == "cpu").
+        if edge_index_gpu_cached and edge_index_global.device.type == "cuda":
+            edge_index_global = edge_index_global.cpu()
+            edge_index_gpu_cached = False
+            clear_merged_edge_cache()
+            clear_random_walk_graph_cache()
+            if args.rank == 0:
+                print(
+                    "[multi_tier] Demoting edge_index_global from GPU to CPU "
+                    f"for edge_policy={_mt_policy} (non-persistent)."
+                )
         args._runtime_edge_policy = _mt_policy
         args._runtime_force_edge_broadcast = (
             _mt_policy in (
@@ -866,7 +882,6 @@ def _print_rank0_training_summary(
     eval_time_count: int,
     num_nodes: int,
     edge_budget_controller,
-    total_bootstrap_time: float,
     total_adjustment_time: float,
 ):
     if args.rank != 0:
@@ -909,7 +924,7 @@ def _print_rank0_training_summary(
     else:
         print("Avg inference time per eval: n/a")
     if edge_budget_controller.enabled:
-        print(f"Timing: bootstrap={total_bootstrap_time:.2f}s  adjustment={total_adjustment_time:.2f}s")
+        print(f"Timing: adjustment={total_adjustment_time:.2f}s")
     print(f"{'=' * 72}")
 
 
