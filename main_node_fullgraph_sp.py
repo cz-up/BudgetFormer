@@ -578,6 +578,14 @@ def main():
         _prefetch_future = _prefetch_pool.submit(_prefetch_fn)
         return True
 
+    # Fail-fast guard for structural OOM: when every multi_tier tier (down to
+    # all-recompute) and every OOM retry are exhausted, _step_with_oom_recovery
+    # drops the step and the epoch is skipped with no gradient update. A single
+    # drop is a transient allocator hiccup, but a long run of consecutive drops
+    # means even the cheapest plan does not fit — the run would otherwise spin
+    # forever making zero progress. Abort with an actionable message instead.
+    _consecutive_oom_drops = 0
+    _MAX_CONSECUTIVE_OOM_DROPS = 5
     for epoch in range(1, args.epochs + 1):
         t_epoch = time.time()
         prefetch_wait_time = 0.0
@@ -1078,6 +1086,27 @@ def main():
         # no logging) and let the next epoch try again with a (hopefully)
         # cleaner allocator state.
         if _epoch_skipped_due_to_oom:
+            _consecutive_oom_drops += 1
+            if _consecutive_oom_drops >= _MAX_CONSECUTIVE_OOM_DROPS:
+                # Even all-recompute (multi_tier's cheapest plan) does not fit,
+                # repeatedly. No tier/retry fallback can help — bail out with a
+                # diagnosis instead of spinning through the remaining epochs.
+                if args.rank == 0:
+                    print(
+                        f"[multi_tier] Aborting: {_consecutive_oom_drops} consecutive "
+                        f"steps dropped to CUDA OOM (through epoch {epoch}). Even the "
+                        f"all-recompute plan does not fit on this GPU. Reduce the memory "
+                        f"footprint: lower the edge budget (real/rw edges per query), "
+                        f"reduce hidden_dim / num_layers / heads, or increase the SP "
+                        f"world size to split the sequence across more GPUs."
+                    )
+                # All SP ranks reach this drop symmetrically (_sp_any_oom syncs
+                # the OOM vote and the recovery decision), so every rank raises
+                # together — no rank is left blocking in a collective.
+                raise RuntimeError(
+                    f"multi_tier: {_consecutive_oom_drops} consecutive OOM step drops; "
+                    f"all-recompute does not fit. See guidance above."
+                )
             if sp_world_size > 1 and dist.is_initialized():
                 # Re-sync ranks so the next epoch starts together.
                 try:
@@ -1085,6 +1114,8 @@ def main():
                 except Exception:
                     pass
             continue
+        # A step completed with a gradient update — reset the structural-OOM guard.
+        _consecutive_oom_drops = 0
 
         (
             out_local,
