@@ -1742,6 +1742,34 @@ class _AdaptiveEdgeBudgetController:
             if self.bad_rounds >= self.patience:
                 self.frozen = True
 
+    def commit_expansion_step(self, next_state):
+        """Commit one block-step toward the budget ceiling B in the chosen
+        expand direction, regardless of one-step gain sign.
+
+        Rationale (Option A): on these datasets every good run uses the full
+        budget B; the only failures are runs that froze BELOW B on a myopic,
+        near-noise one-step probe (e.g. snap-patents seed7 at (2,6)). Always
+        climbing to B removes that fragile early "when to stop" decision and
+        defers the real choice — the real/rw split — to the composition phase
+        at the ceiling, which keeps the positive-gain gate + confirmation +
+        patience freeze. Bounded by B, so expansion always terminates.
+
+        Bypasses the positive-gain confirmation machinery (the decision to
+        expand is unconditional) and marks the controller as past AutoHold so
+        the composition phase runs the patience-based freeze.
+        """
+        self.real_budget = int(next_state["real_edges_per_query"])
+        self.rw_budget = int(next_state["rw_edges_per_query"])
+        if "walk_length" in next_state:
+            self.walk_length = int(next_state["walk_length"])
+        self._n_budget_updates += 1
+        self._pending_kind = None
+        self._pending_state = None
+        self._pending_wins = 0
+        self.bad_rounds = 0
+        self.seen_positive_gain = True
+        self.auto_hold_released = True
+
 
 def _round_budget_to_block(value: int, block_size: int) -> int:
     if value <= 0:
@@ -2348,7 +2376,39 @@ def _maybe_update_edge_budget(
                 f"gain={gain_text} probe_edges={row['edges']}"
             )
 
-    # Check Condition for Release or Continued Update
+    # ---- Phase split (Option A) -----------------------------------------
+    # Expansion phase: there is still headroom below the budget ceiling B, so
+    # candidate_states offered real_up / rw_up. ALWAYS take one block-step
+    # toward B in the least-negative (best-by-gain) direction, regardless of
+    # the gain sign. best_kind/best_state already point at that direction.
+    #
+    # Rationale: on these datasets every good run uses the full budget B; the
+    # only failures are runs that froze BELOW B on a myopic, near-noise
+    # one-step probe (snap-patents seed7 at (2,6)). Climbing to B
+    # unconditionally removes that fragile "when to stop below B" decision and
+    # defers the real choice — the real/rw split — to the composition phase.
+    # Bounded by B, so expansion always terminates.
+    _expand_kinds = ("real_up", "rw_up")
+    in_expansion = any(row["kind"] in _expand_kinds for row in probe_rows)
+    if in_expansion and best_kind is not None and best_state is not None:
+        controller.commit_expansion_step(best_state)
+        if args.rank == 0:
+            _nr, _nw = _budget_pair(controller.current_state())
+            _sign = "positive" if best_gain > 0.0 else "non-positive"
+            print(
+                f"  ↳ BudgetCtrl [Expand→B] epoch={epoch} dir={best_kind} "
+                f"({_sign} rel_gain={best_gain:.8e}) "
+                f"new_budget=({_nr},{_nw}) probe_loss={best_loss:.4f} "
+                f"probe_edges={best_count}"
+            )
+        return
+
+    # ---- Composition phase (at the ceiling B) OR no feasible candidate -----
+    # Only shift_to_* candidates remain (redistribute real<->rw at fixed total).
+    # Here the current-vs-candidate comparison keeps its full meaning: commit a
+    # shift only when it strictly beats current, with the original confirmation
+    # + patience freeze. AutoHold still guards the start-at-ceiling edge case
+    # (no expansion ever happened).
     if not controller.auto_hold_released:
         if best_gain == float("-inf"):
             controller.auto_hold_neg_inf_streak += 1
