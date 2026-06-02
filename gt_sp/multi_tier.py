@@ -624,7 +624,6 @@ class _MultiTierResourceManager:
             self._peak_retain = _peak_retain_last   # may be updated after FRONT probe
             m_full_last = self._fwd_live_retain - self._fwd_live_warmup
             self._m_layer_full = max(m_full_last, 1)
-            self._state = self._CALIBRATE_RETAIN_FRONT
             if is_r0:
                 print(
                     f"[MultiTierManager] CALIBRATE_RETAIN (last layer) done: "
@@ -634,6 +633,28 @@ class _MultiTierResourceManager:
                     f"T_fwd={self._t_fwd_retain*1000:.0f} ms  "
                     f"T_bwd={self._t_bwd_retain*1000:.0f} ms"
                 )
+            # Pre-check (mirrors CALIBRATE_MHA → FRONT): retaining the FIRST layer
+            # keeps its full activation live through the entire backward pass while
+            # every later layer is recomputed, so worst-case peak ≈ peak_warmup +
+            # m_layer_full. Retain is strictly heavier than keep_mha
+            # (m_full >= m_mha), so if that estimate exceeds 90% of physical GPU the
+            # FRONT probe is almost certain to OOM. An OOM here is especially costly:
+            # it fragments the CUDA allocator and, as observed in practice, leaves
+            # even the all-recompute fallback unable to fit on the retry. Skip the
+            # probe entirely and finalise with the last-layer measurement instead.
+            _peak_est_front = self._peak_warmup + self._m_layer_full
+            _physical_gpu = torch.cuda.get_device_properties(device).total_memory
+            if _peak_est_front > int(_physical_gpu * 0.90):
+                if is_r0:
+                    print(
+                        f"[MultiTierManager] Skipping CALIBRATE_RETAIN_FRONT: "
+                        f"est_peak={_peak_est_front/(1024**2):.0f} MiB > "
+                        f"90% physical ({int(_physical_gpu*0.90)/(1024**2):.0f} MiB). "
+                        f"Using last-layer M_layer^full={m_full_last/(1024**2):.1f} MiB."
+                    )
+                self._run_active_plan(device, total_gpu)
+            else:
+                self._state = self._CALIBRATE_RETAIN_FRONT
 
         elif self._state == self._CALIBRATE_RETAIN_FRONT:
             _peak_retain_front = int(

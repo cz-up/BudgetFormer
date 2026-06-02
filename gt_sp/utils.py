@@ -351,8 +351,8 @@ def _safe_rw_device(rw_dev, args, num_nodes: int, num_edges: int):
     estimate = _estimate_rw_working_set_bytes(
         num_nodes=num_nodes,
         num_edges=num_edges,
-        walks_per_node=int(getattr(args, "head_hop_walks_per_node", 2)),
-        walk_length=int(getattr(args, "head_hop_walk_length", 4)),
+        walks_per_node=int(getattr(args, "walks_per_node", 2)),
+        walk_length=int(getattr(args, "walk_length", 4)),
         num_heads=int(getattr(args, "num_heads", 1)),
     )
     if _gpu_can_fit_rw(requested, estimate):
@@ -1454,8 +1454,8 @@ def get_batch_blockize(
                 seed_nodes=idx_batch,
                 num_nodes=N,
                 device=resolve_edge_build_device(args, device if device is not None else edge_index.device),
-                walk_length=getattr(args, "head_hop_walk_length", 4),
-                walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
+                walk_length=getattr(args, "walk_length", 4),
+                walks_per_node=getattr(args, "walks_per_node", 2),
             )
         else:
             sampled_nodes = None
@@ -1555,8 +1555,8 @@ def get_batch_blockize(
                     num_heads=args.num_heads,
                     num_groups=1,
                     device=rw_base.device,
-                    walk_length=getattr(args, "head_hop_walk_length", 4),
-                    walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
+                    walk_length=getattr(args, "walk_length", 4),
+                    walks_per_node=getattr(args, "walks_per_node", 2),
                 )
             except torch.cuda.OutOfMemoryError:
                 # Pre-check under-estimated; fall back to CPU.
@@ -1570,8 +1570,8 @@ def get_batch_blockize(
                     num_heads=args.num_heads,
                     num_groups=1,
                     device=rw_base.device,
-                    walk_length=getattr(args, "head_hop_walk_length", 4),
-                    walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
+                    walk_length=getattr(args, "walk_length", 4),
+                    walks_per_node=getattr(args, "walks_per_node", 2),
                 )
             if rw_edge_index_i_raw is not None and rw_edge_index_i_raw.numel() > 0:
                 edge_parts.append(rw_edge_index_i_raw)
@@ -1595,8 +1595,8 @@ def get_batch_blockize(
                 num_heads=args.num_heads,
                 num_groups=1,
                 device=rw_base.device,
-                walk_length=getattr(args, "head_hop_walk_length", 4),
-                walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
+                walk_length=getattr(args, "walk_length", 4),
+                walks_per_node=getattr(args, "walks_per_node", 2),
             )
         except torch.cuda.OutOfMemoryError:
             if int(getattr(args, "rank", 0)) == 0:
@@ -1609,8 +1609,8 @@ def get_batch_blockize(
                 num_heads=args.num_heads,
                 num_groups=1,
                 device=rw_base.device,
-                walk_length=getattr(args, "head_hop_walk_length", 4),
-                walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
+                walk_length=getattr(args, "walk_length", 4),
+                walks_per_node=getattr(args, "walks_per_node", 2),
             )
 
     if args.model == "graphormer" and apply_graphormer_virtual_edges:

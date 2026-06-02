@@ -841,7 +841,7 @@ def _print_training_header(
             "  Fixed edge budget: "
             f"real={fixed_edge_budget_state['real_edges_per_query']} "
             f"rw={fixed_edge_budget_state['rw_edges_per_query']} "
-            f"walk_length={fixed_edge_budget_state.get('walk_length', getattr(args, 'head_hop_walk_length', 4))}"
+            f"walk_length={fixed_edge_budget_state.get('walk_length', getattr(args, 'walk_length', 4))}"
         )
     print(
         f"  Adaptive edge budget: {int(edge_budget_controller.enabled)} "
@@ -878,6 +878,7 @@ def _print_rank0_training_summary(
     best_test_at_best_val: float,
     epoch_wall_time_sum: float,
     epoch_wall_time_count: int,
+    data_prep_time_sum: float,
     eval_time_sum: float,
     eval_time_count: int,
     num_nodes: int,
@@ -907,9 +908,19 @@ def _print_rank0_training_summary(
         f"Test={fmt(best_test_at_best_val)}"
     )
     if epoch_wall_time_count > 0:
+        avg_epoch_wall = epoch_wall_time_sum / epoch_wall_time_count
         print(
-            f"Avg epoch wall time (excluding epoch 1): "
-            f"{epoch_wall_time_sum / epoch_wall_time_count:.2f}s"
+            f"Avg epoch wall time (excluding epoch 1): {avg_epoch_wall:.2f}s"
+        )
+        avg_data_prep = data_prep_time_sum / epoch_wall_time_count
+        prep_pct = (
+            100.0 * data_prep_time_sum / epoch_wall_time_sum
+            if epoch_wall_time_sum > 0
+            else 0.0
+        )
+        print(
+            f"Avg data prep time (edge build + prefetch wait, excluding epoch 1): "
+            f"{avg_data_prep:.2f}s  ({prep_pct:.2f}% of epoch time)"
         )
     else:
         print("Avg epoch wall time (excluding epoch 1): n/a")

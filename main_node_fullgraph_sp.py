@@ -424,6 +424,9 @@ def main():
     loss_ema = None
     epoch_wall_time_sum = 0.0
     epoch_wall_time_count = 0
+    # Data-preparation (per-epoch edge build + prefetch wait) time, accumulated
+    # over the same epochs as epoch_wall_time so the ratio is apples-to-apples.
+    data_prep_time_sum = 0.0
     eval_time_sum = 0.0
     eval_time_count = 0
     # First eval skipped as warm-up (cuDNN autotune / allocator).
@@ -1289,9 +1292,21 @@ def main():
             )
             dist.all_reduce(epoch_wall_time_t, op=dist.ReduceOp.MAX, group=sp_group)
             epoch_wall_time = float(epoch_wall_time_t.item())
+        # Data-preparation cost for this epoch: foreground edge build (rw_time)
+        # plus time spent blocked on the background edge prefetch. When CPU
+        # prefetch is active rw_time≈0 and the cost surfaces as prefetch_wait,
+        # so summing both captures data prep regardless of the edge policy.
+        data_prep_time = rw_time + prefetch_wait_time
+        if sp_world_size > 1 and dist.is_initialized():
+            data_prep_time_t = torch.tensor(
+                [data_prep_time], device=device, dtype=torch.float64
+            )
+            dist.all_reduce(data_prep_time_t, op=dist.ReduceOp.MAX, group=sp_group)
+            data_prep_time = float(data_prep_time_t.item())
         if epoch > 1:
             epoch_wall_time_sum += epoch_wall_time
             epoch_wall_time_count += 1
+            data_prep_time_sum += data_prep_time
 
         # Adaptive-timing feedback for multi_tier CPU-prefetch policies.
         # Accumulate actual timing and periodically re-evaluate whether the
@@ -1410,8 +1425,14 @@ def main():
                     print(line)
 
         if epoch % args.eval_every == 0:
-            if args.model == "exphormer":
-                _expander_deg = int(getattr(args, "expander_degree", 0))
+            _expander_deg = int(getattr(args, "expander_degree", 0))
+            if args.model == "exphormer" and _expander_deg > 0:
+                # Expander mode: the model's attention graph is the *fixed*
+                # real + self-loops + expander structure, used identically at
+                # train and eval time. Expander degree is small (fixed fan-out),
+                # so the full eval edge set stays memory-feasible. Build it once
+                # here as a cached eval edge_index with row-2 type labels
+                # (0 = real/self-loop, 1 = expander).
                 _ei_cpu = (
                     edge_index_global
                     if edge_index_global.device.type == "cpu"
@@ -1419,23 +1440,25 @@ def main():
                 )
                 _self_nn = torch.arange(num_nodes, dtype=torch.long)
                 _self_loops = torch.stack([_self_nn, _self_nn], dim=0)
-                if _expander_deg <= 0:
-                    _n_real_self = _ei_cpu.shape[1] + num_nodes
-                    _all_eval = torch.cat([_ei_cpu, _self_loops], dim=1)
-                    _eval_types = torch.zeros(_n_real_self, dtype=torch.long)
-                else:
-                    _n_real_self = _ei_cpu.shape[1] + num_nodes
-                    _n_exp = _expander_edge_index_cpu.shape[1]
-                    _all_eval = torch.cat([_ei_cpu, _self_loops, _expander_edge_index_cpu], dim=1)
-                    _eval_types = torch.cat([
-                        torch.zeros(_n_real_self, dtype=torch.long),
-                        torch.ones(_n_exp, dtype=torch.long),
-                    ])
+                _n_real_self = _ei_cpu.shape[1] + num_nodes
+                _n_exp = _expander_edge_index_cpu.shape[1]
+                _all_eval = torch.cat([_ei_cpu, _self_loops, _expander_edge_index_cpu], dim=1)
+                _eval_types = torch.cat([
+                    torch.zeros(_n_real_self, dtype=torch.long),
+                    torch.ones(_n_exp, dtype=torch.long),
+                ])
                 _eval_ei_cpu = torch.cat([_all_eval, _eval_types.unsqueeze(0)], dim=0)
                 del _all_eval, _eval_types
                 _eval_cached_ei = _eval_ei_cpu.to(device)
                 del _eval_ei_cpu
             else:
+                # RW-substitute mode (expander_degree == 0) and all non-exphormer
+                # models: evaluate under the *same* sampled/budgeted edge regime as
+                # training. Passing None lets _eval_sp rebuild attention edges via
+                # _build_attention_edges(edge_budget_state=...), which keeps eval
+                # memory in line with training (the full real graph is ~50x denser
+                # per node on large graphs like ogbn-products and would both OOM and
+                # create a train/eval distribution mismatch).
                 _eval_cached_ei = None
             if torch.cuda.is_available():
                 torch.cuda.synchronize(device)
@@ -1511,6 +1534,7 @@ def main():
         best_test_at_best_val=best_test_at_best_val,
         epoch_wall_time_sum=epoch_wall_time_sum,
         epoch_wall_time_count=epoch_wall_time_count,
+        data_prep_time_sum=data_prep_time_sum,
         eval_time_sum=eval_time_sum,
         eval_time_count=eval_time_count,
         num_nodes=num_nodes,

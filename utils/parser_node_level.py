@@ -109,15 +109,15 @@ def add_node_common_args(parser, defaults=None):
     parser.add_argument("--model_dir", type=str, default=defaults.get("model_dir", "./model_ckpt/"))
 
     parser.add_argument(
-        "--head_hop_walk_length",
+        "--walk_length",
         type=int,
-        default=defaults.get("head_hop_walk_length", 4),
+        default=defaults.get("walk_length", 4),
         help="head hop random-walk length",
     )
     parser.add_argument(
-        "--head_hop_walks_per_node",
+        "--walks_per_node",
         type=int,
-        default=defaults.get("head_hop_walks_per_node", 2),
+        default=defaults.get("walks_per_node", 2),
         help="head hop random walks per node",
     )
     parser.add_argument(
@@ -375,7 +375,7 @@ def add_node_fullgraph_sp_args(parser, defaults=None):
         "--fixed_walk_length",
         type=int,
         default=defaults.get("fixed_walk_length"),
-        help="optional fixed random-walk length paired with --fixed_real_edges_per_query/--fixed_rw_edges_per_query; defaults to --head_hop_walk_length when omitted",
+        help="optional fixed random-walk length paired with --fixed_real_edges_per_query/--fixed_rw_edges_per_query; defaults to --walk_length when omitted",
     )
     parser.add_argument("--seq_len", type=int, default=defaults.get("seq_len", 0), help="compat arg for shared launch scripts")
 
@@ -444,8 +444,8 @@ def _normalize_fixed_edge_budget_args(args):
         raise ValueError("Fixed edge budgets must be >= 0.")
     args.fixed_real_edges_per_query = int(fixed_real)
     args.fixed_rw_edges_per_query = int(fixed_rw)
-    if args.fixed_rw_edges_per_query > 0 and int(getattr(args, "head_hop_walks_per_node", 0)) <= 0:
-        raise ValueError("--fixed_rw_edges_per_query > 0 requires --head_hop_walks_per_node > 0.")
+    if args.fixed_rw_edges_per_query > 0 and int(getattr(args, "walks_per_node", 0)) <= 0:
+        raise ValueError("--fixed_rw_edges_per_query > 0 requires --walks_per_node > 0.")
     if fixed_walk is not None:
         if int(fixed_walk) <= 0:
             raise ValueError("--fixed_walk_length must be > 0 when provided.")

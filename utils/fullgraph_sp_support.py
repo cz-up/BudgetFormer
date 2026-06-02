@@ -797,7 +797,7 @@ def _get_real_edge_budget(args, edge_budget_state=None, adaptive_edge_budget_cfg
         max_tot = int(adaptive_edge_budget_cfg.max_total_edges_per_query)
     else:
         max_tot = int(getattr(args, "max_total_edges_per_query", 0))
-    if int(getattr(args, "head_hop_walks_per_node", 0)) <= 0:
+    if int(getattr(args, "walks_per_node", 0)) <= 0:
         return max_tot
     return (max_tot + 1) // 2
 
@@ -806,7 +806,7 @@ def _get_rw_edge_budget(args, edge_budget_state=None, adaptive_edge_budget_cfg=N
     state = edge_budget_state if edge_budget_state is not None else _fixed_edge_budget_state_from_args(args)
     if state is not None and "rw_edges_per_query" in state:
         return int(state["rw_edges_per_query"])
-    if int(getattr(args, "head_hop_walks_per_node", 0)) <= 0:
+    if int(getattr(args, "walks_per_node", 0)) <= 0:
         return 0
     if adaptive_edge_budget_cfg is not None:
         max_tot = int(adaptive_edge_budget_cfg.max_total_edges_per_query)
@@ -832,7 +832,7 @@ def _use_real_edges_for_state(args, edge_budget_state=None, adaptive_edge_budget
 
 
 def _use_rw_edges(args, edge_budget_state=None, adaptive_edge_budget_cfg=None) -> bool:
-    if int(getattr(args, "head_hop_walks_per_node", 0)) <= 0:
+    if int(getattr(args, "walks_per_node", 0)) <= 0:
         return False
     if _fixed_edge_budget_enabled(args, adaptive_edge_budget_cfg):
         return _get_rw_edge_budget(args, edge_budget_state, adaptive_edge_budget_cfg) > 0
@@ -1470,7 +1470,7 @@ def _build_probe_edge_pools(
                 num_nodes=num_nodes,
                 rw_device=rw_device,
                 walk_length=wl,
-                walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
+                walks_per_node=getattr(args, "walks_per_node", 2),
                 num_heads=args.num_heads,
                 edge_seed=edge_seed,
             )
@@ -1741,34 +1741,6 @@ class _AdaptiveEdgeBudgetController:
             self.bad_rounds += 1
             if self.bad_rounds >= self.patience:
                 self.frozen = True
-
-    def commit_expansion_step(self, next_state):
-        """Commit one block-step toward the budget ceiling B in the chosen
-        expand direction, regardless of one-step gain sign.
-
-        Rationale (Option A): on these datasets every good run uses the full
-        budget B; the only failures are runs that froze BELOW B on a myopic,
-        near-noise one-step probe (e.g. snap-patents seed7 at (2,6)). Always
-        climbing to B removes that fragile early "when to stop" decision and
-        defers the real choice — the real/rw split — to the composition phase
-        at the ceiling, which keeps the positive-gain gate + confirmation +
-        patience freeze. Bounded by B, so expansion always terminates.
-
-        Bypasses the positive-gain confirmation machinery (the decision to
-        expand is unconditional) and marks the controller as past AutoHold so
-        the composition phase runs the patience-based freeze.
-        """
-        self.real_budget = int(next_state["real_edges_per_query"])
-        self.rw_budget = int(next_state["rw_edges_per_query"])
-        if "walk_length" in next_state:
-            self.walk_length = int(next_state["walk_length"])
-        self._n_budget_updates += 1
-        self._pending_kind = None
-        self._pending_state = None
-        self._pending_wins = 0
-        self.bad_rounds = 0
-        self.seen_positive_gain = True
-        self.auto_hold_released = True
 
 
 def _round_budget_to_block(value: int, block_size: int) -> int:
@@ -2376,39 +2348,34 @@ def _maybe_update_edge_budget(
                 f"gain={gain_text} probe_edges={row['edges']}"
             )
 
-    # ---- Phase split (Option A) -----------------------------------------
-    # Expansion phase: there is still headroom below the budget ceiling B, so
-    # candidate_states offered real_up / rw_up. ALWAYS take one block-step
-    # toward B in the least-negative (best-by-gain) direction, regardless of
-    # the gain sign. best_kind/best_state already point at that direction.
+    # Noise guard: when no candidate improves on current probe loss (all gains
+    # <= 0, excluding the all-OOM -inf case), treat this probe round as
+    # uninformative — the edges resampled this round simply did not carry enough
+    # signal to justify a move. Keep the current budget and skip the round
+    # entirely: do NOT commit a move, and do NOT touch any freeze / confirmation
+    # counter (bad_rounds, pending wins, auto-hold streak). The round is ignored
+    # as if it never happened.
     #
-    # Rationale: on these datasets every good run uses the full budget B; the
-    # only failures are runs that froze BELOW B on a myopic, near-noise
-    # one-step probe (snap-patents seed7 at (2,6)). Climbing to B
-    # unconditionally removes that fragile "when to stop below B" decision and
-    # defers the real choice — the real/rw split — to the composition phase.
-    # Bounded by B, so expansion always terminates.
-    _expand_kinds = ("real_up", "rw_up")
-    in_expansion = any(row["kind"] in _expand_kinds for row in probe_rows)
-    if in_expansion and best_kind is not None and best_state is not None:
-        controller.commit_expansion_step(best_state)
+    # EXCEPTION — budget at ceiling (real + rw >= B): once the total budget is
+    # maxed out there is nothing left to grow, so "all gains <= 0" is no longer a
+    # noisy under-sampled round but the genuine convergence signal that we have
+    # reached the best feasible budget. In that case we must NOT skip: fall
+    # through to the normal path so bad_rounds accrues and the patience-based
+    # freeze can eventually fire. Otherwise, late in training where all gains are
+    # routinely negative, the controller would never freeze.
+    _at_ceiling = (controller.real_budget + controller.rw_budget) >= controller.max_total
+    if float("-inf") < best_gain <= 0.0 and not _at_ceiling:
         if args.rank == 0:
-            _nr, _nw = _budget_pair(controller.current_state())
-            _sign = "positive" if best_gain > 0.0 else "non-positive"
             print(
-                f"  ↳ BudgetCtrl [Expand→B] epoch={epoch} dir={best_kind} "
-                f"({_sign} rel_gain={best_gain:.8e}) "
-                f"new_budget=({_nr},{_nw}) probe_loss={best_loss:.4f} "
-                f"probe_edges={best_count}"
+                f"  ↳ BudgetCtrl ignore epoch={epoch}: no candidate beats current "
+                f"on probe loss (best_gain={best_gain:.3e} <= 0) and budget below "
+                f"ceiling ({controller.real_budget}+{controller.rw_budget}"
+                f"<{controller.max_total}); treating round as noise — keeping "
+                f"current budget, counters untouched."
             )
         return
 
-    # ---- Composition phase (at the ceiling B) OR no feasible candidate -----
-    # Only shift_to_* candidates remain (redistribute real<->rw at fixed total).
-    # Here the current-vs-candidate comparison keeps its full meaning: commit a
-    # shift only when it strictly beats current, with the original confirmation
-    # + patience freeze. AutoHold still guards the start-at-ceiling edge case
-    # (no expansion ever happened).
+    # Check Condition for Release or Continued Update
     if not controller.auto_hold_released:
         if best_gain == float("-inf"):
             controller.auto_hold_neg_inf_streak += 1
@@ -2514,7 +2481,7 @@ def _build_merged_edges(args, edge_index_global, num_nodes, final_device, rw_dev
             num_nodes=num_nodes,
             rw_device=rw_device,
             walk_length=wl,
-            walks_per_node=getattr(args, "head_hop_walks_per_node", 2),
+            walks_per_node=getattr(args, "walks_per_node", 2),
             num_heads=args.num_heads,
             edge_seed=edge_seed,
         )
@@ -2575,7 +2542,7 @@ def _resolve_walk_length(args, edge_budget_state=None, walk_length_override=None
     fixed_walk_length = getattr(args, "fixed_walk_length", None)
     if fixed_walk_length is not None:
         return max(1, int(fixed_walk_length))
-    return max(1, int(getattr(args, "head_hop_walk_length", 4)))
+    return max(1, int(getattr(args, "walk_length", 4)))
 
 
 def _broadcast_edges(merged_cpu, device, sp_group, sp_src_rank, sp_rank):
@@ -2625,7 +2592,7 @@ def _make_merged_edge_cache_key(
         int(real_budget),
         int(rw_budget),
         int(walk_length),
-        int(getattr(args, "head_hop_walks_per_node", 2)),
+        int(getattr(args, "walks_per_node", 2)),
         str(rw_build_device),
         str(resolved_policy),
         int(nodes_per_rank),
@@ -2899,6 +2866,25 @@ def _eval_sp(args, model, x_local, y, split_idx, edge_index_global, num_nodes,
                 edge_budget_state=edge_budget_state,
                 adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
             )
+        # Exphormer RW-substitute mode (expander_degree<=0): training appends
+        # per-node self-loops (type 0) to the sampled edges so every node attends
+        # to itself (matching the original Exphormer, which adds self-loops at the
+        # dataset level for both train and eval). Mirror that here so eval uses the
+        # same edge set as training. _build_attention_edges returns [3, E] with
+        # row-2 = edge type for exphormer.
+        if (
+            args.model == "exphormer"
+            and int(getattr(args, "expander_degree", 0)) <= 0
+            and isinstance(edge_index_eval, torch.Tensor)
+            and edge_index_eval.size(0) == 3
+        ):
+            _self_nn = torch.arange(num_nodes, dtype=torch.long, device=edge_index_eval.device)
+            _self_loops = torch.stack([_self_nn, _self_nn], dim=0)
+            _self_types = torch.zeros(num_nodes, dtype=torch.long, device=edge_index_eval.device)
+            edge_index_eval = torch.cat([
+                torch.cat([edge_index_eval[:2], _self_loops], dim=1),
+                torch.cat([edge_index_eval[2], _self_types]).unsqueeze(0),
+            ], dim=0)
     else:
         edge_index_eval = cached_edge_index
 

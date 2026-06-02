@@ -22,6 +22,7 @@ from torch_scatter import scatter
 
 from gt_sp.initialize import (
     get_sequence_parallel_group,
+    get_sequence_parallel_rank,
     sequence_parallel_is_initialized,
 )
 from gt_sp.gt_layer import DistributedAttentionNodeLevel
@@ -94,7 +95,15 @@ class ExphormerCoreAttention(nn.Module):
 
         # Exphormer edge-feature modulation (Embedding → Linear, matching original E pipeline)
         if edge_type is not None:
-            E = self.edge_proj(self.edge_type_emb(edge_type)).view(-1, num_heads, head_dim)
+            # edge_type_emb/edge_proj are sized for the *full* head count, but under
+            # sequence parallelism q/k/v carry only this rank's head partition
+            # (all-to-all assigns head chunk `sp_rank` to rank `sp_rank`). Reshape E
+            # with the full head count, then slice the local head range so it lines
+            # up with `score` (which has `num_heads` = per-partition heads).
+            E = self.edge_proj(self.edge_type_emb(edge_type)).view(-1, self.num_heads, head_dim)
+            if num_heads != self.num_heads:
+                sp_rank = get_sequence_parallel_rank()
+                E = E[:, sp_rank * num_heads:(sp_rank + 1) * num_heads, :]
             score = torch.mul(score, E)
 
         score = score.sum(-1, keepdim=True).clamp(-5, 5)
