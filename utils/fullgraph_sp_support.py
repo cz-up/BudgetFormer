@@ -20,6 +20,7 @@ from gt_sp.utils import (
     _merge_edge_index_list,
     adjust_edge_index_nomerge,
     build_head_hop_edges,
+    compute_khop_pool_dgl_neighbor,
     clear_random_walk_graph_cache,
     fixed_random_seed_cpu,
     fix_edge_index,
@@ -832,7 +833,10 @@ def _use_real_edges_for_state(args, edge_budget_state=None, adaptive_edge_budget
 
 
 def _use_rw_edges(args, edge_budget_state=None, adaptive_edge_budget_cfg=None) -> bool:
-    if int(getattr(args, "walks_per_node", 0)) <= 0:
+    # DGL neighbour-sampling mode builds the head-hop pool from fanout, not from
+    # random walks, so walks_per_node is irrelevant there — don't gate on it.
+    _dgl_mode = str(getattr(args, "rw_edge_mode", "random_walk")) == "dgl_neighbor"
+    if not _dgl_mode and int(getattr(args, "walks_per_node", 0)) <= 0:
         return False
     if _fixed_edge_budget_enabled(args, adaptive_edge_budget_cfg):
         return _get_rw_edge_budget(args, edge_budget_state, adaptive_edge_budget_cfg) > 0
@@ -1351,6 +1355,20 @@ def _filter_by_dst_csr(csr: _DstEdgeCSR, dst_nodes: torch.Tensor) -> torch.Tenso
     return csr.sorted_edge_index[:, base + local_offset]
 
 
+def _parse_fanout(fanout) -> list:
+    """Parse --fanout into a list of ints. Accepts "10,5", [10,5], or (10,5).
+    Each entry is one hop's neighbour cap; -1 means all neighbours at that hop.
+    """
+    if fanout is None:
+        return [10, 5]
+    if isinstance(fanout, (list, tuple)):
+        items = list(fanout)
+    else:
+        items = [p for p in str(fanout).replace(" ", "").split(",") if p != ""]
+    parsed = [int(x) for x in items]
+    return parsed if parsed else [10, 5]
+
+
 def _build_or_retrieve_full_rw_pool(
     args,
     edge_index_global,
@@ -1378,6 +1396,10 @@ def _build_or_retrieve_full_rw_pool(
     Cross-epoch resampling is preserved: the next epoch's training step
     overwrites the cache with a new ``edge_seed``-keyed entry.
     """
+    # Edge-construction mode: "random_walk" (default) or "dgl_neighbor" (DGL
+    # fanout-based k-hop neighbour sampling). fanout is a comma list, e.g. "10,5".
+    edge_mode = str(getattr(args, "rw_edge_mode", "random_walk"))
+    fanout_list = _parse_fanout(getattr(args, "fanout", "10,5"))
     cache_key = (
         id(edge_index_global),
         int(num_nodes),
@@ -1386,6 +1408,8 @@ def _build_or_retrieve_full_rw_pool(
         int(num_heads),
         int(edge_seed) if edge_seed is not None else None,
         str(rw_device),
+        edge_mode,
+        tuple(fanout_list),
     )
     cached = getattr(args, "_cached_full_rw_pool", None)
     if cached is not None and cached.get("key") == cache_key:
@@ -1398,19 +1422,33 @@ def _build_or_retrieve_full_rw_pool(
         else contextlib.nullcontext()
     )
     with seed_ctx:
-        pool = profile_call(
-            "edge_rw_build",
-            lambda: build_head_hop_edges(
-                edge_index=edge_index_global,
-                num_nodes=num_nodes,
-                num_heads=num_heads,
-                num_groups=1,
+        if edge_mode == "dgl_neighbor":
+            pool = profile_call(
+                "edge_rw_build",
+                lambda: compute_khop_pool_dgl_neighbor(
+                    edge_index=edge_index_global,
+                    num_nodes=num_nodes,
+                    fanout=fanout_list,
+                    device=rw_device,
+                    min_hop=1,
+                    seed=edge_seed,
+                ),
                 device=rw_device,
-                walk_length=walk_length,
-                walks_per_node=walks_per_node,
-            ),
-            device=rw_device,
-        )
+            )
+        else:
+            pool = profile_call(
+                "edge_rw_build",
+                lambda: build_head_hop_edges(
+                    edge_index=edge_index_global,
+                    num_nodes=num_nodes,
+                    num_heads=num_heads,
+                    num_groups=1,
+                    device=rw_device,
+                    walk_length=walk_length,
+                    walks_per_node=walks_per_node,
+                ),
+                device=rw_device,
+            )
     if isinstance(pool, list):
         pool = _merge_edge_index_list(pool)
 
@@ -2701,6 +2739,19 @@ def _build_and_broadcast_edges(args, edge_index_global, num_nodes, device, rw_de
     final_build_device, rw_build_device = _edge_policy_build_devices(resolved_policy, device, rw_device)
     resolved_force_broadcast = _edge_policy_force_broadcast(args, resolved_policy, force_broadcast)
 
+    # DGL's CPU sampler is not bit-identical across SP ranks (multi-threaded RNG),
+    # so the rank-local path would give each rank a DIFFERENT edge_index and the
+    # ranks eventually diverge into mismatched collectives (NCCL deadlock). Force
+    # the broadcast path (only src builds, then broadcasts) for the *training*
+    # build. Callers that explicitly pass force_broadcast=False (e.g. the
+    # multi_tier CPU-prefetch profiling, where each rank just measures its own
+    # local build and cross-rank identity is irrelevant) keep their behaviour.
+    if (
+        str(getattr(args, "rw_edge_mode", "random_walk")) == "dgl_neighbor"
+        and force_broadcast is not False
+    ):
+        resolved_force_broadcast = True
+
     if edge_seed is not None and not resolved_force_broadcast:
         # Rank-local path: all ranks independently build the same edge_index.
         # fixed_random_seed handles both CPU and CUDA RNG (covers gpu rw_device).
@@ -2792,9 +2843,22 @@ def _build_and_broadcast_edges(args, edge_index_global, num_nodes, device, rw_de
                 )
             if _bcast_cache_key is not None:
                 _store_merged_edge_cache(_bcast_cache_key, merged)
-        size_t = torch.tensor([merged.shape[0], merged.shape[1]], device=device, dtype=torch.long)
+    # NCCL only broadcasts CUDA tensors, but `device` may be CPU here (e.g. when
+    # profiling CPU edge policies). Pick a CUDA device for the collective and
+    # move the result back to the requested `device` afterwards.
+    _bcast_dev = torch.device(device)
+    if dist.is_initialized():
+        try:
+            _is_nccl = dist.get_backend(sp_group) == "nccl"
+        except Exception:
+            _is_nccl = torch.cuda.is_available()
+        if _is_nccl and torch.cuda.is_available():
+            _bcast_dev = torch.device(f"cuda:{torch.cuda.current_device()}")
+
+    if sp_rank == sp_src_rank:
+        size_t = torch.tensor([merged.shape[0], merged.shape[1]], device=_bcast_dev, dtype=torch.long)
     else:
-        size_t = torch.empty(2, device=device, dtype=torch.long)
+        size_t = torch.empty(2, device=_bcast_dev, dtype=torch.long)
         merged = None
 
     if dist.is_initialized():
@@ -2804,13 +2868,19 @@ def _build_and_broadcast_edges(args, edge_index_global, num_nodes, device, rw_de
             if sp_rank != sp_src_rank:
                 merged = torch.empty(
                     (int(size_t[0].item()), int(size_t[1].item())),
-                    device=device, dtype=torch.long,
+                    device=_bcast_dev, dtype=torch.long,
                 )
+            elif merged.device != _bcast_dev:
+                merged = merged.to(_bcast_dev, dtype=torch.long)
             dist.broadcast(merged, sp_src_rank, group=sp_group)
 
         payload_bytes = int(merged.numel() * merged.element_size()) if merged is not None else 0
         profile_call("edge_broadcast", _broadcast, device=device, payload_bytes=payload_bytes)
 
+    # Move broadcast result back to the requested device (e.g. CPU for prefetch).
+    if merged is not None and merged.device != torch.device(device):
+        merged = merged.to(device=device, dtype=torch.long,
+                           non_blocking=(torch.device(device).type == "cpu"))
     return merged
 
 

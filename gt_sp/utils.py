@@ -1129,6 +1129,107 @@ def build_head_hop_edges(
     return buckets[0] if buckets else edge_index.new_zeros((2, 0), dtype=edge_index.dtype)
 
 
+def compute_khop_pool_dgl_neighbor(
+    edge_index: Tensor,
+    num_nodes: int,
+    fanout: List[int],
+    device: str = "cpu",
+    min_hop: int = 1,
+    seed: int = None,
+) -> Tensor:
+    """DGL neighbor-sampler based k-hop edge pool (alternative to random walk).
+
+    For every node ``q`` (treated as a query) this performs a fanout-bounded
+    breadth expansion along *out*-edges (the same direction random walks follow):
+    at hop ``d`` it samples up to ``fanout[d-1]`` successors of each current
+    frontier node, tracking which query ``q`` every frontier node descends from.
+    For hops ``>= min_hop`` it emits edges ``(neighbour -> q)`` so query ``q``
+    attends to its sampled hop-``d`` nodes.
+
+    fanout entry ``-1`` means "all neighbours" at that hop (exact k-hop; may OOM
+    on dense graphs — that is expected/accepted for this baseline).
+
+    Returns a ``(2, E)`` LongTensor with the SAME orientation as the RW pool:
+    row 0 = key/value node, row 1 = query node.  No per-query budget truncation
+    is applied here (downstream ``_resolve_rw_edges_for_state`` leaves the pool
+    untouched unless random-block sampling is enabled).
+    """
+    import dgl
+
+    # Seed DGL's sampler RNG so all SP ranks (which call this independently on
+    # the rank-local build path) draw bit-identical samples. Same seed + same
+    # graph + same OMP thread count per rank => identical edges, no broadcast.
+    if seed is not None:
+        dgl.seed(int(seed))
+        torch.manual_seed(int(seed))
+
+    rw_device = torch.device(device)
+    k = len(fanout)
+    if edge_index.numel() == 0 or k == 0:
+        return edge_index.new_zeros((2, 0), dtype=torch.long)
+
+    inferred_nodes = int(edge_index.max().item()) + 1
+    N = max(int(num_nodes), inferred_nodes)
+    src = edge_index[0].to(rw_device).long()
+    dst = edge_index[1].to(rw_device).long()
+    g = dgl.graph((src, dst), num_nodes=N, device=rw_device)
+
+    # Frontier carried as two parallel tensors so provenance (origin query) is
+    # tracked across hops without materialising per-query subgraphs.
+    origin = torch.arange(N, device=rw_device, dtype=torch.long)   # which query
+    current = torch.arange(N, device=rw_device, dtype=torch.long)  # current node
+    src_parts: List[Tensor] = []
+    dst_parts: List[Tensor] = []
+
+    for d in range(1, k + 1):
+        if current.numel() == 0:
+            break
+        f = int(fanout[d - 1])
+        uniq = torch.unique(current)
+        # Sample out-edges (node -> successor) for the unique frontier nodes.
+        sg = dgl.sampling.sample_neighbors(g, uniq, f, edge_dir="out")
+        su, sv = sg.edges()
+        su = su.long()
+        sv = sv.long()
+        if su.numel() == 0:
+            break
+        # Group sampled successors by their source node id.
+        deg = torch.bincount(su, minlength=N)            # successors sampled per node
+        order = torch.argsort(su, stable=True)
+        sv_sorted = sv[order]
+        node_offset = torch.zeros(N + 1, dtype=torch.long, device=rw_device)
+        node_offset[1:] = torch.cumsum(deg, dim=0)
+        # Expand each frontier entry to all sampled successors of its node.
+        cnt = deg[current]                               # successors for each entry
+        keep = cnt > 0
+        if not bool(keep.any()):
+            break
+        origin_k = origin[keep]
+        current_k = current[keep]
+        cnt_k = cnt[keep]
+        total = int(cnt_k.sum().item())
+        # Ragged gather: entry i contributes sv_sorted[off[c]:off[c]+cnt] for c=current_k[i].
+        seg_start = node_offset[current_k].repeat_interleave(cnt_k)
+        entry_start = torch.zeros_like(cnt_k)
+        if cnt_k.numel() > 1:
+            entry_start[1:] = torch.cumsum(cnt_k, dim=0)[:-1]
+        within = torch.arange(total, device=rw_device) - entry_start.repeat_interleave(cnt_k)
+        gather_idx = seg_start + within
+        new_nodes = sv_sorted[gather_idx]                # successor per expanded entry
+        new_origin = origin_k.repeat_interleave(cnt_k)
+
+        if d >= min_hop:
+            nz = new_nodes != new_origin                 # drop trivial self edges
+            src_parts.append(new_nodes[nz])              # key/value
+            dst_parts.append(new_origin[nz])             # query
+        origin = new_origin
+        current = new_nodes
+
+    if not src_parts:
+        return edge_index.new_zeros((2, 0), dtype=torch.long)
+    return torch.stack([torch.cat(src_parts), torch.cat(dst_parts)], dim=0).to(torch.long)
+
+
 def _run_random_walk(edge_index: Tensor, rowptr: Tensor, col: Tensor, starts: Tensor, walk_length: int) -> Tensor:
     # DGL path: better CPU parallelism (OpenMP) for CPU-resident graphs.
     # Only used on CPU from the main thread; background prefetch threads fall

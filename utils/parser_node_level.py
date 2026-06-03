@@ -121,6 +121,24 @@ def add_node_common_args(parser, defaults=None):
         help="head hop random walks per node",
     )
     parser.add_argument(
+        "--rw_edge_mode",
+        type=str,
+        default=defaults.get("rw_edge_mode", "random_walk"),
+        choices=["random_walk", "dgl_neighbor"],
+        help="how to build the head-hop edge pool: 'random_walk' (default) or "
+             "'dgl_neighbor' (DGL fanout-based k-hop neighbour sampling). "
+             "dgl_neighbor requires --walks_per_node > 0 to enable the rw branch; "
+             "walk_length/walks_per_node are otherwise ignored in this mode.",
+    )
+    parser.add_argument(
+        "--fanout",
+        type=str,
+        default=defaults.get("fanout", "10,5"),
+        help="comma-separated per-hop fanout for --rw_edge_mode dgl_neighbor, "
+             "e.g. '10,5' (2-hop). -1 at a hop means all neighbours (exact k-hop, "
+             "may OOM on dense graphs). Ignored for random_walk mode.",
+    )
+    parser.add_argument(
         "--edge_build_device",
         type=str,
         default=defaults.get("edge_build_device", "same"),

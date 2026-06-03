@@ -271,7 +271,7 @@ def main():
                 and max(adaptive_edge_budget_cfg.max_total_edges_per_query, edge_budget_controller.real_budget) > 0
             )
             or (
-                int(getattr(args, "head_hop_walks_per_node", 0)) > 0
+                int(getattr(args, "walks_per_node", 0)) > 0
                 and max(adaptive_edge_budget_cfg.max_total_edges_per_query, edge_budget_controller.rw_budget) > 0
             )
         )
@@ -519,6 +519,13 @@ def main():
         if _prefetch_future is not None:
             return False
         if next_epoch > args.epochs:
+            return False
+        # DGL is not thread-safe: its sampler deadlocks when called from a
+        # background thread concurrently with GPU training on the main thread
+        # (same reason the RW path falls back to torch_cluster off the main
+        # thread). The dgl_neighbor builder has no thread-safe fallback, so
+        # disable background prefetch entirely and build edges foreground.
+        if str(getattr(args, "rw_edge_mode", "random_walk")) == "dgl_neighbor":
             return False
         if (
             not use_epoch_seed
