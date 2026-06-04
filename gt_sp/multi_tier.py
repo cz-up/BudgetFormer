@@ -172,6 +172,12 @@ class _MultiTierResourceManager:
         # OOMs. The planner skips candidate plans that use the disabled tier.
         self._t1_infeasible: bool = False
         self._t4_infeasible: bool = False
+        # Set when the *_FRONT probe is skipped because keeping that tier on a
+        # non-last layer is predicted to OOM (peak_warmup + M_layer > 90% GPU).
+        # The planner then only has a reliable cost for the tier on the single
+        # deepest layer, so it must NOT place the tier on any non-last position.
+        self._t1_nonlast_infeasible: bool = False
+        self._t4_nonlast_infeasible: bool = False
 
         # --- Final plan ---
         self._cache_edge:          bool = False
@@ -558,8 +564,12 @@ class _MultiTierResourceManager:
                         f"[MultiTierManager] Skipping CALIBRATE_MHA_FRONT: "
                         f"est_peak={_peak_est_front/(1024**2):.0f} MiB > "
                         f"90% physical ({int(_physical_gpu*0.90)/(1024**2):.0f} MiB). "
-                        f"Using last-layer M_layer^mha={m_mha_last/(1024**2):.1f} MiB."
+                        f"Using last-layer M_layer^mha={m_mha_last/(1024**2):.1f} MiB. "
+                        f"keep_mha restricted to the last layer only."
                     )
+                # A non-last keep_mha layer would OOM, so the planner may only
+                # place keep_mha on the single deepest layer.
+                self._t1_nonlast_infeasible = True
                 self._state = self._CALIBRATE_RETAIN
             else:
                 self._state = self._CALIBRATE_MHA_FRONT
@@ -650,8 +660,12 @@ class _MultiTierResourceManager:
                         f"[MultiTierManager] Skipping CALIBRATE_RETAIN_FRONT: "
                         f"est_peak={_peak_est_front/(1024**2):.0f} MiB > "
                         f"90% physical ({int(_physical_gpu*0.90)/(1024**2):.0f} MiB). "
-                        f"Using last-layer M_layer^full={m_full_last/(1024**2):.1f} MiB."
+                        f"Using last-layer M_layer^full={m_full_last/(1024**2):.1f} MiB. "
+                        f"retain restricted to the last layer only."
                     )
+                # A non-last retain layer would OOM, so the planner may only
+                # place retain on the single deepest layer.
+                self._t4_nonlast_infeasible = True
                 self._run_active_plan(device, total_gpu)
             else:
                 self._state = self._CALIBRATE_RETAIN_FRONT
@@ -893,6 +907,19 @@ class _MultiTierResourceManager:
                 if k_ret > 0 and self._t4_infeasible:
                     continue
                 k_rec = L - k_keep - k_ret
+                # FRONT-skip constraints: a tier whose non-last placement was
+                # judged infeasible may appear ONLY on the single deepest layer.
+                # Layout is [R]*k_rec + [K]*k_keep + [N]*k_ret (retain deepest),
+                # so keep_mha is on the last layer iff k_keep==1 and k_ret==0;
+                # retain is on the last layer iff k_ret==1.
+                if (
+                    self._t1_nonlast_infeasible
+                    and k_keep > 0
+                    and not (k_keep == 1 and k_ret == 0)
+                ):
+                    continue
+                if self._t4_nonlast_infeasible and k_ret > 1:
+                    continue
                 extra_k = max(0, k_keep - 1)
                 extra_r = max(0, k_ret - 1)
                 m_mha_scaled = int(m_mha * (1.0 + _FRAG_FACTOR * extra_k))
