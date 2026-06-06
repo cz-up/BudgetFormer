@@ -755,6 +755,10 @@ class _AdaptiveEdgeBudgetConfig:
     patience: int
     max_total_edges_per_query: int
     static_seed_epochs: int
+    # Max rw edges realisable per query = walks_per_node * walk_length (the RW
+    # pool size). rw budget is capped at this so the controller never searches
+    # an unfillable rw region. 0 = unknown -> no cap.
+    rw_max_per_query: int = 0
 
 
 def _random_block_sampling_enabled(args, adaptive_edge_budget_cfg=None) -> bool:
@@ -873,6 +877,12 @@ def _resolve_adaptive_edge_budget_config(args, valid_size: int) -> _AdaptiveEdge
             static_seed_epochs = 0
     static_seed_epochs = max(0, static_seed_epochs)
 
+    # RW pool size per query = walks_per_node * walk_length (upper bound on rw
+    # edges a single query can realise). Used to cap the rw budget.
+    _P = int(getattr(args, "walks_per_node", 0))
+    _L = int(getattr(args, "walk_length", 0))
+    rw_max_per_query = max(0, _P * _L)
+
     return _AdaptiveEdgeBudgetConfig(
         enabled=enabled,
         probe_size=probe_size,
@@ -881,6 +891,7 @@ def _resolve_adaptive_edge_budget_config(args, valid_size: int) -> _AdaptiveEdge
         patience=patience,
         max_total_edges_per_query=max(0, int(getattr(args, "max_total_edges_per_query", 0))),
         static_seed_epochs=static_seed_epochs,
+        rw_max_per_query=rw_max_per_query,
     )
 
 
@@ -1673,8 +1684,14 @@ class _AdaptiveEdgeBudgetController:
             self.walk_length = None
             return
 
+        # rw can never realise more than walks_per_node*walk_length candidates
+        # per query, so cap the rw budget there (any rw budget above this is an
+        # unfillable upper bound). Freed headroom stays available to real and is
+        # taken only if the probe says it helps.
+        _pl = int(getattr(config, "rw_max_per_query", 0))
+        self.rw_max = min(self.max_total, _pl) if _pl > 0 else self.max_total
         self.real_budget = 2 if self.max_total > 0 else 0
-        self.rw_budget = 2 if self.max_total > 0 else 0
+        self.rw_budget = min(2, self.rw_max) if self.max_total > 0 else 0
         self.walk_length = None
         # Dynamic confirmation: the n-th budget adjustment requires n consecutive
         # wins before committing (capped at _max_confirm_rounds).  Early moves
@@ -1697,21 +1714,27 @@ class _AdaptiveEdgeBudgetController:
 
     def candidate_states(self):
         out = {}
+        _rw_can_grow = self.rw_budget + self.block_size <= self.rw_max
         # Expand total budget if headroom remains.
         if self.real_budget + self.rw_budget + self.block_size <= self.max_total:
             real_up = {
                 "real_edges_per_query": self.real_budget + self.block_size,
                 "rw_edges_per_query": self.rw_budget,
             }
-            rw_up = {
-                "real_edges_per_query": self.real_budget,
-                "rw_edges_per_query": self.rw_budget + self.block_size,
-            }
             if self.walk_length is not None:
                 real_up["walk_length"] = int(self.walk_length)
-                rw_up["walk_length"] = int(self.walk_length)
             out["real_up"] = real_up
-            out["rw_up"] = rw_up
+            # rw can only grow while there are still realisable rw candidates
+            # (rw_budget < walks_per_node*walk_length); otherwise growing it is a
+            # no-op upper bound, so don't offer it.
+            if _rw_can_grow:
+                rw_up = {
+                    "real_edges_per_query": self.real_budget,
+                    "rw_edges_per_query": self.rw_budget + self.block_size,
+                }
+                if self.walk_length is not None:
+                    rw_up["walk_length"] = int(self.walk_length)
+                out["rw_up"] = rw_up
         # At the budget ceiling: offer incremental shift candidates so the
         # controller can redistribute between real and rw even after both sides
         # have grown.  Dynamic confirmation (in update()) prevents noise-driven
@@ -1725,7 +1748,7 @@ class _AdaptiveEdgeBudgetController:
                 if self.walk_length is not None:
                     cand["walk_length"] = int(self.walk_length)
                 out["shift_to_real"] = cand
-            if self.real_budget >= self.block_size:
+            if self.real_budget >= self.block_size and _rw_can_grow:
                 cand = {
                     "real_edges_per_query": self.real_budget - self.block_size,
                     "rw_edges_per_query":   self.rw_budget + self.block_size,
