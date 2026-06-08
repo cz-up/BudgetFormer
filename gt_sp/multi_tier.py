@@ -146,8 +146,10 @@ class _MultiTierResourceManager:
         self._peak_warmup:           int   = 0
         self._peak_mha:              int   = 0   # consolidated max(last, front)
         self._peak_mha_front:        int   = 0
+        self._peak_mha_last:         int   = 0   # last-layer-only probe (cheap; deepest tier)
         self._peak_retain:           int   = 0   # consolidated max(last, front)
         self._peak_retain_front:     int   = 0
+        self._peak_retain_last:      int   = 0   # last-layer-only probe (cheap; deepest tier)
         self._t_fwd_recompute:    float = 0.0
         self._t_fwd_offload:      float = 0.0
         self._t_fwd_mha:          float = 0.0
@@ -548,6 +550,7 @@ class _MultiTierResourceManager:
                     self._sync_max_scalar(float(t_bwd), device, torch.float64)
                 )
             self._peak_mha = _peak_mha_last   # may be updated after FRONT probe
+            self._peak_mha_last = _peak_mha_last   # preserved; the FRONT max never overwrites this
             m_mha_last = self._fwd_live_mha - self._fwd_live_warmup
             self._m_layer_mha = max(m_mha_last, 1)
             # Pre-check: FRONT probe requires first-layer MHA to persist through
@@ -632,6 +635,7 @@ class _MultiTierResourceManager:
                     self._sync_max_scalar(float(t_bwd), device, torch.float64)
                 )
             self._peak_retain = _peak_retain_last   # may be updated after FRONT probe
+            self._peak_retain_last = _peak_retain_last   # preserved; the FRONT max never overwrites this
             m_full_last = self._fwd_live_retain - self._fwd_live_warmup
             self._m_layer_full = max(m_full_last, 1)
             if is_r0:
@@ -785,7 +789,7 @@ class _MultiTierResourceManager:
                 continue
 
             policy_best_t = float("inf")
-            for tiers, k_off, cpu_est, peak_est, t_fwd_est, t_bwd_est, t_model_est in self._enumerate_structured_plans(
+            for tiers, tie_break, cpu_est, peak_est, t_fwd_est, t_bwd_est, t_model_est in self._enumerate_structured_plans(
                 peak_limit=peak_limit,
                 cpu_budget=cpu_budget,
                 edge_peak=edge_peak,
@@ -795,7 +799,7 @@ class _MultiTierResourceManager:
                 policy_best_t = min(policy_best_t, t_est)
                 key = (
                     t_est,
-                    k_off,
+                    tie_break,
                     cpu_est,
                     int(edge_peak > 0),
                     prep_cpu_delta,
@@ -858,8 +862,8 @@ class _MultiTierResourceManager:
                 f"peak_limit={peak_limit/(1024**2):.0f} MiB  "
                 f"transient_limit={transient_limit/(1024**2):.0f} MiB"
                 f"{'(relaxed)' if _exp_seg else ''}  "
-                f"net_delta(mha/retain)={(self._peak_mha - self._peak_warmup)/(1024**2):+.1f}"
-                f"/{(self._peak_retain - self._peak_warmup)/(1024**2):+.1f} MiB  "
+                f"last_delta(mha/retain)={(self._peak_mha_last - self._peak_warmup)/(1024**2):+.1f}"
+                f"/{(self._peak_retain_last - self._peak_warmup)/(1024**2):+.1f} MiB  "
                 f"est_T_step={best_step_time*1000:.0f} ms "
                 f"(model={best_model_time*1000:.0f} ms "
                 f"fwd={best_fwd_time*1000:.0f} ms "
@@ -888,11 +892,35 @@ class _MultiTierResourceManager:
         t_r = self._t_bwd_recompute / L
         t_k = max(t_r + (self._t_bwd_mha - self._t_bwd_recompute), 0.0)
         t_n = max(t_r + (self._t_bwd_retain - self._t_bwd_recompute), 0.0)
+        # Physical monotonicity. By construction retain does strictly LESS
+        # backward work than keep_mha, which does less than recompute: retain
+        # stores the whole layer (no recomputation), keep_mha recomputes
+        # everything except the saved MHA output, and recompute redoes the full
+        # layer. Hence the true per-layer times must satisfy t_n <= t_k <= t_r
+        # (and likewise for forward). On small/fast graphs the single-sample
+        # calibration noise (a few ms) can exceed the genuine tier gap and rank
+        # the heavier tier as "faster" (e.g. arxiv measured t_bwd_retain >
+        # t_bwd_mha), which would make the planner choose keep_mha where retain
+        # is strictly better. Clamp to restore the physical ordering.
+        t_k = min(t_k, t_r)
+        t_n = min(t_n, t_k)
+        t_f_k = min(t_f_k, t_f_r)
+        t_f_n = min(t_f_n, t_f_k)
 
         m_full = int(self._m_layer_full)
         m_mha = int(self._m_layer_mha)
-        mha_delta = self._peak_mha - self._peak_warmup
-        retain_delta = self._peak_retain - self._peak_warmup
+        # Position-aware deltas. In the structured layout
+        #   [R]*k_rec + [K]*k_keep + [N]*k_ret      (retain is deepest)
+        # the kept/retained tiers always occupy the DEEP suffix, so the single
+        # deepest occupied layer is the LAST layer. Its saved activation is
+        # consumed first in the backward pass and freed before the recompute
+        # prefix runs, so it barely raises the peak — use the cheap last-layer
+        # delta measured directly by CALIBRATE_MHA/RETAIN (≈ tens–hundreds MiB),
+        # NOT the FRONT/worst-case delta (a full layer activation). Only the
+        # ADDITIONAL, shallower kept/retained layers persist long enough to
+        # coexist with later work and must each be charged a full layer.
+        mha_delta_last = max(self._peak_mha_last - self._peak_warmup, 0)
+        retain_delta_last = max(self._peak_retain_last - self._peak_warmup, 0)
         # 5% per-additional-layer fragmentation factor: the memory allocator
         # cannot always pack multiple live activation tensors contiguously, so
         # the measured single-layer delta under-estimates the true peak for
@@ -920,12 +948,28 @@ class _MultiTierResourceManager:
                     continue
                 if self._t4_nonlast_infeasible and k_ret > 1:
                     continue
-                extra_k = max(0, k_keep - 1)
-                extra_r = max(0, k_ret - 1)
-                m_mha_scaled = int(m_mha * (1.0 + _FRAG_FACTOR * extra_k))
-                m_full_scaled = int(m_full * (1.0 + _FRAG_FACTOR * extra_r))
-                mha_extra = (mha_delta + extra_k * m_mha_scaled) if k_keep > 0 else 0
-                retain_extra = (retain_delta + extra_r * m_full_scaled) if k_ret > 0 else 0
+                # Position-aware suffix cost: the deepest occupied layer (always
+                # the LAST layer) is charged its cheap last-layer delta; every
+                # shallower kept/retained layer is charged a full activation.
+                if k_ret > 0:
+                    # retain is deepest -> last layer is retain (cheap);
+                    # (k_ret-1) shallower retains + all k_keep keeps are full.
+                    nr = k_ret - 1                       # non-last retain layers
+                    nk = k_keep                          # all keep layers non-last
+                    m_full_scaled = int(m_full * (1.0 + _FRAG_FACTOR * max(0, nr - 1)))
+                    m_mha_scaled = int(m_mha * (1.0 + _FRAG_FACTOR * max(0, nk - 1)))
+                    retain_extra = retain_delta_last + nr * m_full_scaled
+                    mha_extra = nk * m_mha_scaled
+                elif k_keep > 0:
+                    # no retain -> last layer is keep_mha (cheap);
+                    # (k_keep-1) shallower keeps are full.
+                    nk = k_keep - 1                      # non-last keep layers
+                    m_mha_scaled = int(m_mha * (1.0 + _FRAG_FACTOR * max(0, nk - 1)))
+                    mha_extra = mha_delta_last + nk * m_mha_scaled
+                    retain_extra = 0
+                else:
+                    mha_extra = 0
+                    retain_extra = 0
                 net_fwd_extra = max(0, mha_extra + retain_extra)
                 peak_est = self._peak_warmup + edge_peak + net_fwd_extra
                 if peak_est > peak_limit:
@@ -938,7 +982,15 @@ class _MultiTierResourceManager:
                 t_fwd_est = (k_rec * t_f_r) + (k_keep * t_f_k) + (k_ret * t_f_n)
                 t_bwd_est = (k_rec * t_r) + (k_keep * t_k) + (k_ret * t_n)
                 t_model_est = t_fwd_est + t_bwd_est
-                candidates.append((tiers, 0, 0, peak_est, t_fwd_est, t_bwd_est, t_model_est))
+                # Tie-break (smaller wins, applied only when t_est is equal):
+                # once monotonicity is enforced t_n == t_k can tie, so prefer the
+                # plan that retains more (and keeps more over recompute). retain
+                # is exact (no recompute) and strictly the lightest-compute tier,
+                # so when memory allows it is the right choice — matching the
+                # intuition that if N fits on every layer the planner should pick
+                # all-retain rather than all-keep.
+                tie_break = -(2 * k_ret + k_keep)
+                candidates.append((tiers, tie_break, 0, peak_est, t_fwd_est, t_bwd_est, t_model_est))
         return candidates
 
     def mode(self, layer_idx: int) -> str:
