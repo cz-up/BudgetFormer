@@ -1046,19 +1046,32 @@ def _sample_random_edge_blocks(args, real_edges, rw_edges, edge_seed=None, adapt
     real_budget = _get_real_edge_budget(args, adaptive_edge_budget_cfg=adaptive_edge_budget_cfg)
     rw_budget = _get_rw_edge_budget(args, adaptive_edge_budget_cfg=adaptive_edge_budget_cfg)
 
-    if real_edges is not None and real_budget > 0:
-        real_edges = _sample_edges_per_query_random(
-            real_edges,
-            real_budget,
-            _edge_block_seed(args, edge_seed, 17),
-        )
+    # A budget of 0 means "use none of this edge type". The pools are shared
+    # across candidates (CRN coupling), so a 0-budget side MUST be dropped
+    # explicitly: otherwise the full, un-sampled pool leaks downstream into
+    # _assemble_edges_from_pools (which unconditionally concatenates a non-empty
+    # rw/real tensor). That both inflates a 0-component candidate's edge set by
+    # the entire pool (a memory spike that scales with P*L) and makes its probe
+    # loss reflect the wrong graph, biasing the budget decision.
+    if real_edges is not None:
+        if real_budget > 0:
+            real_edges = _sample_edges_per_query_random(
+                real_edges,
+                real_budget,
+                _edge_block_seed(args, edge_seed, 17),
+            )
+        else:
+            real_edges = None
 
-    if rw_edges is not None and rw_budget > 0:
-        rw_edges = _sample_edges_per_query_random(
-            rw_edges,
-            rw_budget,
-            _edge_block_seed(args, edge_seed, 37),
-        )
+    if rw_edges is not None:
+        if rw_budget > 0:
+            rw_edges = _sample_edges_per_query_random(
+                rw_edges,
+                rw_budget,
+                _edge_block_seed(args, edge_seed, 37),
+            )
+        else:
+            rw_edges = None
 
     return real_edges, rw_edges
 
@@ -1077,19 +1090,32 @@ def _sample_random_edge_blocks_with_state(
     real_budget = _get_real_edge_budget(args, edge_budget_state, adaptive_edge_budget_cfg)
     rw_budget = _get_rw_edge_budget(args, edge_budget_state, adaptive_edge_budget_cfg)
 
-    if real_edges is not None and real_budget > 0:
-        real_edges = _sample_edges_per_query_random(
-            real_edges,
-            real_budget,
-            _edge_block_seed(args, edge_seed, 17),
-        )
+    # A budget of 0 means "use none of this edge type". The pools are shared
+    # across candidates (CRN coupling), so a 0-budget side MUST be dropped
+    # explicitly: otherwise the full, un-sampled pool leaks downstream into
+    # _assemble_edges_from_pools (which unconditionally concatenates a non-empty
+    # rw/real tensor). That both inflates a 0-component candidate's edge set by
+    # the entire pool (a memory spike that scales with P*L) and makes its probe
+    # loss reflect the wrong graph, biasing the budget decision.
+    if real_edges is not None:
+        if real_budget > 0:
+            real_edges = _sample_edges_per_query_random(
+                real_edges,
+                real_budget,
+                _edge_block_seed(args, edge_seed, 17),
+            )
+        else:
+            real_edges = None
 
-    if rw_edges is not None and rw_budget > 0:
-        rw_edges = _sample_edges_per_query_random(
-            rw_edges,
-            rw_budget,
-            _edge_block_seed(args, edge_seed, 37),
-        )
+    if rw_edges is not None:
+        if rw_budget > 0:
+            rw_edges = _sample_edges_per_query_random(
+                rw_edges,
+                rw_budget,
+                _edge_block_seed(args, edge_seed, 37),
+            )
+        else:
+            rw_edges = None
 
     return real_edges, rw_edges
 
