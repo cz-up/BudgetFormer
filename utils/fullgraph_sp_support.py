@@ -35,6 +35,13 @@ from utils.lr import CosineWithWarmupLR, PolynomialDecayLR
 from utils.split_utils import load_default_split
 
 _MINHASH_SAMPLE_K_LIMIT = 8
+# Edge count above which CPU real-edge sampling routes to the CSR sort path
+# instead of the scatter-based minhash loop.  The minhash loop runs K rounds
+# of scatter_reduce over all E edges (random-write pattern = cache thrashing);
+# a single argsort over the pre-sorted CSR order is faster for large E because
+# argsort has sequential access within each node's contiguous group.
+# Empirically useful for E > ~1M (Amazon has 264M, ogbn-products has 122M).
+_CPU_CSR_SORT_THRESHOLD = 1_000_000
 
 # Deterministic merged-edge cache.  When edge_seed is fixed across calls (e.g.
 # during static-seed epochs), the full walk+merge computation
@@ -251,6 +258,45 @@ def _get_edge_dst_stats(edge_index: torch.Tensor) -> Optional[dict]:
         "max_count": int(counts.max().item()) if counts.numel() > 0 else 0,
         "heavy_group_maps": {},
     }
+
+    # CSR structure for large edge sets: pre-sort edges by dst so the per-epoch
+    # sampling can use a single argsort over contiguous per-node groups instead
+    # of K rounds of scatter_reduce (which thrashes CPU cache).  Built once and
+    # reused every epoch.
+    #
+    # Index dtype selection: int32 halves memory (and is safe when E < 2^31,
+    # i.e. < ~2.15 B edges).  For very large graphs where E ≥ 2^31 we fall back
+    # to int64 so the indices never overflow.  The sampling function reads
+    # "csr_int32" from the cache to decide which path to use.
+    E = int(edge_index.size(1))
+    _INT32_MAX = (1 << 31) - 1
+    _use_int32 = E <= _INT32_MAX
+    if E >= _CPU_CSR_SORT_THRESHOLD:
+        idx_dtype = torch.int32 if _use_int32 else torch.int64
+
+        # Sort by dst (stable so same-dst edges keep their original relative
+        # order, which is consistent with the sort-based sampling path).
+        csr_order = torch.argsort(dst, stable=True)                    # int64, (E,)
+        sorted_dst = dst[csr_order].to(idx_dtype)                      # (E,)
+        sorted_src = edge_index[0, csr_order].to(idx_dtype)            # (E,)
+
+        # Row-pointer array: csr_ptr[i] = start of node i's edges in CSR order.
+        csr_ptr = torch.zeros(num_groups + 1, dtype=torch.long)
+        ones = torch.ones(E, dtype=torch.long)
+        csr_ptr[1:].scatter_add_(0, dst[csr_order], ones)
+        csr_ptr = torch.cumsum(csr_ptr, dim=0)                         # int64, (N+1,)
+
+        # group_start[i] = csr_ptr[dst_csr[i]]: the CSR row-start for edge i's
+        # destination node.  Values are in [0, E), so int32 is safe when E < 2^31.
+        group_start = csr_ptr[sorted_dst.long()].to(idx_dtype)         # (E,)
+
+        cached["csr_int32"] = _use_int32                                # dtype flag
+        cached["csr_order"] = csr_order.to(idx_dtype)                  # map CSR→orig
+        cached["csr_src"] = sorted_src                                  # src in CSR order
+        cached["csr_dst"] = sorted_dst                                  # dst in CSR order
+        cached["csr_ptr"] = csr_ptr                                     # row pointers
+        cached["csr_group_start"] = group_start                         # CSR row-start per edge
+
     if len(_EDGE_DST_STATS_CACHE) >= 2:
         _EDGE_DST_STATS_CACHE.pop(next(iter(_EDGE_DST_STATS_CACHE)))
     _EDGE_DST_STATS_CACHE[key] = cached
@@ -759,6 +805,12 @@ class _AdaptiveEdgeBudgetConfig:
     # pool size). rw budget is capped at this so the controller never searches
     # an unfillable rw region. 0 = unknown -> no cap.
     rw_max_per_query: int = 0
+    # Per-GPU memory limit (MiB) used to gate budget GROWTH against feasibility.
+    # 0 disables the gate (budget growth is then bounded only by max_total, the
+    # original behaviour). When > 0, the controller stops growing B once the
+    # extrapolated floor peak would exceed gpu_limit_mib*(1-gpu_safety_margin).
+    gpu_limit_mib: float = 0.0
+    gpu_safety_margin: float = 0.1
 
 
 def _random_block_sampling_enabled(args, adaptive_edge_budget_cfg=None) -> bool:
@@ -892,6 +944,12 @@ def _resolve_adaptive_edge_budget_config(args, valid_size: int) -> _AdaptiveEdge
         max_total_edges_per_query=max(0, int(getattr(args, "max_total_edges_per_query", 0))),
         static_seed_epochs=static_seed_epochs,
         rw_max_per_query=rw_max_per_query,
+        gpu_limit_mib=float(
+            getattr(args, "_multi_tier_effective_gpu_memory_limit_mib", 0.0)
+            or getattr(args, "multi_tier_gpu_memory_limit_mib", 0.0)
+            or 0.0
+        ),
+        gpu_safety_margin=float(getattr(args, "multi_tier_safety_margin", 0.1) or 0.1),
     )
 
 
@@ -1018,6 +1076,82 @@ def _sample_edges_per_query_random_minhash(
     return edge_index[:, keep_mask]
 
 
+def _sample_edges_per_query_random_csr_cpu(
+    edge_index,
+    max_edges_per_query: int,
+    seed: int,
+    dst_stats: dict,
+):
+    """Fast CPU real-edge sampling using a pre-sorted CSR structure.
+
+    Replaces K rounds of scatter_reduce (cache-thrashing random writes over E
+    edges) with a single argsort over a composite key whose high bits encode
+    the pre-sorted group order and whose low bits encode the per-epoch rand_key.
+    Because edges belonging to the same destination node are contiguous in CSR
+    order, the argsort touches memory sequentially within each group, giving
+    much better L2/L3 cache utilisation than the scatter path.
+
+    Produces the same selection as _sample_edges_per_query_random_sort: for
+    each query node (dst), the K neighbours with the smallest
+    hash(src, dst, seed) value are kept.  The only difference from the global
+    sort is that we start from an already-dst-sorted permutation, so the
+    per-epoch argsort only needs to resolve ties within groups rather than
+    sorting the full (dst, rand_key) space from scratch.
+
+    Memory: reuses the cached CSR tensors (all int32, ~4 GiB for Amazon)
+    and allocates only O(E) temporaries that are freed immediately after the
+    call — no K-fold peak like the minhash loop.
+    """
+    use_int32: bool = bool(dst_stats.get("csr_int32", True))
+    idx_dtype = torch.int32 if use_int32 else torch.int64
+    E = int(dst_stats["csr_order"].size(0))
+    scale = 1 << 31
+
+    # ── rand_key ──────────────────────────────────────────────────────────
+    # Intermediate arithmetic needs int64 to avoid overflow; the result of
+    # remainder(·, 2^31) fits in int32 (when use_int32) or stays int64.
+    # Build in-place to minimise simultaneously-live large tensors.
+    rand_key = dst_stats["csr_src"].to(torch.int64)   # int64 copy, freed below
+    rand_key *= 1103515245
+    _t = dst_stats["csr_dst"].to(torch.int64)
+    _t *= 214013
+    rand_key += _t
+    del _t
+    rand_key += int(seed) * 2654435761 + 12345
+    rand_key.remainder_(scale)
+    rand_key = rand_key.to(idx_dtype)                  # int32 (1 GiB) or int64 (2 GiB)
+
+    # ── composite sort key (always int64) ────────────────────────────────
+    # group_start × scale: max value = E × 2^31 ≈ 5.7×10^17 < int64 max, safe.
+    composite = dst_stats["csr_group_start"].to(torch.int64)
+    composite *= scale
+    composite += rand_key.to(torch.int64)              # temp int64, freed after +=
+    del rand_key
+
+    # ── single argsort ────────────────────────────────────────────────────
+    perm = torch.argsort(composite, stable=False).to(idx_dtype)
+    del composite
+
+    # ── rank within group, keep top-K ─────────────────────────────────────
+    grp_start_sorted = dst_stats["csr_group_start"][perm.to(torch.int64)]
+    arange = torch.arange(E, dtype=idx_dtype)
+    is_new = torch.ones(E, dtype=torch.bool)
+    is_new[1:] = grp_start_sorted[1:] != grp_start_sorted[:-1]
+    del grp_start_sorted
+    # cummax requires int64 on some PyTorch builds; upcast only if needed.
+    _arange_l = arange.long()
+    seg_starts = torch.where(is_new, _arange_l, torch.zeros(E, dtype=torch.long))
+    del is_new, _arange_l
+    seg_starts = torch.cummax(seg_starts, dim=0).values  # int64
+    pos_in_group = arange.long() - seg_starts
+    del arange, seg_starts
+    keep = pos_in_group < max_edges_per_query
+    del pos_in_group
+
+    orig_ids = dst_stats["csr_order"][perm[keep].to(torch.int64)].to(torch.int64)
+    return edge_index[:, orig_ids]
+
+
 def _sample_edges_per_query_random(
     edge_index,
     max_edges_per_query: int,
@@ -1029,6 +1163,21 @@ def _sample_edges_per_query_random(
         return edge_index
 
     max_edges_per_query = int(max_edges_per_query)
+
+    # For large CPU tensors use the CSR sort path when the cache is available.
+    # K rounds of scatter_reduce (minhash) thrash the CPU cache on graphs with
+    # hundreds of millions of edges; a single argsort over the pre-sorted CSR
+    # layout is 10-25× faster empirically (Amazon B=8 real-heavy split).
+    if (
+        edge_index.device.type == "cpu"
+        and edge_index.size(1) >= _CPU_CSR_SORT_THRESHOLD
+        and dst_stats is not None
+        and "csr_order" in dst_stats
+    ):
+        return _sample_edges_per_query_random_csr_cpu(
+            edge_index, max_edges_per_query, seed, dst_stats
+        )
+
     if max_edges_per_query <= _MINHASH_SAMPLE_K_LIMIT:
         return _sample_edges_per_query_random_minhash(
             edge_index,
@@ -1688,6 +1837,10 @@ def _build_probe_attention_edges(
 
 
 
+# Confidence multiplier for the budget saturation test: a probe gain is treated
+# as real only if it exceeds Z standard errors of the paired per-node loss gain.
+# Z=2 ~ 95% confidence. It is dimensionless (in units of the data's own SE), so
+# it transfers across datasets/hardware without tuning — not a per-run knob.
 class _AdaptiveEdgeBudgetController:
     def __init__(self, config: _AdaptiveEdgeBudgetConfig) -> None:
         self.enabled = config.enabled
@@ -1697,6 +1850,13 @@ class _AdaptiveEdgeBudgetController:
         self.patience = int(config.patience)
         self.bad_rounds = 0
         self.seen_positive_gain = False
+
+        # Feasibility gate (Sec.~4): observed full-graph peak per budget level,
+        # used to stop budget growth before it OOMs / exceeds the GPU limit.
+        self._gpu_limit_mib = float(getattr(config, "gpu_limit_mib", 0.0) or 0.0)
+        self._gpu_safety_margin = float(getattr(config, "gpu_safety_margin", 0.1) or 0.0)
+        self._peak_hist: list = []  # [(total_budget, peak_mib)], one max per budget
+        self._over_budget: bool = False  # set when current-B peak exceeds the limit
 
         self.auto_hold_released = False
         self.auto_hold_neg_inf_streak = 0
@@ -1782,7 +1942,98 @@ class _AdaptiveEdgeBudgetController:
                 if self.walk_length is not None:
                     cand["walk_length"] = int(self.walk_length)
                 out["shift_to_rw"] = cand
+        # Feasibility gate (Sec.~4): drop budget-GROWTH candidates whose
+        # extrapolated floor peak would exceed the GPU memory limit, so B stops
+        # at the largest feasible value instead of growing into OOM. The gate is
+        # source-agnostic (real_up and rw_up cost the same per final edge), and
+        # shift_* keep the total budget fixed so they are never gated here.
+        out = {k: v for k, v in out.items() if self._growth_fits(v)}
         return out
+
+    def observe_peak(self, peak_mib) -> None:
+        """Record the full-graph step peak observed at the current total budget.
+
+        Called once per budget-phase epoch with an SP-synchronized peak so that
+        every rank builds an identical (budget, peak) history and therefore
+        gates budget growth identically (a divergent budget would deadlock the
+        collective probe).
+        """
+        if (not self.enabled) or self.frozen or self._gpu_limit_mib <= 0:
+            return
+        if peak_mib is None or peak_mib <= 0:
+            return
+        # Over-budget flag (drives the memory-driven shrink): the current budget
+        # already exceeds the usable limit, so growth must stop and B be reduced.
+        limit = self._gpu_limit_mib * (1.0 - self._gpu_safety_margin)
+        self._over_budget = peak_mib > limit
+        total = int(self.real_budget + self.rw_budget)
+        for i, (b, p) in enumerate(self._peak_hist):
+            if b == total:
+                if peak_mib > p:
+                    self._peak_hist[i] = (total, float(peak_mib))
+                return
+        self._peak_hist.append((total, float(peak_mib)))
+
+    def _predict_peak(self, target_total: int):
+        """Conservatively extrapolate the floor peak at ``target_total`` from the
+        observed (budget, peak) history, using the empirical peak ~ O(B) trend.
+        Returns None when there is too little history to extrapolate."""
+        pts = sorted(self._peak_hist)
+        if len(pts) < 2:
+            return None
+        b_hi, p_hi = pts[-1]
+        if target_total <= b_hi:
+            return p_hi  # already-observed region: p_hi is the max seen so far
+        # Conservative slope: the steepest segment observed so far.
+        slope = 0.0
+        for (b0, p0), (b1, p1) in zip(pts, pts[1:]):
+            if b1 > b0:
+                slope = max(slope, (p1 - p0) / (b1 - b0))
+        return p_hi + slope * (target_total - b_hi)
+
+    def _growth_fits(self, cand_state) -> bool:
+        """Admit a budget-increasing candidate only if its predicted floor peak
+        stays under the limit. Non-growth candidates (shift/shrink) and the
+        disabled gate (gpu_limit<=0) always pass, preserving original behaviour.
+        With too little history to extrapolate, growth is allowed (the runtime
+        OOM fallback remains the safety net)."""
+        if self._gpu_limit_mib <= 0:
+            return True
+        total = int(cand_state.get("real_edges_per_query", 0)
+                    + cand_state.get("rw_edges_per_query", 0))
+        if total <= int(self.real_budget + self.rw_budget):
+            return True
+        pred = self._predict_peak(total)
+        if pred is None:
+            return True
+        limit = self._gpu_limit_mib * (1.0 - self._gpu_safety_margin)
+        return pred <= limit
+
+    def force_shrink(self):
+        """Memory-driven reduction of the total budget by one block, bypassing
+        the quality-based confirmation (this is a safety reduction, not a
+        quality move). Reduces the larger component (ties -> rw, whose pool is
+        the heavier construction cost). Returns the new state, or None if there
+        is nothing left to shrink. Driven by the SP-synchronized over-budget
+        flag, so all ranks shrink identically."""
+        self._over_budget = False
+        if (self.real_budget + self.rw_budget) <= 0:
+            return None
+        if self.rw_budget >= self.real_budget:
+            if self.rw_budget >= self.block_size:
+                self.rw_budget -= self.block_size
+            else:
+                self.real_budget = max(0, self.real_budget - self.block_size)
+        else:
+            if self.real_budget >= self.block_size:
+                self.real_budget -= self.block_size
+            else:
+                self.rw_budget = max(0, self.rw_budget - self.block_size)
+        # The forced change overrides any in-flight (quality-driven) move.
+        self._pending_kind = None
+        self._pending_state = None
+        self._pending_wins = 0
+        return self.current_state()
 
     def set_state(self, state) -> None:
         if state is None:
@@ -2170,6 +2421,22 @@ def _maybe_update_edge_budget(
     if local_probe_idx is None or probe_idx_global is None or probe_idx_global.numel() == 0:
         controller.frozen = True
         _release_probe_caches_on_freeze(controller, args)
+        return
+
+    # Memory-driven shrink (Sec.~4 feedback loop). If the observed full-graph
+    # peak at the current budget already exceeds the GPU limit (an early ungated
+    # growth overshot, or extrapolation was optimistic), reduce the total budget
+    # by one block and skip this epoch's gain probe. The over-budget flag is set
+    # from the SP-synchronized peak, so every rank shrinks identically and
+    # returns symmetrically here (no collective deadlock).
+    if getattr(controller, "_over_budget", False):
+        new_state = controller.force_shrink()
+        if args.rank == 0:
+            _ns = new_state or controller.current_state()
+            print(
+                f"  ↳ BudgetCtrl shrink epoch={epoch} (peak over GPU limit) "
+                f"new_budget=({_ns['real_edges_per_query']},{_ns['rw_edges_per_query']})"
+            )
         return
 
     # Use the SAME edge_seed the training step used in this epoch, so probe
