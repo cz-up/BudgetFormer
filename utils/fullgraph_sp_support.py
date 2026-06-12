@@ -966,12 +966,18 @@ def _sample_edges_per_query_random_sort(edge_index, max_edges_per_query: int, se
         return edge_index
 
     scale = 1 << 31
-    rand_key = torch.remainder(
-        src * 1103515245 + dst * 214013 + int(seed) * 2654435761 + 12345,
-        scale,
-    )
-    composite = dst * scale + rand_key
+    # In-place key construction: see _sample_edges_per_query_random_minhash_mask.
+    rand_key = src * 1103515245
+    _t = dst * 214013
+    rand_key += _t
+    del _t
+    rand_key += int(seed) * 2654435761 + 12345
+    rand_key.remainder_(scale)
+    composite = dst * scale
+    composite += rand_key
+    del rand_key
     perm = torch.argsort(composite)
+    del composite
     dst_sorted = dst[perm]
 
     arange = torch.arange(dst_sorted.numel(), device=dst_sorted.device, dtype=torch.long)
@@ -990,10 +996,18 @@ def _sample_edges_per_query_random_minhash_mask(src, dst, max_edges_per_query: i
         return torch.ones(src.numel(), dtype=torch.bool, device=src.device)
 
     scale = 1 << 31
-    rand_key = torch.remainder(
-        src * 1103515245 + dst * 214013 + int(seed) * 2654435761 + 12345,
-        scale,
-    ).to(torch.long)
+    # Build rand_key in place.  The one-shot expression
+    #   remainder(src*a + dst*b + c, scale)
+    # holds three E-sized int64 temporaries simultaneously (~6 GiB at
+    # E=264M); chaining in-place ops caps the transient at two live
+    # tensors.  Same construction as _sample_edges_per_query_random_csr_cpu.
+    rand_key = src.to(torch.int64) * 1103515245
+    _t = dst.to(torch.int64) * 214013
+    rand_key += _t
+    del _t
+    rand_key += int(seed) * 2654435761 + 12345
+    rand_key.remainder_(scale)
+
     num_groups = int(dst.max().item()) + 1
     if num_groups <= 0:
         return torch.ones(src.numel(), dtype=torch.bool, device=src.device)
@@ -1005,20 +1019,32 @@ def _sample_edges_per_query_random_minhash_mask(src, dst, max_edges_per_query: i
     key_fill = int(scale)
     pos_fill = int(edge_count)
 
+    # Two reusable E-sized scratch buffers replace the four fresh E-sized
+    # allocations made per loop round (the masked key/pos values and the two
+    # per-edge gathers of group minima).  At E=264M each round previously
+    # churned ~8.4 GiB of alloc/free — both a peak-memory and an
+    # allocator-fragmentation problem on 24 GB cards.
+    vals_buf = torch.empty_like(rand_key)
+    gather_buf = torch.empty_like(rand_key)
+
     for _ in range(max_edges_per_query):
         if not bool(active.any().item()):
             break
         min_key = torch.full((num_groups,), key_fill, dtype=torch.long, device=dst.device)
-        key_vals = rand_key.masked_fill(~active, key_fill)
-        min_key.scatter_reduce_(0, dst, key_vals, reduce="amin", include_self=True)
-        chosen = active & (rand_key == min_key.index_select(0, dst))
+        vals_buf.copy_(rand_key)
+        vals_buf.masked_fill_(~active, key_fill)
+        min_key.scatter_reduce_(0, dst, vals_buf, reduce="amin", include_self=True)
+        torch.index_select(min_key, 0, dst, out=gather_buf)
+        chosen = active & (rand_key == gather_buf)
         if not bool(chosen.any().item()):
             break
 
         min_pos = torch.full((num_groups,), pos_fill, dtype=torch.long, device=dst.device)
-        pos_vals = edge_pos.masked_fill(~chosen, pos_fill)
-        min_pos.scatter_reduce_(0, dst, pos_vals, reduce="amin", include_self=True)
-        chosen = chosen & (edge_pos == min_pos.index_select(0, dst))
+        vals_buf.copy_(edge_pos)
+        vals_buf.masked_fill_(~chosen, pos_fill)
+        min_pos.scatter_reduce_(0, dst, vals_buf, reduce="amin", include_self=True)
+        torch.index_select(min_pos, 0, dst, out=gather_buf)
+        chosen &= edge_pos == gather_buf
         keep_mask |= chosen
         active &= ~chosen
 
@@ -1302,28 +1328,45 @@ def _resolve_real_edges_for_state(
             _gpu_concurrent_overhead_bytes,
             _rw_log_is_rank0,
             _RW_DEVICE_DECISION_CACHE,
+            rw_realedge_gpu_infeasible,
         )
-        if not _gpu_can_fit(build_device, sampling_estimate):
-            cache_key = ("real_edge_sampling", str(build_device), E_real, "cpu")
-            prev = _RW_DEVICE_DECISION_CACHE.get(cache_key)
-            if prev is None and _rw_log_is_rank0():
-                try:
-                    free, _ = torch.cuda.mem_get_info(build_device)
-                    free_mib = free / (1024 ** 2)
-                except Exception:
-                    free_mib = -1.0
-                overhead_mib = _gpu_concurrent_overhead_bytes(build_device) / (1024 ** 2)
-                print(
-                    f"[rw-device] real-edge sampling: peak single alloc "
-                    f"{single_alloc/(1024**2):.0f} MiB × 4 concurrent = "
-                    f"{sampling_estimate/(1024**2):.0f} MiB exceeds usable GPU "
-                    f"(free={free_mib:.0f} MiB − overhead {overhead_mib:.0f} MiB); "
-                    f"forcing CPU sampling for E={E_real:,}. "
-                    f"NOTE: this overrides any GPU-based edge_policy announced by "
-                    f"multi_tier ACTIVE. (Further matching calls suppressed.)"
-                )
-            _RW_DEVICE_DECISION_CACHE[cache_key] = (sampling_estimate, 0)
+        # Sticky run-level decision: if a prior step already OOM'd building real
+        # edges on GPU for this E and fell back to CPU, don't re-attempt GPU
+        # every epoch. The driving cause is allocator fragmentation, which the
+        # proactive _gpu_can_fit check below cannot predict, so retrying only
+        # reproduces the OOM + churn. The multi_tier planner is separately told
+        # this policy is GPU-infeasible and re-plans toward gpu_persist / CPU
+        # prefetch.
+        if rw_realedge_gpu_infeasible(build_device, E_real):
             build_device = torch.device("cpu")
+        elif not _gpu_can_fit(build_device, sampling_estimate):
+            # Pre-check failed: GPU pool is likely fragmented (driver_free ≈ 0
+            # after the allocator filled the 24 GB card).  The argsort for large
+            # E needs ~8 GiB of contiguous allocations that the fragmented pool
+            # cannot provide.  Flush the caching allocator first — this returns
+            # cached-but-free blocks to the CUDA driver, restoring driver_free —
+            # and re-check.  Cost: ~5 ms, negligible vs. the ~2.5 s build time.
+            torch.cuda.empty_cache()
+            if not _gpu_can_fit(build_device, sampling_estimate):
+                # Still insufficient after flush; fall back to CPU permanently.
+                cache_key = ("real_edge_sampling", str(build_device), E_real, "cpu")
+                prev = _RW_DEVICE_DECISION_CACHE.get(cache_key)
+                if prev is None and _rw_log_is_rank0():
+                    try:
+                        free, _ = torch.cuda.mem_get_info(build_device)
+                        free_mib = free / (1024 ** 2)
+                    except Exception:
+                        free_mib = -1.0
+                    overhead_mib = _gpu_concurrent_overhead_bytes(build_device) / (1024 ** 2)
+                    print(
+                        f"[rw-device] real-edge sampling: peak single alloc "
+                        f"{single_alloc/(1024**2):.0f} MiB × 4 concurrent = "
+                        f"{sampling_estimate/(1024**2):.0f} MiB exceeds usable GPU "
+                        f"even after cache flush (free={free_mib:.0f} MiB − overhead "
+                        f"{overhead_mib:.0f} MiB); forcing CPU sampling for E={E_real:,}."
+                    )
+                _RW_DEVICE_DECISION_CACHE[cache_key] = (sampling_estimate, 0)
+                build_device = torch.device("cpu")
 
     if edge_index_global.device == build_device:
         real_edges = edge_index_global
@@ -1359,21 +1402,64 @@ def _resolve_real_edges_for_state(
                 device=build_device,
             )
         except torch.cuda.OutOfMemoryError as _oom:
-            # Proactive estimate passed (empty_cache freed allocator blocks) but
-            # CUDA fragmentation still caused the allocation to fail mid-way.
-            # Evict decision cache so the proactive check uses updated free memory
-            # next epoch, then fall back to CPU for this call.
-            if build_device.type == "cuda":
-                torch.cuda.empty_cache()
-                from gt_sp.utils import _RW_DEVICE_DECISION_CACHE, _rw_log_is_rank0
-                E_real = int(edge_index_global.size(1))
-                evict_key = ("real_edge_sampling", str(build_device), E_real, "cpu")
-                _RW_DEVICE_DECISION_CACHE.pop(evict_key, None)
+            if build_device.type != "cuda":
+                raise
+            from gt_sp.utils import (
+                mark_rw_realedge_gpu_infeasible,
+                _rw_log_is_rank0,
+            )
+            E_real = int(edge_index_global.size(1))
+            # A first OOM here is usually transient fragmentation, not a real
+            # capacity limit: the training pool is full (driver_free ≈ 0) and
+            # the sampling's multi-GiB allocations cannot be placed, even
+            # though the clean-state profiling probe succeeded with the
+            # identical workload.  empty_cache() returns reserved-but-free
+            # segments to the driver, restoring contiguous space — retry on
+            # GPU once before permanently downgrading this run to CPU.
+            torch.cuda.empty_cache()
+            try:
+                real_edges = profile_call(
+                    "edge_real_sample",
+                    lambda: _sample_edges_per_query_random(
+                        real_edges,
+                        real_budget,
+                        _edge_block_seed(args, edge_seed, 17),
+                        dst_stats=dst_stats,
+                    ),
+                    device=build_device,
+                )
                 if _rw_log_is_rank0():
                     print(
-                        f"[rw-device] real-edge sampling OOM on GPU "
-                        f"({type(_oom).__name__}); falling back to CPU. "
-                        f"Decision cache evicted — will re-check GPU next epoch."
+                        f"[rw-device] real-edge sampling OOM'd on GPU but "
+                        f"succeeded after empty_cache() retry "
+                        f"(E={E_real:,}; transient pool fragmentation)."
+                    )
+            except torch.cuda.OutOfMemoryError as _oom_retry:
+                # Retry on a flushed pool also failed → genuinely infeasible
+                # for this E on this card.  Record the ground truth: mark
+                # real-edge GPU sampling sticky-infeasible for the rest of the
+                # run (no per-epoch OOM spam) and fall back to CPU.  The
+                # multi_tier planner reads this signal (via
+                # rw_realedge_gpu_infeasible_any) and re-plans away from GPU
+                # edge policies toward CPU prefetch.
+                torch.cuda.empty_cache()
+                mark_rw_realedge_gpu_infeasible(build_device, E_real)
+                if _rw_log_is_rank0():
+                    _alloc_mib = torch.cuda.memory_allocated(build_device) / (1024 ** 2)
+                    _resv_mib = torch.cuda.memory_reserved(build_device) / (1024 ** 2)
+                    try:
+                        _free_b, _ = torch.cuda.mem_get_info(build_device)
+                        _free_mib = _free_b / (1024 ** 2)
+                    except Exception:
+                        _free_mib = -1.0
+                    print(
+                        f"[rw-device] real-edge sampling OOM on GPU persists "
+                        f"after empty_cache() retry; falling back to CPU and "
+                        f"marking GPU-infeasible for E={E_real:,} this run "
+                        f"(planner will re-plan; no further GPU retries).\n"
+                        f"[rw-device]   post-OOM state: allocated={_alloc_mib:.0f} MiB "
+                        f"reserved={_resv_mib:.0f} MiB driver_free={_free_mib:.0f} MiB\n"
+                        f"[rw-device]   retry OOM detail: {_oom_retry}"
                     )
                 build_device = torch.device("cpu")
                 real_edges = real_edges.cpu()
@@ -1388,8 +1474,6 @@ def _resolve_real_edges_for_state(
                     ),
                     device=build_device,
                 )
-            else:
-                raise
     return real_edges
 
 

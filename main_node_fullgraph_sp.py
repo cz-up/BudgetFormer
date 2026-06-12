@@ -37,7 +37,11 @@ from gt_sp.initialize import (
     set_last_batch_global_token_indices,
 )
 from gt_sp.reducer import build_gradient_reducer, sync_params_and_buffers
-from gt_sp.utils import clear_random_walk_graph_cache, resolve_edge_build_device
+from gt_sp.utils import (
+    clear_random_walk_graph_cache,
+    resolve_edge_build_device,
+    rw_realedge_gpu_infeasible_any,
+)
 from utils.fullgraph_sp_runtime import (
     _aggregate_comm_profile,
     _apply_adaptive_edge_cache_decision,
@@ -648,6 +652,7 @@ def main():
                     reset_comm_profiler()
                 # Skip the remainder of the profile block.
                 _mt_prof_mgr = None
+
             if _mt_prof_mgr is not None:
                 candidate_policies = []
                 if device.startswith("cuda"):
@@ -780,6 +785,43 @@ def main():
                             f"live_edge={metrics['live_edge_bytes'] / (1024 ** 2):.1f} MiB"
                         )
                 _multi_tier_edge_profiled = True
+
+                # Post-profiling: if GPU real-edge sampling OOM'd on any rank
+                # during the probes, disable GPU policies now so the planner
+                # never selects a plan that immediately fails at WARMUP.
+                if _mt_prof_mgr is not None:
+                    _rw_gpu_local = int(rw_realedge_gpu_infeasible_any())
+                    if sp_world_size > 1 and dist.is_initialized():
+                        _rw_gpu_t = torch.tensor(
+                            [_rw_gpu_local], device=device, dtype=torch.long
+                        )
+                        dist.all_reduce(_rw_gpu_t, op=dist.ReduceOp.MAX, group=sp_group)
+                        _rw_gpu_local = int(_rw_gpu_t.item())
+                    if _rw_gpu_local:
+                        if args.rank == 0:
+                            print(
+                                "[multi_tier] GPU real-edge sampling infeasible during profiling; "
+                                "disabling gpu_ephemeral and gpu_persist."
+                            )
+                        for _gpu_p in (EDGE_POLICY_GPU_EPHEMERAL, EDGE_POLICY_GPU_PERSIST):
+                            _mt_prof_mgr.set_edge_policy_profile(
+                                _gpu_p,
+                                prep_time_s=0.0,
+                                gpu_peak_bytes=0,
+                                cpu_delta_bytes=0,
+                                live_edge_bytes=0,
+                                enabled=False,
+                            )
+
+                # Final cleanup after all probes so WARMUP starts in the
+                # cleanest possible memory state (the individual probes each
+                # call empty_cache, but we do one more pass here).
+                if device.startswith("cuda"):
+                    import gc as _gc
+                    _gc.collect()
+                    torch.cuda.synchronize(device)
+                    torch.cuda.empty_cache()
+
                 if profile_sp_comm:
                     reset_comm_profiler()
 
@@ -1184,6 +1226,38 @@ def main():
                             modes=_forced_modes,
                         )
                         # Keep edge_index_global/gpu_cached consistent with forced policy.
+                        edge_index_global, edge_index_gpu_cached = _apply_multi_tier_active_plan(
+                            model, args, edge_index_global, edge_index_gpu_cached,
+                            device=device, sp_group=sp_group, sp_world_size=sp_world_size,
+                        )
+
+        # Reactive edge-policy correction: if a GPU real-edge build OOM'd this
+        # epoch and fell back to CPU (recorded run-level by the build path),
+        # the planner's profiled gpu_peak was wrong (allocator fragmentation,
+        # not statically predictable). Tell the planner to drop both GPU edge
+        # policies and re-plan to the fastest feasible CPU-prefetch policy. The
+        # check + re-plan must be cross-rank consistent to avoid an NCCL
+        # deadlock when only some ranks OOM, so MAX-reduce the local flag first.
+        if _is_multi_tier:
+            _mt_fb = getattr(model, "_comm_ckpt", None)
+            if _mt_fb is not None and _mt_fb.is_active():
+                _local_infeasible = int(
+                    _mt_fb.edge_policy in (EDGE_POLICY_GPU_EPHEMERAL, EDGE_POLICY_GPU_PERSIST)
+                    and rw_realedge_gpu_infeasible_any()
+                )
+                if sp_world_size > 1 and dist.is_initialized():
+                    _fb_t = torch.tensor([_local_infeasible], device=device, dtype=torch.long)
+                    dist.all_reduce(_fb_t, op=dist.ReduceOp.MAX, group=sp_group)
+                    _local_infeasible = int(_fb_t.item())
+                if _local_infeasible:
+                    _fb_changed = _mt_fb.report_runtime_edge_gpu_infeasible(device)
+                    if _fb_changed:
+                        if _prefetch_future is not None:
+                            try:
+                                _prefetch_future.result()
+                            except Exception:
+                                pass
+                            _prefetch_future = None
                         edge_index_global, edge_index_gpu_cached = _apply_multi_tier_active_plan(
                             model, args, edge_index_global, edge_index_gpu_cached,
                             device=device, sp_group=sp_group, sp_world_size=sp_world_size,

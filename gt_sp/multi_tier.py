@@ -181,6 +181,15 @@ class _MultiTierResourceManager:
         self._t1_nonlast_infeasible: bool = False
         self._t4_nonlast_infeasible: bool = False
 
+        # --- Runtime edge-policy feedback ---
+        # GPU edge policies (gpu_ephemeral / gpu_persist) whose per-step real-edge
+        # build was observed to OOM on GPU at runtime and fall back to CPU. The
+        # planner excludes these from _run_active_plan so re-planning picks the
+        # next feasible policy (gpu_persist, then CPU prefetch). Populated via
+        # report_runtime_edge_gpu_infeasible(); see _RW_REALEDGE_GPU_INFEASIBLE.
+        self._gpu_infeasible_policies: set = set()
+        self._active_peak_limit:   int  = 0   # saved from last _run_active_plan call
+
         # --- Final plan ---
         self._cache_edge:          bool = False
         self._edge_policy:         str  = self.EDGE_GPU_EPHEMERAL
@@ -734,17 +743,28 @@ class _MultiTierResourceManager:
         is_r0 = self._is_rank0()
         cpu_budget = self._available_cpu_bytes()
         peak_limit = max(int(total_gpu * (1.0 - self.safety_margin)), int(self._peak_warmup))
+        self._active_peak_limit = peak_limit
 
-        # Separate transient budget for the edge-build phase.
-        _exp_seg = False
+        # Ground-truth gate: if GPU real-edge sampling already OOM'd this run
+        # (sticky flag set by the edge builder, now only after a failed
+        # flush-and-retry), both GPU edge policies would silently degrade to
+        # CPU build at runtime.  Exclude them at planning time instead of
+        # discovering the contradiction one epoch later via the
+        # report_runtime_edge_gpu_infeasible feedback cycle.
         try:
-            from gt_sp.utils import _expandable_segments_enabled as _check_exp_seg
-            _exp_seg = _check_exp_seg()
-        except Exception:
+            from gt_sp.utils import rw_realedge_gpu_infeasible_any
+            if rw_realedge_gpu_infeasible_any():
+                for _p in (self.EDGE_GPU_EPHEMERAL, self.EDGE_GPU_PERSIST):
+                    if _p not in self._gpu_infeasible_policies:
+                        self._gpu_infeasible_policies.add(_p)
+                        if is_r0:
+                            print(
+                                f"[MultiTierManager] {_p} excluded at planning "
+                                f"time: GPU real-edge sampling already marked "
+                                f"infeasible this run."
+                            )
+        except ImportError:
             pass
-        # 97 % leaves a small buffer for measurement noise while still being
-        # significantly more permissive than peak_limit (85 % by default).
-        transient_limit = int(total_gpu * 0.97) if _exp_seg else peak_limit
 
         best_key = None
         best_step_time = float("inf")
@@ -761,6 +781,17 @@ class _MultiTierResourceManager:
         policy_log: dict = {}  # policy -> (status_str, best_t_ms_or_none)
 
         for edge_policy, edge_profile in self._edge_policy_profiles():
+            # Skip GPU policies whose real-edge build was observed to OOM at
+            # runtime (ground-truth feedback). The profiled gpu_peak passed the
+            # static transient gate, but allocator fragmentation made the actual
+            # per-step build fail; excluding the policy lets re-planning land on
+            # a feasible alternative (gpu_persist, then CPU prefetch).
+            if edge_policy in self._gpu_infeasible_policies:
+                policy_log[edge_policy] = (
+                    "skip:gpu_infeasible(runtime OOM fallback)",
+                    None,
+                )
+                continue
             edge_peak = int(edge_profile.get("live_edge_bytes", 0))
             edge_serial_time = float(
                 edge_profile.get(
@@ -772,14 +803,6 @@ class _MultiTierResourceManager:
             prep_gpu_peak = int(edge_profile.get("gpu_peak_bytes", 0))
             prep_cpu_delta = int(edge_profile.get("cpu_delta_bytes", 0))
 
-            # --- Transient feasibility (build phase) ---
-            if prep_gpu_peak > transient_limit:
-                policy_log[edge_policy] = (
-                    f"skip:build_peak={prep_gpu_peak/(1024**2):.0f}>"
-                    f"transient_limit={transient_limit/(1024**2):.0f} MiB",
-                    None,
-                )
-                continue
             if prep_cpu_delta > cpu_budget:
                 policy_log[edge_policy] = (
                     f"skip:cpu_delta={prep_cpu_delta/(1024**2):.0f}>"
@@ -793,6 +816,7 @@ class _MultiTierResourceManager:
                 peak_limit=peak_limit,
                 cpu_budget=cpu_budget,
                 edge_peak=edge_peak,
+                build_peak=prep_gpu_peak,
             ):
                 edge_time = edge_serial_time + max(0.0, edge_overlap_time - t_model_est)
                 t_est = t_model_est + edge_time
@@ -843,6 +867,14 @@ class _MultiTierResourceManager:
         self._modes = best_tiers
         self._state = self._ACTIVE
 
+        # Flush the GPU caching allocator whenever a GPU edge policy is
+        # selected.  Profiling probes run after empty_cache(); without this
+        # flush the first ACTIVE step has a full, fragmented pool that may
+        # fail the real-edge argsort even though the profiling peak was fine.
+        if best_policy in (self.EDGE_GPU_EPHEMERAL, self.EDGE_GPU_PERSIST):
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
         if is_r0:
             tier_counts = {}
             for t in best_tiers:
@@ -860,8 +892,6 @@ class _MultiTierResourceManager:
                 f"edge_policy={best_policy}  "
                 f"tiers={tier_counts}  "
                 f"peak_limit={peak_limit/(1024**2):.0f} MiB  "
-                f"transient_limit={transient_limit/(1024**2):.0f} MiB"
-                f"{'(relaxed)' if _exp_seg else ''}  "
                 f"last_delta(mha/retain)={(self._peak_mha_last - self._peak_warmup)/(1024**2):+.1f}"
                 f"/{(self._peak_retain_last - self._peak_warmup)/(1024**2):+.1f} MiB  "
                 f"est_T_step={best_step_time*1000:.0f} ms "
@@ -872,7 +902,13 @@ class _MultiTierResourceManager:
                 f"[MultiTierManager]   policy candidates: {' | '.join(policy_parts)}"
             )
 
-    def _enumerate_structured_plans(self, peak_limit: int, cpu_budget: int, edge_peak: int):
+    def _enumerate_structured_plans(
+        self,
+        peak_limit: int,
+        cpu_budget: int,
+        edge_peak: int,
+        build_peak: int = 0,
+    ):
         """Yield feasible [R][K][N] structured plans.
 
         Recompute fills the prefix, keep_mha forms a suffix, and retain
@@ -881,6 +917,17 @@ class _MultiTierResourceManager:
         activations are computed on GPU before the CPU transfer), and the
         synchronous non-pinned PCIe transfer in the backward pass is pure
         overhead compared to recomputation.
+
+        ``build_peak`` is the profiling-measured GPU peak for this edge policy
+        with all-recompute tiers (i.e. ``edge_profile["gpu_peak_bytes"]``).  It
+        represents the per-step construction transient: for GPU edge policies this
+        is the dominant per-step peak (argsort/CSR of E edges every step); for CPU
+        edge policies it approximates ``peak_warmup``.  The feasibility check uses
+        ``max(build_peak, peak_warmup + live_edge + tier_delta)`` so that both
+        the edge-construction transient and the model steady-state peak are gated
+        against ``peak_limit``.  This joint check naturally prevents GPU policies
+        whose construction transient exceeds the budget from being selected,
+        without a separate two-limit design.
         """
         L = self.n_layers
         if L == 0 or self._t_bwd_recompute <= 0:
@@ -971,7 +1018,19 @@ class _MultiTierResourceManager:
                     mha_extra = 0
                     retain_extra = 0
                 net_fwd_extra = max(0, mha_extra + retain_extra)
-                peak_est = self._peak_warmup + edge_peak + net_fwd_extra
+                # Joint peak estimate: take the max of
+                #   (a) build_peak — the per-step edge-construction transient
+                #       measured during profiling (all-recompute).  For GPU
+                #       policies this includes the argsort/CSR allocation that
+                #       happens every step and is the binding constraint.
+                #   (b) steady-state model fwd peak — warmup base + persistent
+                #       live edge + tier activation delta.
+                # Tier activations are accumulated AFTER construction (sequential),
+                # so the two phases don't add; we gate both against peak_limit.
+                peak_est = max(
+                    int(build_peak),
+                    self._peak_warmup + edge_peak + net_fwd_extra,
+                )
                 if peak_est > peak_limit:
                     continue
                 tiers = (
@@ -1108,11 +1167,22 @@ class _MultiTierResourceManager:
         actual_cpu_t_step = float(actual_t_model_s) + float(actual_prefetch_wait_s) + stage_time
 
         # Best GPU alternative: t_step = t_model + gpu_build_time (serial, no overlap)
+        # Skip any GPU policy that has been runtime-marked infeasible (OOM fallback);
+        # the adaptive-timing switch must respect the same feasibility gate as the
+        # regular planner — otherwise it will repeatedly re-try a policy that OOM'd.
         best_gpu_policy = None
         best_gpu_t_step = float("inf")
         for gpu_pol in (self.EDGE_GPU_EPHEMERAL, self.EDGE_GPU_PERSIST):
+            if gpu_pol in self._gpu_infeasible_policies:
+                continue
             prof = self._edge_profiles.get(gpu_pol)
             if prof is None:
+                continue
+            # Respect the same joint-peak gate used at plan-selection time:
+            # build_peak must fit within peak_limit (the threshold that excluded
+            # gpu_persist when its build_peak was 22,985 MiB > 20,400 MiB).
+            build_peak = int(prof.get("gpu_peak_bytes", 0))
+            if self._active_peak_limit > 0 and build_peak > self._active_peak_limit:
                 continue
             gpu_serial = float(prof.get("serial_time_s", prof.get("prep_time_s", 0.0)))
             gpu_t_step = float(actual_t_model_s) + gpu_serial
@@ -1152,6 +1222,58 @@ class _MultiTierResourceManager:
         self._edge_policy = best_gpu_policy
         self._cache_edge = best_gpu_policy == self.EDGE_GPU_PERSIST
         return True
+
+    def report_runtime_edge_gpu_infeasible(self, device) -> bool:
+        """Ground-truth feedback that GPU real-edge sampling OOM'd at runtime.
+
+        Called when the per-step real-edge build was observed to OOM on GPU and
+        fall back to CPU. The profiling-time ``gpu_peak`` passed the planner's
+        static transient gate, but allocator fragmentation made the real
+        allocation fail — a condition not statically predictable (even the
+        runtime mem_get_info guard is fooled).
+
+        Both GPU edge policies sample the full real-edge set on GPU per step
+        (gpu_ephemeral rebuilds it; gpu_persist caches the *raw* edges and still
+        samples each step), so a real-edge sampling OOM rules out BOTH. We mark
+        them GPU-infeasible for this run and re-plan, which excludes both and
+        selects the best CPU-prefetch policy (built off-GPU, overlapped with the
+        model) — the only feasible regime for this E on this card.
+
+        Returns True if the ACTIVE edge_policy changed (caller must re-apply the
+        edge placement via the same path used for the initial ACTIVE plan).
+        """
+        if self._state != self._ACTIVE:
+            return False
+        _gpu_policies = (self.EDGE_GPU_EPHEMERAL, self.EDGE_GPU_PERSIST)
+        if self._edge_policy not in _gpu_policies:
+            return False
+        if not torch.cuda.is_available():
+            return False
+        # Mark only the currently active policy as infeasible.  The other GPU
+        # policy has a different (usually lower) profiling peak and may still be
+        # feasible; the planner will exclude it only if its own build_peak exceeds
+        # peak_limit.  Marking both here was the old conservative behaviour: it
+        # prevented gpu_ephemeral (lower peak) from being selected even when only
+        # gpu_persist OOM'd.
+        newly = self._edge_policy not in self._gpu_infeasible_policies
+        self._gpu_infeasible_policies.add(self._edge_policy)
+        prev_policy = self._edge_policy
+        real_total_gpu = torch.cuda.get_device_properties(device).total_memory
+        total_gpu = self._effective_total_gpu_bytes(real_total_gpu)
+        if self._is_rank0() and newly:
+            print(
+                f"[MultiTierManager] runtime feedback: real-edge build OOM'd on GPU "
+                f"and fell back to CPU; marking {prev_policy} infeasible "
+                f"and re-planning."
+            )
+        # Re-plan with the GPU policies excluded. Flush the allocator first so
+        # the re-applied plan starts from a clean memory state.
+        import gc as _gc
+        _gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+        self._run_active_plan(device, total_gpu)
+        return self._edge_policy != prev_policy
 
     def override_cache_decision(self, cache: bool) -> None:
         """Apply the cross-rank-synced topology cache decision."""

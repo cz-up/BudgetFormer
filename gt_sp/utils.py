@@ -223,6 +223,38 @@ def _clear_rw_device_cache() -> None:
     _RW_DEVICE_DECISION_CACHE.clear()
 
 
+# Run-level registry of (device_str, E) for which a real-edge GPU sampling build
+# was observed to OOM at runtime and fall back to CPU. Unlike
+# _RW_DEVICE_DECISION_CACHE (a per-probe log-suppression cache cleared by
+# _clear_rw_device_cache before every policy profile), this set is STICKY for the
+# whole run: once a key is present, real-edge sampling for that key skips the GPU
+# attempt entirely (no per-epoch retry / OOM spam), and the multi_tier planner is
+# told the GPU edge policy is infeasible so it re-plans (e.g. gpu_ephemeral ->
+# gpu_persist -> cpu prefetch). The OOM driving this is allocator fragmentation,
+# which is not statically predictable — even the mem_get_info-based _gpu_can_fit
+# guard is fooled — so we record the observed ground truth instead of estimating.
+_RW_REALEDGE_GPU_INFEASIBLE: set = set()
+
+
+def _rw_realedge_key(device, num_edges: int):
+    return (str(device), int(num_edges))
+
+
+def mark_rw_realedge_gpu_infeasible(device, num_edges: int) -> None:
+    """Record that real-edge GPU sampling for (device, num_edges) OOM'd at runtime."""
+    _RW_REALEDGE_GPU_INFEASIBLE.add(_rw_realedge_key(device, num_edges))
+
+
+def rw_realedge_gpu_infeasible(device, num_edges: int) -> bool:
+    """Return True if real-edge GPU sampling for (device, num_edges) is known infeasible."""
+    return _rw_realedge_key(device, num_edges) in _RW_REALEDGE_GPU_INFEASIBLE
+
+
+def rw_realedge_gpu_infeasible_any() -> bool:
+    """Return True if any real-edge GPU sampling fallback was recorded this run."""
+    return len(_RW_REALEDGE_GPU_INFEASIBLE) > 0
+
+
 def _expandable_segments_enabled() -> bool:
     """Return True if PYTORCH_CUDA_ALLOC_CONF enables expandable_segments."""
     conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
