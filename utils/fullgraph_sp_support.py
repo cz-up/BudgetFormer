@@ -303,6 +303,20 @@ def _get_edge_dst_stats(edge_index: torch.Tensor) -> Optional[dict]:
     return cached
 
 
+def clear_edge_dst_stats_cache() -> int:
+    """Drop the cached CPU dst-stats / CSR sampling structures.
+
+    On large graphs the CSR arrays dominate the cache (~4.2 GiB for amazon's
+    E=264M at int32).  Called when the ACTIVE edge policy samples on GPU and
+    the CPU structures would otherwise sit unused for the rest of the run.
+    Rebuilt automatically (one-time cost) if CPU sampling is needed again.
+    Returns the number of cache entries dropped.
+    """
+    n = len(_EDGE_DST_STATS_CACHE)
+    _EDGE_DST_STATS_CACHE.clear()
+    return n
+
+
 def _get_heavy_group_map(dst_stats: Optional[dict], max_edges_per_query: int) -> Optional[torch.Tensor]:
     if dst_stats is None:
         return None

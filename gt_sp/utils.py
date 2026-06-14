@@ -33,10 +33,32 @@ _RANDOM_WALK_GRAPH_CACHE = {}
 _DGL_GRAPH_CACHE: dict = {}
 
 
-def clear_random_walk_graph_cache() -> None:
-    """Evict cached random-walk graph structures after graph storage changes."""
-    _RANDOM_WALK_GRAPH_CACHE.clear()
-    _DGL_GRAPH_CACHE.clear()
+def clear_random_walk_graph_cache(device_type: str = None, data_ptr: int = None) -> int:
+    """Evict cached random-walk graph structures after graph storage changes.
+
+    With no filters, evicts everything.  ``device_type`` ("cpu"/"cuda")
+    restricts eviction to CSR entries resident on that device type (cache
+    key[3]); ``data_ptr`` restricts to entries built from a specific source
+    edge_index tensor (cache key[0]) — used to drop entries keyed to a
+    temporary GPU topology cache before that tensor is freed.  DGL graph
+    objects built from the evicted rowptr/col tensors are evicted alongside.
+    Returns the number of CSR entries evicted.
+    """
+    if device_type is None and data_ptr is None:
+        n = len(_RANDOM_WALK_GRAPH_CACHE)
+        _RANDOM_WALK_GRAPH_CACHE.clear()
+        _DGL_GRAPH_CACHE.clear()
+        return n
+    evict = [
+        k
+        for k in _RANDOM_WALK_GRAPH_CACHE
+        if (device_type is None or k[3] == device_type)
+        and (data_ptr is None or k[0] == int(data_ptr))
+    ]
+    for k in evict:
+        _, rowptr, col = _RANDOM_WALK_GRAPH_CACHE.pop(k)
+        _DGL_GRAPH_CACHE.pop((rowptr.data_ptr(), col.data_ptr()), None)
+    return len(evict)
 
 
 def _compute_local_spd_bias(edge_index: Tensor, n_nodes: int, max_dist: int) -> Tensor:
@@ -110,15 +132,17 @@ def fix_edge_index(x, num_node):
 
 def resolve_edge_build_device(args, default_device) -> torch.device:
     """Resolve the device used for edge construction and sampling."""
-    spec = getattr(args, "edge_build_device", "same")
-    if spec in (None, "", "same"):
+    spec = getattr(args, "edge_build_device", "gpu")
+    # "gpu" builds edges on the training device (the GPU); "same" is the
+    # deprecated alias kept for backward compatibility with older runs/scripts.
+    if spec in (None, "", "gpu", "same"):
         return torch.device(default_device)
 
     try:
         build_device = torch.device(spec)
     except (TypeError, RuntimeError) as exc:
         raise ValueError(
-            f"Invalid --edge_build_device={spec!r}; expected same/cpu/cuda/cuda:N."
+            f"Invalid --edge_build_device={spec!r}; expected gpu/cpu/cuda/cuda:N."
         ) from exc
 
     if build_device.type == "cuda":
@@ -348,13 +372,20 @@ def _gpu_can_fit_rw(device, need_bytes: int) -> bool:
     # allocated blocks may be too fragmented to satisfy a single multi-GiB
     # contiguous request, so we conservatively ignore them.
     #
-    # With expandable_segments:True the allocator grows existing segments
-    # in-place; there are no sub-GiB fragment boundaries for large requests,
-    # so the full reserved_slack is reliably usable and we add it back in.
-    # This prevents spurious CPU fallbacks after a previous allocation round
-    # (e.g. a prior policy profiling run) left a large reserved-but-freed
-    # block that the driver hasn't reclaimed yet.
-    if _expandable_segments_enabled():
+    # With expandable_segments:True the allocator can grow existing segments
+    # in-place — but ONLY when there is physically free GPU memory to grow
+    # into (driver_free > 0).  When driver_free ≈ 0 the GPU is physically
+    # full; there is nothing to extend into, and fragmented reserved_slack
+    # blocks cannot satisfy a large contiguous request any better than the
+    # non-expandable case.  Adding reserved_slack unconditionally caused
+    # false-positive "fits" that later OOM'd on the argsort for E=264M.
+    #
+    # Rule: add reserved_slack only when driver_free is non-trivial
+    # (≥ 256 MiB).  That threshold is chosen to be small enough that a
+    # clean post-empty_cache() state always qualifies (driver_free ≫ 256 MiB
+    # after cache flush) while a fully-reserved GPU (driver_free ≈ 0) does not.
+    _MIN_DRIVER_FREE_FOR_SLACK = 256 * 1024 * 1024  # 256 MiB
+    if _expandable_segments_enabled() and int(free) >= _MIN_DRIVER_FREE_FOR_SLACK:
         try:
             reserved_slack = max(
                 0,

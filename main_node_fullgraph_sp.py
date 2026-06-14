@@ -21,6 +21,12 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
+try:
+    from torch.utils.checkpoint import CheckpointError as _CheckpointError
+except ImportError:  # older torch: class not exported; never raised then
+    class _CheckpointError(Exception):
+        pass
+
 from gt_sp.comm_profiler import (
     enable_comm_profiler,
     get_comm_profile_summary,
@@ -76,6 +82,7 @@ from utils.fullgraph_sp_support import (
     _build_model,
     _build_optimizer_bundle,
     _cuda_empty_cache,
+    clear_edge_dst_stats_cache,
     _eval_sp,
     _measure_edge_h2d_time,
     _try_cache_edge_index_on_gpu,
@@ -694,11 +701,20 @@ def main():
                 # RW fallback and gets one clean retry.
                 _RW_WORKING_SET_MIB = 12000  # rough estimate; guards retry logic
                 _CPU_CONTAMINATION_THRESHOLD_MIB = _RW_WORKING_SET_MIB * 0.5
+                # CPU probe order: broadcast BEFORE rank_local.  rank_local does
+                # the same build as broadcast, concurrently on every local rank,
+                # so its optimistic time lower bound can be derived from the
+                # broadcast measurement plus the core-oversubscription ratio.
+                # When even that bound cannot beat broadcast's measured total,
+                # the rank_local probe (~10 GiB/rank transient on large graphs)
+                # is provably pointless and is skipped — a hyperparameter-free
+                # domination test.
+                _bcast_metrics = None
                 for policy in (
                     EDGE_POLICY_GPU_EPHEMERAL,
                     EDGE_POLICY_GPU_PERSIST,
-                    EDGE_POLICY_CPU_RANK_LOCAL_PREFETCH,
                     EDGE_POLICY_CPU_BROADCAST_PREFETCH,
+                    EDGE_POLICY_CPU_RANK_LOCAL_PREFETCH,
                 ):
                     if policy not in candidate_policies:
                         _mt_prof_mgr.set_edge_policy_profile(
@@ -710,6 +726,86 @@ def main():
                             enabled=False,
                         )
                         continue
+                    if (
+                        policy == EDGE_POLICY_CPU_RANK_LOCAL_PREFETCH
+                        and _bcast_metrics is not None
+                    ):
+                        # Domination test, applied on single-node setups only.
+                        #
+                        # contention_lb assumes the solo build scales linearly
+                        # with OMP threads; real builds scale sublinearly (and
+                        # the real-edge argsort is near single-threaded), so
+                        # the bound can OVERestimate the concurrent slowdown.
+                        # On a single node that error is harmless: broadcast's
+                        # measured comm overhead is tens of ms, which bounds
+                        # rank_local's possible win to noise either way.  On
+                        # multiple nodes the comm term is real (seconds over
+                        # the interconnect) and a model error could wrongly
+                        # discard a genuine winner — so the probe always runs
+                        # there, paying its memory cost to make a correct call.
+                        import hashlib as _hashlib
+                        import socket as _socket
+                        # Deterministic across processes (builtin hash() is
+                        # per-process salted and unusable for agreement).
+                        _host_hash = int.from_bytes(
+                            _hashlib.md5(_socket.gethostname().encode()).digest()[:8],
+                            "little",
+                        ) & 0x7FFFFFFFFFFFFFFF
+                        _single_node = True
+                        if sp_world_size > 1 and dist.is_initialized():
+                            _h_min = torch.tensor([_host_hash], device=device, dtype=torch.long)
+                            _h_max = _h_min.clone()
+                            dist.all_reduce(_h_min, op=dist.ReduceOp.MIN, group=sp_group)
+                            dist.all_reduce(_h_max, op=dist.ReduceOp.MAX, group=sp_group)
+                            _single_node = int(_h_min.item()) == int(_h_max.item())
+                        _t_build_solo = float(_bcast_metrics.get("overlap_time_s", 0.0))
+                        _t_bcast_total = float(_bcast_metrics.get("prep_time_s", 0.0))
+                        _cores = os.cpu_count() or 1
+                        _omp = int(os.environ.get("OMP_NUM_THREADS", _cores))
+                        # Single-node only: every SP rank is local, so the
+                        # sp_world_size fallback is exact even when the
+                        # launcher does not set LOCAL_WORLD_SIZE.
+                        _local_ranks = int(
+                            os.environ.get("LOCAL_WORLD_SIZE", max(1, sp_world_size))
+                        )
+                        _contention_lb = max(1.0, (_omp * _local_ranks) / _cores)
+                        _rank_local_lb = _t_build_solo * _contention_lb
+                        # The probe runs SP collectives internally, so the skip
+                        # decision must be unanimous across ranks.  MIN reduce:
+                        # skip only when EVERY rank judges dominated.
+                        _skip_rank_local = int(
+                            _single_node and _rank_local_lb >= _t_bcast_total
+                        )
+                        if sp_world_size > 1 and dist.is_initialized():
+                            _skip_t = torch.tensor(
+                                [_skip_rank_local], device=device, dtype=torch.long
+                            )
+                            dist.all_reduce(_skip_t, op=dist.ReduceOp.MIN, group=sp_group)
+                            _skip_rank_local = int(_skip_t.item())
+                        if not _single_node and args.rank == 0:
+                            print(
+                                "[multi_tier] multi-node SP group detected; "
+                                "cpu_rank_local_prefetch probe always runs "
+                                "(broadcast comm cost is real on the interconnect)."
+                            )
+                        if _skip_rank_local:
+                            _mt_prof_mgr.set_edge_policy_profile(
+                                policy,
+                                prep_time_s=0.0,
+                                gpu_peak_bytes=0,
+                                cpu_delta_bytes=0,
+                                live_edge_bytes=0,
+                                enabled=False,
+                            )
+                            if args.rank == 0:
+                                print(
+                                    f"[multi_tier] edge_policy={policy} skipped: dominated "
+                                    f"(est_lb={_rank_local_lb:.1f}s = build {_t_build_solo:.1f}s "
+                                    f"x contention>={_contention_lb:.1f} >= "
+                                    f"broadcast total {_t_bcast_total:.1f}s; probe not worth "
+                                    f"its memory cost)."
+                                )
+                            continue
                     # For GPU policies: flush caching allocator + reset RW cache
                     # before each probe so prior policy's memory footprint does
                     # not skew the device-selection check.
@@ -774,6 +870,11 @@ def main():
                         live_edge_bytes=metrics["live_edge_bytes"],
                         enabled=True,
                     )
+                    if policy == EDGE_POLICY_CPU_BROADCAST_PREFETCH:
+                        # Input for the rank_local domination test below.  The
+                        # times inside metrics are already sp_group_max-reduced,
+                        # so every rank sees identical numbers here.
+                        _bcast_metrics = metrics
                     if args.rank == 0:
                         print(
                             f"[multi_tier] edge_policy={policy}: "
@@ -785,6 +886,16 @@ def main():
                             f"live_edge={metrics['live_edge_bytes'] / (1024 ** 2):.1f} MiB"
                         )
                 _multi_tier_edge_profiled = True
+
+                # Drop probe-built CPU sampling caches on non-src ranks.  With
+                # broadcast-style prefetch (the pre-ACTIVE default and the
+                # common winner) only the src rank builds edges, so the
+                # dst-stats CSR first materialized by the cpu_rank_local probe
+                # (~4.2 GiB on amazon) would otherwise sit unused on every
+                # other rank for the rest of the run.  Rebuilt automatically
+                # (one-time cost) if cpu_rank_local is ever applied.
+                if sp_rank != sp_src_rank:
+                    clear_edge_dst_stats_cache()
 
                 # Post-profiling: if GPU real-edge sampling OOM'd on any rank
                 # during the probes, disable GPU policies now so the planner
@@ -824,6 +935,81 @@ def main():
 
                 if profile_sp_comm:
                     reset_comm_profiler()
+
+        # ── Plan-state sync (epoch start, BEFORE the edge build) ────────────
+        # These blocks previously lived in the post-step epoch tail, which a
+        # dropped (OOM-skipped) epoch bypasses via `continue`.  That left the
+        # runtime edge policy stale after a drop: the planner had already
+        # selected a new plan but it was never applied, so the next epoch
+        # rebuilt edges under the old, possibly infeasible policy (observed
+        # as an uncaught merge-stage OOM on ogbn-products @16 GiB cap).
+        # Hoisted here they run unconditionally; for normal epochs the
+        # effective timing is unchanged (the tail ran them just before the
+        # next epoch's build anyway).
+
+        # Adaptive mode: apply edge-cache decision once calibration completes.
+        if _is_adaptive_ckpt and not _adaptive_edge_decision_done:
+            _comm_ckpt_check = getattr(model, "_comm_ckpt", None)
+            if _comm_ckpt_check is not None and _comm_ckpt_check.is_active():
+                _adaptive_edge_decision_done = True
+                edge_index_global, edge_index_gpu_cached = _apply_adaptive_edge_cache_decision(
+                    model, args, edge_index_global, edge_index_gpu_cached,
+                    device=device, sp_group=sp_group, sp_world_size=sp_world_size,
+                )
+
+        # multi_tier: apply topology-cache decision once ACTIVE.
+        if _is_multi_tier and not _multi_tier_decision_done:
+            _mt_ckpt = getattr(model, "_comm_ckpt", None)
+            if _mt_ckpt is not None and _mt_ckpt.is_active():
+                _multi_tier_decision_done = True
+                edge_index_global, edge_index_gpu_cached = _apply_multi_tier_active_plan(
+                    model, args, edge_index_global, edge_index_gpu_cached,
+                    device=device, sp_group=sp_group, sp_world_size=sp_world_size,
+                )
+                # --force_multi_tier_plan override (for ablation / manual testing).
+                _force_plan = str(getattr(args, "force_multi_tier_plan", "") or "")
+                if _force_plan and _mt_ckpt is not None:
+                    _forced = _parse_force_multi_tier_plan(_force_plan, _mt_ckpt.n_layers)
+                    if _forced is not None:
+                        _forced_policy, _forced_modes = _forced
+                        _mt_ckpt.override_active_plan(
+                            edge_policy=_forced_policy,
+                            modes=_forced_modes,
+                        )
+                        edge_index_global, edge_index_gpu_cached = _apply_multi_tier_active_plan(
+                            model, args, edge_index_global, edge_index_gpu_cached,
+                            device=device, sp_group=sp_group, sp_world_size=sp_world_size,
+                        )
+
+        # Reactive edge-policy correction: if a GPU real-edge build OOM'd and
+        # fell back to CPU (recorded run-level by the build path), tell the
+        # planner to drop GPU edge policies and re-plan to the fastest
+        # feasible CPU-prefetch policy.  Cross-rank MAX-reduced for collective
+        # safety.
+        if _is_multi_tier:
+            _mt_fb = getattr(model, "_comm_ckpt", None)
+            if _mt_fb is not None and _mt_fb.is_active():
+                _local_infeasible = int(
+                    _mt_fb.edge_policy in (EDGE_POLICY_GPU_EPHEMERAL, EDGE_POLICY_GPU_PERSIST)
+                    and rw_realedge_gpu_infeasible_any()
+                )
+                if sp_world_size > 1 and dist.is_initialized():
+                    _fb_t = torch.tensor([_local_infeasible], device=device, dtype=torch.long)
+                    dist.all_reduce(_fb_t, op=dist.ReduceOp.MAX, group=sp_group)
+                    _local_infeasible = int(_fb_t.item())
+                if _local_infeasible:
+                    _fb_changed = _mt_fb.report_runtime_edge_gpu_infeasible(device)
+                    if _fb_changed:
+                        if _prefetch_future is not None:
+                            try:
+                                _prefetch_future.result()
+                            except Exception:
+                                pass
+                            _prefetch_future = None
+                        edge_index_global, edge_index_gpu_cached = _apply_multi_tier_active_plan(
+                            model, args, edge_index_global, edge_index_gpu_cached,
+                            device=device, sp_group=sp_group, sp_world_size=sp_world_size,
+                        )
 
         def _build_edges_for_epoch():
             return _build_attention_edges(
@@ -865,11 +1051,67 @@ def main():
             except Exception:
                 pass
 
-        edge_index_rw, rw_time = _time_step_block(
-            _build_edges_for_epoch,
-            device=device,
-            synchronize_cuda=sync_step_timing,
-        )
+        # Epoch-level edge build with voted OOM recovery.  This build sits
+        # outside the step-level OOM machinery; an uncaught OOM here (e.g. in
+        # the merge/adjust stage, which has no internal device fallback) used
+        # to kill the whole run.  All ranks vote on the failure so the
+        # recovery path (collective re-plan) stays rank-consistent.
+        def _sp_any_build_fail(flag: bool) -> bool:
+            if sp_world_size > 1 and dist.is_initialized():
+                _t = torch.tensor([int(flag)], device=device, dtype=torch.long)
+                dist.all_reduce(_t, op=dist.ReduceOp.MAX, group=sp_group)
+                return bool(_t.item())
+            return bool(flag)
+
+        _build_fail_local = False
+        edge_index_rw, rw_time = None, 0.0
+        try:
+            edge_index_rw, rw_time = _time_step_block(
+                _build_edges_for_epoch,
+                device=device,
+                synchronize_cuda=sync_step_timing,
+            )
+        except torch.cuda.OutOfMemoryError:
+            _build_fail_local = True
+        if _sp_any_build_fail(_build_fail_local):
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            # If a GPU edge policy is active, mark it runtime-infeasible and
+            # re-plan to the best CPU policy (collective), then rebuild once.
+            if _is_multi_tier:
+                _mt_b = getattr(model, "_comm_ckpt", None)
+                if (
+                    _mt_b is not None
+                    and _mt_b.is_active()
+                    and _mt_b.edge_policy in (EDGE_POLICY_GPU_EPHEMERAL, EDGE_POLICY_GPU_PERSIST)
+                ):
+                    if _mt_b.report_runtime_edge_gpu_infeasible(device):
+                        edge_index_global, edge_index_gpu_cached = _apply_multi_tier_active_plan(
+                            model, args, edge_index_global, edge_index_gpu_cached,
+                            device=device, sp_group=sp_group, sp_world_size=sp_world_size,
+                        )
+            if args.rank == 0:
+                print(
+                    f"[edge-build] OOM during epoch {epoch} edge build on some rank; "
+                    f"rebuilding once after cleanup/re-plan."
+                )
+            _build_fail_local = False
+            try:
+                edge_index_rw, rw_time = _time_step_block(
+                    _build_edges_for_epoch,
+                    device=device,
+                    synchronize_cuda=sync_step_timing,
+                )
+            except torch.cuda.OutOfMemoryError:
+                _build_fail_local = True
+            if _sp_any_build_fail(_build_fail_local):
+                # Symmetric abort: every rank raises together, no rank is left
+                # blocking inside a later collective.
+                raise RuntimeError(
+                    f"edge build OOM persists after cleanup/re-plan at epoch "
+                    f"{epoch}; aborting (all ranks)."
+                )
 
         # Exphormer edge-type assembly.
         # Mode A (--expander_degree > 0): fixed expander as type 1, RW/real as type 0.
@@ -948,7 +1190,14 @@ def main():
                     loss = out_local.sum() * 0.0
             return out_local, out_rows, local_y_eff, valid_train_mask, local_train_idx_eff, loss
 
+        # Phase marker for the OOM-recovery policy below: an OOM raised after
+        # backward has started may leave shared autograd state (epoch-level
+        # tensors reused across attempts, partially recomputed checkpoint
+        # frames) inconsistent, so in-place retry of the step is unsafe.
+        _step_phase = {"bwd_started": False}
+
         def _run_fwd_bwd_opt():
+            _step_phase["bwd_started"] = False
             fwd_result, fwd_t = _time_step_block(
                 _forward_step,
                 device=device,
@@ -969,6 +1218,7 @@ def main():
                     scaler.scale(loss_).backward()
                 else:
                     loss_.backward()
+            _step_phase["bwd_started"] = True
             _, autograd_bwd_t = _time_step_block(
                 _autograd_backward_step,
                 device=device,
@@ -1028,11 +1278,21 @@ def main():
             _oom_retries = 0
             while True:
                 local_oom = False
+                local_retry_unsafe = False
                 try:
                     step_outputs = _run_fwd_bwd_opt()
                 except torch.cuda.OutOfMemoryError as _e:
                     local_oom = True
                     _oom_exc = _e
+                    local_retry_unsafe = _step_phase["bwd_started"]
+                except _CheckpointError as _e:
+                    # Recompute-consistency failure: in practice secondary
+                    # damage after an earlier mid-backward OOM left shared
+                    # autograd state inconsistent. Never retry on it — treat
+                    # as an unrecoverable step and drop below.
+                    local_oom = True
+                    _oom_exc = _e
+                    local_retry_unsafe = True
                 # Every rank must vote on OOM status: if one rank OOM'd inside an NCCL
                 # collective, others are blocked there and can't reach this point — they
                 # will surface as a timeout rather than a local OOM flag.
@@ -1122,6 +1382,22 @@ def main():
                             f"dropping this step."
                         )
                     return None, True
+                # Retry-safety gate (cross-rank synced): if any rank failed
+                # after backward had started — or hit a CheckpointError — the
+                # epoch-level autograd state shared across attempts may be
+                # inconsistent (partially recomputed checkpoint frames),
+                # and an in-place retry can crash with CheckpointError.
+                # The fallback above already adjusted the plan; drop this
+                # step and let the adjusted plan take effect next step.
+                if _sp_any_oom(local_retry_unsafe):
+                    if args.rank == 0:
+                        print(
+                            f"[multi_tier] OOM at epoch {epoch} ({_recovery_kind}) "
+                            f"after backward had started; in-place retry is unsafe "
+                            f"(stale checkpoint state). Dropping this step; the "
+                            f"adjusted plan takes effect from the next step."
+                        )
+                    return None, True
                 _oom_retries += 1
                 if args.rank == 0:
                     print(
@@ -1165,6 +1441,9 @@ def main():
                     dist.barrier(group=sp_group)
                 except Exception:
                     pass
+            # Plan-state sync (incl. the reactive edge-policy correction) now
+            # runs at the START of every epoch, so the next epoch will apply
+            # any plan selected or invalidated during this dropped one.
             continue
         # A step completed with a gradient update — reset the structural-OOM guard.
         _consecutive_oom_drops = 0
@@ -1189,79 +1468,10 @@ def main():
         if hasattr(model, "comm_aware_notify_step_end"):
             model.comm_aware_notify_step_end(device, t_bwd=bwd_time, t_fwd=fwd_time)
 
-        # Adaptive mode: apply edge-cache decision once calibration completes.
-        # The checkpointer transitions to ACTIVE after the calibrate step, so
-        # this block runs exactly once (at the start of epoch 3 effective work).
-        if _is_adaptive_ckpt and not _adaptive_edge_decision_done:
-            _comm_ckpt_check = getattr(model, "_comm_ckpt", None)
-            if _comm_ckpt_check is not None and _comm_ckpt_check.is_active():
-                _adaptive_edge_decision_done = True
-                edge_index_global, edge_index_gpu_cached = _apply_adaptive_edge_cache_decision(
-                    model, args, edge_index_global, edge_index_gpu_cached,
-                    device=device, sp_group=sp_group, sp_world_size=sp_world_size,
-                )
-
-        # multi_tier: apply topology-cache decision once ACTIVE.
-        # Runs exactly once, after the planner finishes its last probe step.
-        # Mirrors the adaptive-checkpoint sync pattern above but serves the
-        # _MultiTierResourceManager instead of _CommAwareCheckpointer.
-        if _is_multi_tier and not _multi_tier_decision_done:
-            _mt_ckpt = getattr(model, "_comm_ckpt", None)
-            if _mt_ckpt is not None and _mt_ckpt.is_active():
-                _multi_tier_decision_done = True
-                edge_index_global, edge_index_gpu_cached = _apply_multi_tier_active_plan(
-                    model, args, edge_index_global, edge_index_gpu_cached,
-                    device=device, sp_group=sp_group, sp_world_size=sp_world_size,
-                )
-                # --force_multi_tier_plan override (for ablation / manual testing).
-                # Format: "<edge_policy>:<tier_config>"
-                # Examples: "gpu_persist:recompute"  "gpu_ephemeral:keep_mha=2"
-                _force_plan = str(getattr(args, "force_multi_tier_plan", "") or "")
-                if _force_plan and _mt_ckpt is not None:
-                    _forced = _parse_force_multi_tier_plan(_force_plan, _mt_ckpt.n_layers)
-                    if _forced is not None:
-                        _forced_policy, _forced_modes = _forced
-                        _mt_ckpt.override_active_plan(
-                            edge_policy=_forced_policy,
-                            modes=_forced_modes,
-                        )
-                        # Keep edge_index_global/gpu_cached consistent with forced policy.
-                        edge_index_global, edge_index_gpu_cached = _apply_multi_tier_active_plan(
-                            model, args, edge_index_global, edge_index_gpu_cached,
-                            device=device, sp_group=sp_group, sp_world_size=sp_world_size,
-                        )
-
-        # Reactive edge-policy correction: if a GPU real-edge build OOM'd this
-        # epoch and fell back to CPU (recorded run-level by the build path),
-        # the planner's profiled gpu_peak was wrong (allocator fragmentation,
-        # not statically predictable). Tell the planner to drop both GPU edge
-        # policies and re-plan to the fastest feasible CPU-prefetch policy. The
-        # check + re-plan must be cross-rank consistent to avoid an NCCL
-        # deadlock when only some ranks OOM, so MAX-reduce the local flag first.
-        if _is_multi_tier:
-            _mt_fb = getattr(model, "_comm_ckpt", None)
-            if _mt_fb is not None and _mt_fb.is_active():
-                _local_infeasible = int(
-                    _mt_fb.edge_policy in (EDGE_POLICY_GPU_EPHEMERAL, EDGE_POLICY_GPU_PERSIST)
-                    and rw_realedge_gpu_infeasible_any()
-                )
-                if sp_world_size > 1 and dist.is_initialized():
-                    _fb_t = torch.tensor([_local_infeasible], device=device, dtype=torch.long)
-                    dist.all_reduce(_fb_t, op=dist.ReduceOp.MAX, group=sp_group)
-                    _local_infeasible = int(_fb_t.item())
-                if _local_infeasible:
-                    _fb_changed = _mt_fb.report_runtime_edge_gpu_infeasible(device)
-                    if _fb_changed:
-                        if _prefetch_future is not None:
-                            try:
-                                _prefetch_future.result()
-                            except Exception:
-                                pass
-                            _prefetch_future = None
-                        edge_index_global, edge_index_gpu_cached = _apply_multi_tier_active_plan(
-                            model, args, edge_index_global, edge_index_gpu_cached,
-                            device=device, sp_group=sp_group, sp_world_size=sp_world_size,
-                        )
+        # NOTE: plan-state sync (adaptive edge-cache apply, multi_tier ACTIVE
+        # plan apply + force override, reactive edge-policy correction) was
+        # hoisted to the START of the epoch loop, before the edge build, so
+        # that dropped (OOM-skipped) epochs cannot bypass it.
 
         loss_val = loss.item()
         loss_ema = loss_val if loss_ema is None else 0.9 * loss_ema + 0.1 * loss_val

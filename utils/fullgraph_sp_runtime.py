@@ -13,7 +13,11 @@ import time
 import torch
 import torch.distributed as dist
 
-from gt_sp.utils import clear_random_walk_graph_cache, _clear_rw_device_cache
+from gt_sp.utils import (
+    clear_random_walk_graph_cache,
+    _clear_rw_device_cache,
+    rw_realedge_gpu_infeasible_any,
+)
 from utils.fullgraph_sp_support import (
     EDGE_POLICY_CPU_BROADCAST,
     EDGE_POLICY_CPU_BROADCAST_PREFETCH,
@@ -31,6 +35,7 @@ from utils.fullgraph_sp_support import (
     _try_cache_edge_index_on_gpu,
     _use_real_edges,
     _use_rw_edges,
+    clear_edge_dst_stats_cache,
     clear_merged_edge_cache,
 )
 
@@ -389,35 +394,70 @@ def _profile_multi_tier_edge_policy(
 
     cpu_before = _get_process_rss_mib()
     gpu_peak_abs = 0
+    first_build_peak = 0
     cpu_delta_bytes = 0
     prep_time = 0.0
     policy_oom = False
-    if torch.cuda.is_available() and device.startswith("cuda"):
+    _is_cuda = torch.cuda.is_available() and device.startswith("cuda")
+    if _is_cuda:
         torch.cuda.synchronize(device)
         torch.cuda.reset_peak_memory_stats(device)
+
+    def _probe_build(_seed):
+        return _build_attention_edges(
+            args,
+            probe_edge_index_global,
+            num_nodes,
+            device,
+            rw_device,
+            sp_group,
+            sp_src_rank,
+            sp_rank,
+            local_num_nodes,
+            edge_seed=_seed,
+            edge_budget_state=edge_budget_state,
+            adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
+            edge_policy=policy,
+        )
+
     try:
+        # Cold build: pays one-time construction costs (for gpu_persist the
+        # RW CSR must be rebuilt because the freshly cached topology has a
+        # new data_ptr; plus H2D staging and merged-edge structures).  These
+        # transients do not recur per training step, so gating the policy on
+        # this peak systematically overestimates it (gpu_persist measured
+        # 22.9 GiB cold vs an estimated ~18.6 GiB steady on amazon).
         edge_index_probe, prep_time = _time_step_block(
-            lambda: _build_attention_edges(
-                args,
-                probe_edge_index_global,
-                num_nodes,
-                device,
-                rw_device,
-                sp_group,
-                sp_src_rank,
-                sp_rank,
-                local_num_nodes,
-                edge_seed=edge_seed,
-                edge_budget_state=edge_budget_state,
-                adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
-                edge_policy=policy,
-            ),
+            lambda: _probe_build(edge_seed),
             device=device,
             synchronize_cuda=precise_step_timing,
         )
-        if torch.cuda.is_available() and device.startswith("cuda"):
+        if _is_cuda:
+            first_build_peak = int(torch.cuda.max_memory_allocated(device))
+        # Warm build: structural caches (CSR, topology) are now in their
+        # steady ACTIVE-phase state.  A bumped seed defeats seed-keyed result
+        # caches, mirroring the per-epoch seed change of real training.  The
+        # warm time and peak are what the planner ranks and gates on.
+        del edge_index_probe
+        if _is_cuda:
+            torch.cuda.synchronize(device)
+            torch.cuda.reset_peak_memory_stats(device)
+        _warm_seed = (int(edge_seed) + 1) if edge_seed is not None else None
+        edge_index_probe, prep_time = _time_step_block(
+            lambda: _probe_build(_warm_seed),
+            device=device,
+            synchronize_cuda=precise_step_timing,
+        )
+        if _is_cuda:
             gpu_peak_abs = int(torch.cuda.max_memory_allocated(device))
         cpu_delta_bytes = max(int(((_get_process_rss_mib() - cpu_before) * (1024 ** 2))), 0)
+        if args.rank == 0 and _is_cuda and first_build_peak > gpu_peak_abs:
+            print(
+                f"[multi_tier] edge_policy={policy}: cold-build peak="
+                f"{first_build_peak / (1024 ** 2):.1f} MiB (one-time cache "
+                f"construction) vs warm peak={gpu_peak_abs / (1024 ** 2):.1f} MiB; "
+                f"planner uses the warm value."
+            )
     except torch.cuda.OutOfMemoryError as oom:
         policy_oom = True
         if args.rank == 0:
@@ -430,6 +470,14 @@ def _profile_multi_tier_edge_policy(
         if "edge_index_probe" in locals():
             del edge_index_probe
         if probe_cached and probe_edge_index_global is not edge_index_global:
+            # Evict RW CSR entries keyed to the temporary GPU topology cache
+            # BEFORE freeing it — otherwise a ~2.1 GiB CSR for a dead pointer
+            # lingers in HBM for the rest of the run and inflates every later
+            # memory measurement.
+            clear_random_walk_graph_cache(
+                device_type="cuda",
+                data_ptr=probe_edge_index_global.data_ptr(),
+            )
             del probe_edge_index_global
         gc.collect()
         if torch.cuda.is_available():
@@ -706,6 +754,37 @@ def _apply_multi_tier_active_plan(
                 f"[multi_tier] Applying edge_policy={_mt_policy} "
                 "(no persistent full-edge cache)."
             )
+
+    # ---- Cache trim: drop CSR caches the applied policy will not use ----
+    # GPU edge policies sample on-device every step, so the CPU dst-stats
+    # CSR built during pre-freeze / calibration CPU sampling (~4.2 GiB per
+    # rank on amazon) is dead weight for the rest of the run.  Skip the trim
+    # in the sticky CPU-fallback regime (real-edge sampling forced to CPU),
+    # where the cache is still read every epoch.  The CPU RW CSR (~2.1 GiB)
+    # is intentionally kept: it is the cheap H2D rebuild source for the GPU
+    # RW CSR, and dropping it would force an expensive on-GPU coalesce if
+    # the GPU entry is ever evicted.
+    # CPU prefetch policies are the inverse: RW runs on CPU, so GPU-resident
+    # RW CSR entries (~2.1 GiB HBM) only consume activation headroom.
+    _final_policy = getattr(args, "_runtime_edge_policy", None)
+    if _final_policy in (EDGE_POLICY_GPU_PERSIST, EDGE_POLICY_GPU_EPHEMERAL):
+        if not rw_realedge_gpu_infeasible_any():
+            _n_dropped = clear_edge_dst_stats_cache()
+            if _n_dropped > 0 and args.rank == 0:
+                print(
+                    f"[multi_tier] Dropped CPU dst-stats CSR cache "
+                    f"({_n_dropped} entr{'y' if _n_dropped == 1 else 'ies'}; "
+                    f"unused by edge_policy={_final_policy})."
+                )
+    else:
+        _n_evicted = clear_random_walk_graph_cache(device_type="cuda")
+        if _n_evicted > 0 and args.rank == 0:
+            print(
+                f"[multi_tier] Evicted {_n_evicted} GPU RW CSR cache "
+                f"entr{'y' if _n_evicted == 1 else 'ies'} "
+                f"(unused by edge_policy={_final_policy})."
+            )
+
     _cuda_empty_cache(args)
     return edge_index_global, edge_index_gpu_cached
 
