@@ -143,10 +143,11 @@ def _parse_force_multi_tier_plan(spec: str, n_layers: int):
             modes = ["recompute"] * (n_layers - k) + ["retain"] * k
         else:
             raise ValueError(f"unknown tier_config {tier_spec!r}")
-        print(
-            f"[force_multi_tier_plan] Overriding planner: "
-            f"edge_policy={edge_policy}  tiers={modes}"
-        )
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            print(
+                f"[force_multi_tier_plan] Overriding planner: "
+                f"edge_policy={edge_policy}  tiers={modes}"
+            )
         return edge_policy, modes
     except Exception as exc:
         print(f"[force_multi_tier_plan] WARNING: could not parse {spec!r}: {exc}; ignoring override.")
@@ -962,24 +963,22 @@ def main():
             _mt_ckpt = getattr(model, "_comm_ckpt", None)
             if _mt_ckpt is not None and _mt_ckpt.is_active():
                 _multi_tier_decision_done = True
+                # --force_multi_tier_plan override (for ablation / manual testing).
+                # Apply BEFORE _apply_multi_tier_active_plan so the correct policy
+                # is visible on the first (and only) call, avoiding a spurious
+                # GPU cache followed by an immediate CPU demotion.
+                _force_plan = str(getattr(args, "force_multi_tier_plan", "") or "")
+                if _force_plan:
+                    _forced = _parse_force_multi_tier_plan(_force_plan, _mt_ckpt.n_layers)
+                    if _forced is not None:
+                        _mt_ckpt.override_active_plan(
+                            edge_policy=_forced[0],
+                            modes=_forced[1],
+                        )
                 edge_index_global, edge_index_gpu_cached = _apply_multi_tier_active_plan(
                     model, args, edge_index_global, edge_index_gpu_cached,
                     device=device, sp_group=sp_group, sp_world_size=sp_world_size,
                 )
-                # --force_multi_tier_plan override (for ablation / manual testing).
-                _force_plan = str(getattr(args, "force_multi_tier_plan", "") or "")
-                if _force_plan and _mt_ckpt is not None:
-                    _forced = _parse_force_multi_tier_plan(_force_plan, _mt_ckpt.n_layers)
-                    if _forced is not None:
-                        _forced_policy, _forced_modes = _forced
-                        _mt_ckpt.override_active_plan(
-                            edge_policy=_forced_policy,
-                            modes=_forced_modes,
-                        )
-                        edge_index_global, edge_index_gpu_cached = _apply_multi_tier_active_plan(
-                            model, args, edge_index_global, edge_index_gpu_cached,
-                            device=device, sp_group=sp_group, sp_world_size=sp_world_size,
-                        )
 
         # Reactive edge-policy correction: if a GPU real-edge build OOM'd and
         # fell back to CPU (recorded run-level by the build path), tell the
@@ -1356,6 +1355,13 @@ def main():
                     # at the next epoch. Allocator state often recovers across
                     # epochs, and adaptive budget probe may produce a smaller
                     # edge_index_eval shortly. Worst case we lose a few steps.
+                    #
+                    # If gpu_persist is active, the 4+ GiB persistent edge on
+                    # GPU is a likely contributor.  Tier demotion cannot evict
+                    # it, so mark gpu_persist infeasible now — the next epoch
+                    # will replan to a CPU policy.
+                    if _mt_mgr is not None and _mt_mgr.is_active() and _mt_mgr.cache_edge:
+                        _mt_mgr.report_runtime_edge_gpu_infeasible(device)
                     if args.rank == 0:
                         _reason = ("OOM with no further fallback"
                                    if local_oom else "peer rank reported OOM")
@@ -1375,6 +1381,10 @@ def main():
                 if not _recovered:
                     # All tiers already at T0 (or OOM in WARMUP/DEFERRED) — no
                     # plan adjustment can help. Drop the step and continue.
+                    # If gpu_persist is still active, mark it infeasible so the
+                    # next epoch replans to a CPU policy.
+                    if _mt_mgr.is_active() and _mt_mgr.cache_edge:
+                        _mt_mgr.report_runtime_edge_gpu_infeasible(device)
                     if args.rank == 0:
                         print(
                             f"[multi_tier] OOM at epoch {epoch} with no remaining "
@@ -1810,7 +1820,11 @@ def main():
                 )
             del accs
 
-    _prefetch_pool.shutdown(wait=False)
+    # Wait for in-flight prefetch builds to finish before the interpreter starts
+    # tearing down tensors. With wait=False a background thread could still be in
+    # native edge-construction code when the main thread frees the tensors it
+    # references, causing a SIGSEGV at process exit.
+    _prefetch_pool.shutdown(wait=True)
 
     _print_rank0_training_summary(
         args=args,
@@ -1834,6 +1848,16 @@ def main():
     )
     _print_peak_gpu_memory(args, device)
     _print_cpu_rss(args, device)
+
+    # Explicitly tear down the NCCL process group before the interpreter exits,
+    # so its cleanup does not race with CUDA-context / native-extension
+    # destructors (a common cause of SIGSEGV at exit in distributed runs).
+    if dist.is_initialized():
+        try:
+            dist.barrier()
+            dist.destroy_process_group()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

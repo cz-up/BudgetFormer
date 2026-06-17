@@ -247,6 +247,26 @@ def _clear_rw_device_cache() -> None:
     _RW_DEVICE_DECISION_CACHE.clear()
 
 
+# Per-process GPU memory cap registered by set_rw_gpu_memory_cap() when
+# torch.cuda.set_per_process_memory_fraction() is in effect.  0 means no cap.
+# _gpu_can_fit_rw uses this to bound the usable budget: the driver-reported
+# free (mem_get_info) is the physical free and does NOT account for the
+# per-process cap, so without this correction _gpu_can_fit_rw can return True
+# while the actual allocation later fails (cap - reserved is too small for
+# the requested contiguous block, even though physical free looks ample).
+_GPU_PROCESS_MEMORY_CAP_BYTES: int = 0
+
+
+def set_rw_gpu_memory_cap(cap_bytes: int) -> None:
+    """Register the per-process GPU memory cap set via set_per_process_memory_fraction.
+
+    Should be called once from _apply_multi_tier_gpu_memory_limit() after the
+    fraction is set.  Passing 0 disables the cap-awareness correction.
+    """
+    global _GPU_PROCESS_MEMORY_CAP_BYTES
+    _GPU_PROCESS_MEMORY_CAP_BYTES = max(0, int(cap_bytes))
+
+
 # Run-level registry of (device_str, E) for which a real-edge GPU sampling build
 # was observed to OOM at runtime and fall back to CPU. Unlike
 # _RW_DEVICE_DECISION_CACHE (a per-probe log-suppression cache cleared by
@@ -392,6 +412,20 @@ def _gpu_can_fit_rw(device, need_bytes: int) -> bool:
                 torch.cuda.memory_reserved(torch_device) - torch.cuda.memory_allocated(torch_device),
             )
             free = free + reserved_slack
+        except Exception:
+            pass
+    # If a per-process memory cap is set via set_per_process_memory_fraction(),
+    # mem_get_info returns the driver-level physical free, which is unaware of
+    # the cap.  The allocator can only extend its reserved pool up to
+    # (cap - reserved); new contiguous allocations beyond the pool's existing
+    # free blocks must come from that headroom.  Clamp free to this headroom so
+    # the check doesn't over-optimistically greenlight GPU builds that will later
+    # OOM when the actual cudaMalloc is gated by the cap.
+    if _GPU_PROCESS_MEMORY_CAP_BYTES > 0:
+        try:
+            reserved = torch.cuda.memory_reserved(torch_device)
+            cap_headroom = max(0, _GPU_PROCESS_MEMORY_CAP_BYTES - reserved)
+            free = min(int(free), cap_headroom)
         except Exception:
             pass
     overhead = _gpu_concurrent_overhead_bytes(torch_device)
@@ -1065,54 +1099,83 @@ def compute_hop_buckets_random_walk(
     # CPU-fallback regime does not flood stdout.
     if rw_device.type == "cuda":
         E_cur = int(edge_index.size(1))
-        # The dominant GPU cost is building the CSR (SparseTensor.coalesce +
-        # argsort) — 6 × E × 8 bytes on large graphs.  After the first call,
-        # _get_random_walk_graph caches the CSR on CPU and can H2D transfer
-        # rowptr + col to GPU without any sorting.  In that case, only the
-        # walk tensors + transient H2D buffers need to fit, not the full
-        # sort pipeline.  Use a reduced estimate when the CPU CSR is cached.
-        _cpu_csr_key = (int(edge_index.data_ptr()), E_cur, num_nodes, "cpu", None)
-        if _cpu_csr_key in _RANDOM_WALK_GRAPH_CACHE:
+        # Sticky OOM record: if a prior GPU walk OOM'd for this exact graph,
+        # skip GPU entirely rather than re-evaluating every epoch.  The cold
+        # estimate (~12.5 GiB for amazon) passes _gpu_can_fit_rw on a 30 GiB
+        # card even at a 16 GiB cap, so the reactive OOM-then-fallback loop
+        # would repeat forever without this sticky bypass.
+        _oom_sticky_key = ("rw_gpu_oom", int(edge_index.data_ptr()), E_cur, int(num_nodes))
+        if _oom_sticky_key in _RW_DEVICE_DECISION_CACHE:
+            rw_device = torch.device("cpu")
+        else:
+            # Three-level estimate: cold → CPU CSR cached (H2D + COO) → GPU CSR
+            # cached (just COO row+sort, col already live).  See block below.
+            _cuda_csr_key = (int(edge_index.data_ptr()), E_cur, num_nodes, rw_device.type, rw_device.index)
+            _cpu_csr_key = (int(edge_index.data_ptr()), E_cur, num_nodes, "cpu", None)
             N_cur = max(1, int(num_nodes))
             W = max(1, int(walks_per_node))
             L = max(1, int(walk_length))
-            col_h2d = E_cur * 8          # H2D col array (transient, largest piece)
-            estimate = int(
-                col_h2d
-                + N_cur * W * (L + 1) * 8    # walks tensor
-                + N_cur * W * 33              # per-d peak (mask+2×select+stack)
-                + 2 * N_cur * W * L * 8       # bucket_cumulative
-            )
-        else:
-            estimate = _estimate_rw_working_set_bytes(
-                num_nodes=num_nodes,
-                num_edges=E_cur,
-                walks_per_node=walks_per_node,
-                walk_length=walk_length,
-            )
-        if not _gpu_can_fit_rw(rw_device, estimate):
-            try:
-                free, _ = torch.cuda.mem_get_info(rw_device)
-                free_mib = free / (1024 ** 2)
-            except Exception:
-                free_mib = -1.0
-            cache_key = ("compute_hop_buckets_random_walk", str(rw_device), E_cur, "cpu")
-            prev = _RW_DEVICE_DECISION_CACHE.get(cache_key)
-            overhead_mib = _gpu_concurrent_overhead_bytes(rw_device) / (1024 ** 2)
-            usable_mib = max(0.0, free_mib - overhead_mib)
-            if prev is None and _rw_log_is_rank0():
-                print(
-                    f"[rw-device] compute_hop_buckets_random_walk: estimated "
-                    f"working set {estimate/(1024**2):.0f} MiB > usable GPU "
-                    f"{usable_mib:.0f} MiB (driver_free={free_mib:.0f} − "
-                    f"overhead {overhead_mib:.0f} MiB), "
-                    f"num_edges={E_cur:,}; forcing CPU build. NOTE: this overrides "
-                    f"only the RW build device; topology policies such as gpu_persist "
-                    f"may still cache edge_index_global on GPU. "
-                    f"(Further matching calls suppressed.)"
+            # Newer torch_cluster (≥1.6) uses COO API (row, col) — _run_random_walk
+            # always reconstructs row=repeat_interleave(arange(N), degrees) (E×8),
+            # then torch_cluster internally allocates:
+            #   step1=row*N (E×8), step2=(row*N+col) (E×8), argsort (E×8),
+            #   radix_aux (E×8), perm_outputs=row[perm]+col[perm] (2×E×8)  → 6×E×8.
+            # Three cases:
+            #   GPU CSR cached  → col is already a live GPU tensor; no H2D needed.
+            #   CPU CSR cached  → col must be H2D'd (one more E×8 term).
+            #   Cold            → full SparseTensor build dominates.
+            if _cuda_csr_key in _RANDOM_WALK_GRAPH_CACHE:
+                row_coo = E_cur * 8
+                tc_sort = 6 * E_cur * 8      # 6×E×8: step1+step2+argsort+radix+perm(2×)
+                estimate = int(
+                    row_coo
+                    + tc_sort
+                    + N_cur * W * (L + 1) * 8    # walks tensor
+                    + N_cur * W * 33              # per-d peak (mask+2×select+stack)
+                    + 2 * N_cur * W * L * 8       # bucket_cumulative
                 )
-            _RW_DEVICE_DECISION_CACHE[cache_key] = (estimate, free_mib)
-            rw_device = torch.device("cpu")
+            elif _cpu_csr_key in _RANDOM_WALK_GRAPH_CACHE:
+                col_h2d = E_cur * 8
+                row_coo = E_cur * 8
+                tc_sort = 6 * E_cur * 8      # 6×E×8: step1+step2+argsort+radix+perm(2×)
+                estimate = int(
+                    col_h2d
+                    + row_coo
+                    + tc_sort
+                    + N_cur * W * (L + 1) * 8    # walks tensor
+                    + N_cur * W * 33              # per-d peak (mask+2×select+stack)
+                    + 2 * N_cur * W * L * 8       # bucket_cumulative
+                )
+            else:
+                estimate = _estimate_rw_working_set_bytes(
+                    num_nodes=num_nodes,
+                    num_edges=E_cur,
+                    walks_per_node=walks_per_node,
+                    walk_length=walk_length,
+                )
+            if not _gpu_can_fit_rw(rw_device, estimate):
+                try:
+                    free, _ = torch.cuda.mem_get_info(rw_device)
+                    free_mib = free / (1024 ** 2)
+                except Exception:
+                    free_mib = -1.0
+                cache_key = ("compute_hop_buckets_random_walk", str(rw_device), E_cur, "cpu")
+                prev = _RW_DEVICE_DECISION_CACHE.get(cache_key)
+                overhead_mib = _gpu_concurrent_overhead_bytes(rw_device) / (1024 ** 2)
+                usable_mib = max(0.0, free_mib - overhead_mib)
+                if prev is None and _rw_log_is_rank0():
+                    print(
+                        f"[rw-device] compute_hop_buckets_random_walk: estimated "
+                        f"working set {estimate/(1024**2):.0f} MiB > usable GPU "
+                        f"{usable_mib:.0f} MiB (driver_free={free_mib:.0f} − "
+                        f"overhead {overhead_mib:.0f} MiB), "
+                        f"num_edges={E_cur:,}; forcing CPU build. NOTE: this overrides "
+                        f"only the RW build device; topology policies such as gpu_persist "
+                        f"may still cache edge_index_global on GPU. "
+                        f"(Further matching calls suppressed.)"
+                    )
+                _RW_DEVICE_DECISION_CACHE[cache_key] = (estimate, free_mib)
+                rw_device = torch.device("cpu")
 
     edge_index_dev, rowptr, col = _get_random_walk_graph(edge_index, num_nodes, rw_device)
 
@@ -1132,11 +1195,18 @@ def compute_hop_buckets_random_walk(
             int(num_nodes), rw_device.type, rw_device.index,
         )
         _RANDOM_WALK_GRAPH_CACHE.pop(_bad_key, None)
-        _RW_DEVICE_DECISION_CACHE.clear()
+        # Store a sticky CPU-forced record so all subsequent epochs skip the
+        # GPU attempt directly, without re-evaluating the estimate every time.
+        # The cold estimate (~12.5 GiB on amazon) always passes _gpu_can_fit_rw
+        # on a large-physical-memory card even under a 16 GiB cap, so without
+        # this sticky entry the OOM → CPU-fallback loop would repeat forever.
+        _oom_sticky_key = ("rw_gpu_oom", int(edge_index.data_ptr()), int(edge_index.size(1)), int(num_nodes))
+        _RW_DEVICE_DECISION_CACHE[_oom_sticky_key] = True
         if _rw_log_is_rank0():
             print(
                 f"[rw-device] GPU walk failed ({type(_gpu_walk_exc).__name__}); "
-                f"evicting GPU CSR cache and retrying on CPU."
+                f"evicting GPU CSR cache and retrying on CPU. "
+                f"GPU walk suppressed for subsequent epochs (num_edges={int(edge_index.size(1)):,})."
             )
         rw_device = torch.device("cpu")
         edge_index_dev, rowptr, col = _get_random_walk_graph(edge_index, num_nodes, rw_device)
@@ -1295,14 +1365,19 @@ def compute_khop_pool_dgl_neighbor(
 
 def _run_random_walk(edge_index: Tensor, rowptr: Tensor, col: Tensor, starts: Tensor, walk_length: int) -> Tensor:
     # DGL path: better CPU parallelism (OpenMP) for CPU-resident graphs.
-    # Only used on CPU from the main thread; background prefetch threads fall
-    # through to torch_cluster.  DGL's OpenMP workers and its internal CUDA
-    # context accesses are not safe when called concurrently with GPU training
-    # on the main thread, causing deadlocks.  torch_cluster is thread-safe and
-    # respects PyTorch's CPU RNG, so prefetch walks remain deterministic.
+    # Main-thread calls: construct the DGL graph on first use, cache it, run.
+    # Background-thread calls: use DGL only when the graph is already cached —
+    # graph *construction* may touch CUDA context internals that conflict with
+    # concurrent GPU training, but a random_walk on a pre-built CPU graph is a
+    # pure CPU operation and is safe from any thread.  If the graph is not yet
+    # cached (first call from a background thread before the main thread has
+    # built it), fall through to torch_cluster which is always thread-safe.
     if rowptr.device.type == "cpu":
         import threading as _threading
-        if _threading.current_thread() is _threading.main_thread():
+        _is_main = _threading.current_thread() is _threading.main_thread()
+        key = (int(rowptr.data_ptr()), int(col.data_ptr()))
+        _cached_g = _DGL_GRAPH_CACHE.get(key)
+        if _is_main or _cached_g is not None:
             try:
                 import dgl as _dgl
                 # Draw from PyTorch's CPU RNG instead of using initial_seed().
@@ -1312,9 +1387,9 @@ def _run_random_walk(edge_index: Tensor, rowptr: Tensor, col: Tensor, starts: Te
                 # determinism while allowing normal training walks to evolve.
                 dgl_seed = int(torch.randint(0, 2**31 - 1, (1,), dtype=torch.int64).item())
                 _dgl.seed(dgl_seed)
-                key = (int(rowptr.data_ptr()), int(col.data_ptr()))
-                g = _DGL_GRAPH_CACHE.get(key)
+                g = _cached_g
                 if g is None:
+                    # Main thread: construct and cache.
                     num_nodes = int(rowptr.numel()) - 1
                     try:
                         # DGL ≥ 1.0: build directly from CSR (rowptr, col).

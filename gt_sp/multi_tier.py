@@ -116,7 +116,7 @@ class _MultiTierResourceManager:
     _CALIBRATE_RETAIN_FRONT =  4   # first-layer T4 probe
     _ACTIVE                 =  5
 
-    def __init__(self, n_layers: int, safety_margin: float = 0.15, deferred: bool = False):
+    def __init__(self, n_layers: int, safety_margin: float = 0.1, deferred: bool = False):
         self.n_layers      = int(n_layers)
         self.safety_margin = float(safety_margin)
         self._state        = self._DEFERRED if deferred else self._WARMUP_RECOMPUTE
