@@ -240,6 +240,10 @@ class _MultiTierResourceManager:
             return f"GPU total={real_mib:.0f} MiB"
         return f"GPU total={real_mib:.0f} MiB, planner_limit={effective_mib:.0f} MiB"
 
+    def _model_peak_limit_bytes(self, total_gpu: int) -> int:
+        """Peak budget used for model forward/backward planning."""
+        return max(int(total_gpu * (1.0 - self.safety_margin)), int(self._peak_warmup))
+
     @staticmethod
     def _sync_max_scalar(value, device, dtype) -> int | float:
         if (
@@ -565,17 +569,20 @@ class _MultiTierResourceManager:
             # Pre-check: FRONT probe requires first-layer MHA to persist through
             # the entire backward pass, coexisting with recomputation of all
             # subsequent layers. Worst-case peak ≈ peak_warmup + m_layer_mha.
-            # If that exceeds 90% of physical GPU, skip the FRONT probe entirely
-            # and use the last-layer measurement — safer than risking an OOM that
-            # dirties the CUDA allocator and cascades into the next training step.
+            # If that exceeds the planner's model peak budget, skip the FRONT
+            # probe entirely and use the last-layer measurement. This uses the
+            # same effective cap + safety margin as ACTIVE planning; using the
+            # physical GPU size is wrong when set_per_process_memory_fraction()
+            # emulates a smaller card.
             _peak_est_front = self._peak_warmup + self._m_layer_mha
-            _physical_gpu = torch.cuda.get_device_properties(device).total_memory
-            if _peak_est_front > int(_physical_gpu * 0.90):
+            _peak_limit = self._model_peak_limit_bytes(total_gpu)
+            if _peak_est_front > _peak_limit:
                 if is_r0:
                     print(
                         f"[MultiTierManager] Skipping CALIBRATE_MHA_FRONT: "
                         f"est_peak={_peak_est_front/(1024**2):.0f} MiB > "
-                        f"90% physical ({int(_physical_gpu*0.90)/(1024**2):.0f} MiB). "
+                        f"model_peak_limit={_peak_limit/(1024**2):.0f} MiB "
+                        f"({gpu_total_msg}, safety_margin={self.safety_margin:.2f}). "
                         f"Using last-layer M_layer^mha={m_mha_last/(1024**2):.1f} MiB. "
                         f"keep_mha restricted to the last layer only."
                     )
@@ -660,19 +667,21 @@ class _MultiTierResourceManager:
             # keeps its full activation live through the entire backward pass while
             # every later layer is recomputed, so worst-case peak ≈ peak_warmup +
             # m_layer_full. Retain is strictly heavier than keep_mha
-            # (m_full >= m_mha), so if that estimate exceeds 90% of physical GPU the
-            # FRONT probe is almost certain to OOM. An OOM here is especially costly:
-            # it fragments the CUDA allocator and, as observed in practice, leaves
-            # even the all-recompute fallback unable to fit on the retry. Skip the
-            # probe entirely and finalise with the last-layer measurement instead.
+            # (m_full >= m_mha), so if that estimate exceeds the planner's model
+            # peak budget the FRONT probe is almost certain to violate the same
+            # feasibility gate used for ACTIVE planning. An OOM here is especially
+            # costly: it can surface as an unrecoverable NCCL timeout rather than a
+            # Python CUDA OOM. Skip the probe and finalise with the last-layer
+            # measurement instead.
             _peak_est_front = self._peak_warmup + self._m_layer_full
-            _physical_gpu = torch.cuda.get_device_properties(device).total_memory
-            if _peak_est_front > int(_physical_gpu * 0.90):
+            _peak_limit = self._model_peak_limit_bytes(total_gpu)
+            if _peak_est_front > _peak_limit:
                 if is_r0:
                     print(
                         f"[MultiTierManager] Skipping CALIBRATE_RETAIN_FRONT: "
                         f"est_peak={_peak_est_front/(1024**2):.0f} MiB > "
-                        f"90% physical ({int(_physical_gpu*0.90)/(1024**2):.0f} MiB). "
+                        f"model_peak_limit={_peak_limit/(1024**2):.0f} MiB "
+                        f"({gpu_total_msg}, safety_margin={self.safety_margin:.2f}). "
                         f"Using last-layer M_layer^full={m_full_last/(1024**2):.1f} MiB. "
                         f"retain restricted to the last layer only."
                     )
@@ -742,7 +751,7 @@ class _MultiTierResourceManager:
         del device
         is_r0 = self._is_rank0()
         cpu_budget = self._available_cpu_bytes()
-        peak_limit = max(int(total_gpu * (1.0 - self.safety_margin)), int(self._peak_warmup))
+        peak_limit = self._model_peak_limit_bytes(total_gpu)
         self._active_peak_limit = peak_limit
 
         # Ground-truth gate: if GPU real-edge sampling already OOM'd this run

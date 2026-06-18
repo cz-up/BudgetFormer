@@ -811,7 +811,7 @@ def main():
                     # before each probe so prior policy's memory footprint does
                     # not skew the device-selection check.
                     if policy in _GPU_POLICIES and device.startswith("cuda"):
-                        _pre_profile_gpu_cleanup(device)
+                        _pre_profile_gpu_cleanup(device, args=args)
                     _profile_kwargs = dict(
                         args=args,
                         policy=policy,
@@ -845,7 +845,7 @@ def main():
                                 f"{metrics['cpu_delta_bytes'] / (1024**2):.0f} MiB suggests "
                                 f"CPU-RW fallback during probe; retrying after cleanup."
                             )
-                        _pre_profile_gpu_cleanup(device)
+                        _pre_profile_gpu_cleanup(device, args=args)
                         metrics_retry = _profile_multi_tier_edge_policy(**_profile_kwargs)
                         if metrics_retry is not None:
                             metrics = metrics_retry

@@ -17,6 +17,7 @@ from gt_sp.utils import (
     clear_random_walk_graph_cache,
     _clear_rw_device_cache,
     rw_realedge_gpu_infeasible_any,
+    set_rw_gpu_memory_cap,
 )
 from utils.fullgraph_sp_support import (
     EDGE_POLICY_CPU_BROADCAST,
@@ -181,6 +182,10 @@ def _apply_multi_tier_gpu_memory_limit(args, device: str) -> int:
     fraction = min(max(effective / float(real_total), 0.0), 1.0)
     torch.cuda.set_per_process_memory_fraction(fraction, dev)
     args._multi_tier_effective_gpu_memory_limit_mib = effective / (1024 ** 2)
+    # Register the cap with the RW-device feasibility checker so that
+    # _gpu_can_fit_rw accounts for the cap headroom (cap - reserved) rather
+    # than the driver-level free, which is unaware of set_per_process_memory_fraction.
+    set_rw_gpu_memory_cap(effective)
     if args.rank == 0:
         print(
             f"[gpu-cap] multi_tier per-rank GPU memory cap: "
@@ -221,11 +226,16 @@ def _edge_seed_for_epoch(epoch: int, *, args, use_epoch_seed: bool, adaptive_edg
     return args.seed + epoch
 
 
-def _pre_profile_gpu_cleanup(device: str) -> None:
+def _pre_profile_gpu_cleanup(device: str, args=None) -> None:
     """Best-effort GPU cleanup before profiling a policy.
 
-    Clears the PyTorch caching allocator and resets the RW-device decision
-    cache so that each policy sees an uncontaminated GPU memory estimate.
+    Clears the PyTorch caching allocator, resets the RW-device decision
+    cache, and evicts the merged-edge and full-RW-pool caches so that each
+    policy (and each retry) sees an uncontaminated GPU memory estimate and
+    actually re-executes the edge build rather than serving a cached result
+    from a prior probe.  Without this, a retry probe with the same edge_seed
+    hits _MERGED_EDGE_CACHE (populated by the contaminated first probe) and
+    measures only ~12 ms of H2D staging instead of the true construction cost.
     """
     gc.collect()
     if torch.cuda.is_available():
@@ -233,6 +243,9 @@ def _pre_profile_gpu_cleanup(device: str) -> None:
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
     _clear_rw_device_cache()
+    clear_merged_edge_cache()
+    if args is not None and hasattr(args, "_cached_full_rw_pool"):
+        args._cached_full_rw_pool = None
 
 
 def _profile_multi_tier_edge_policy(
@@ -280,6 +293,20 @@ def _profile_multi_tier_edge_policy(
                     edge_policy=policy,
                     force_broadcast=False,
                 )
+
+            # Warm-up pass: the first CPU build populates the DGL random-walk
+            # graph cache (_DGL_GRAPH_CACHE) and the CPU CSR cache.  Without
+            # this, the timed measurement includes one-time construction cost
+            # (up to 10s on Amazon) that never recurs, causing the planner to
+            # overestimate T_prefetch and incorrectly prefer GPU policies even
+            # when CPU prefetch would be fully hidden behind model compute.
+            try:
+                _warmup_probe = _build_prefetch_payload()
+                del _warmup_probe
+            except Exception:
+                pass
+            clear_merged_edge_cache()
+            cpu_before = _get_process_rss_mib()  # reset RSS baseline after warm-up
 
             build_probe, build_time = _time_step_block(
                 _build_prefetch_payload,
@@ -891,7 +918,8 @@ def _print_training_header(
     print(f"  Edge build device: {rw_device}")
     print(f"  Real-edge sampling device: {real_edge_sampling_device}")
     print(f"  Force edge broadcast: {int(bool(getattr(args, 'force_edge_broadcast', False)))}")
-    print(f"  Runtime edge policy: {getattr(args, '_runtime_edge_policy', EDGE_POLICY_GPU_EPHEMERAL)}")
+    if getattr(args, "activation_checkpoint_mode", None) == "multi_tier":
+        print(f"  Runtime edge policy: {getattr(args, '_runtime_edge_policy', EDGE_POLICY_GPU_EPHEMERAL)}")
     print(f"  Edge index GPU cached: {int(edge_index_gpu_cached)}")
     print(f"  AMP dtype: {args.amp_dtype}")
     print(f"  Activation CPU offload: {int(bool(getattr(args, 'activation_cpu_offload', False)))}")
