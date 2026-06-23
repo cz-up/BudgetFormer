@@ -2779,7 +2779,40 @@ def _maybe_update_edge_budget(
         )
 
     winner_by_loss = min(probe_rows, key=lambda row: row["loss"])
-    # Loss-only decision: commit iff a non-base candidate strictly beats base
+
+    # Loss-tie → accuracy arbitration. Probe loss is the primary signal, but
+    # when EVERY candidate's loss stays within ±LOSS_BAND of base (|gain| <
+    # LOSS_BAND for all), the loss differences are within noise and cannot rank
+    # the directions. In that regime switch to accuracy — the quantity we
+    # actually optimise — to pick the direction; otherwise keep the loss winner.
+    # Note the band is on |gain| (relative loss change vs base), so any round
+    # with a strong signal — including large NEGATIVE gains like real edges in a
+    # rw-saturated state — stays loss-driven; only genuine near-ties (all
+    # directions barely moving loss, e.g. snap-patents seed7 epoch 6) flip to
+    # accuracy.
+    LOSS_BAND = 0.01
+    _arb_cands = [r for r in probe_rows if r["kind"] != "current"]
+    if _arb_cands and all(abs(r["gain"]) < LOSS_BAND for r in _arb_cands):
+        _acc_win = max(_arb_cands, key=lambda r: r["acc"])
+        if _acc_win["kind"] != best_kind:
+            if args.rank == 0:
+                _lr, _lw = _budget_pair(_acc_win["state"])
+                _loss_win_acc = next(
+                    (r["acc"] for r in _arb_cands if r["kind"] == best_kind), -1.0
+                )
+                print(
+                    f"  ↳ BudgetCtrl acc-driven epoch={epoch}: all |gain|<"
+                    f"{LOSS_BAND:.0%} (loss-tie); acc picks {_acc_win['kind']}"
+                    f"({_lr},{_lw}) acc={_acc_win['acc']:.6f} over loss-winner "
+                    f"{best_kind} acc={_loss_win_acc:.6f}"
+                )
+            best_kind = _acc_win["kind"]
+            best_gain = _acc_win["gain"]
+            best_state = _acc_win["state"]
+            best_loss = _acc_win["loss"]
+            best_count = _acc_win["edges"]
+
+    # Loss-only decision: commit iff the chosen candidate strictly beats base
     # on probe loss. No threshold (the progressive-confirmation gate in
     # controller.update absorbs noise filtering).
     commit_ok = best_gain > 0.0
