@@ -1133,9 +1133,28 @@ class _MultiTierResourceManager:
             tier_counts = {}
             for t in modes:
                 tier_counts[t] = tier_counts.get(t, 0) + 1
+            # Human-readable per-source device placement implied by the edge
+            # policy (real / random-walk / topology). For GPU policies the
+            # random-walk build is additionally offloaded to the CPU at runtime
+            # when its working set exceeds the budget; that runtime decision is
+            # logged separately by the rw builder ("[rw-device] ... forcing CPU
+            # build").
+            _placement = {
+                self.EDGE_GPU_PERSIST:
+                    "real=GPU, rw=GPU(->CPU if oversized), topology=GPU",
+                self.EDGE_GPU_EPHEMERAL:
+                    "real=GPU, rw=GPU(->CPU if oversized), topology=staged",
+                self.EDGE_CPU_RANK_LOCAL_PREFETCH:
+                    "real=CPU, rw=CPU (rank-local prefetch)",
+                self.EDGE_CPU_BROADCAST_PREFETCH:
+                    "real=CPU, rw=CPU (broadcast prefetch)",
+                self.EDGE_CPU_BROADCAST:
+                    "real=CPU, rw=CPU (broadcast)",
+            }.get(self._edge_policy, "?")
             print(
                 f"[MultiTierManager] Synced ACTIVE plan: "
-                f"edge_policy={self._edge_policy} tiers={tier_counts}"
+                f"edge_policy={self._edge_policy} tiers={tier_counts} "
+                f"placement=({_placement})"
             )
 
     def reconsider_with_actual_timing(

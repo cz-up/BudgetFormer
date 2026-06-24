@@ -314,6 +314,12 @@ def add_node_fullgraph_sp_args(parser, defaults=None):
         ),
     )
     parser.add_argument(
+        "--disable_edge_prefetch",
+        action="store_true",
+        default=defaults.get("disable_edge_prefetch", False),
+        help="ablation: never overlap edge construction with GPU compute; build the next epoch's edges in the foreground (serial). Isolates the value of overlap-aware prefetching against an otherwise identical build path.",
+    )
+    parser.add_argument(
         "--random_edge_blocks",
         action="store_true",
         default=defaults.get("random_edge_blocks", False),

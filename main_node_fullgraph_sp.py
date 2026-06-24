@@ -528,6 +528,13 @@ def main():
 
     def _submit_prefetch(next_epoch: int, budget_state) -> bool:
         nonlocal _prefetch_future
+        # Ablation switch: when --disable_edge_prefetch is set, never launch the
+        # background builder, forcing the next epoch's edges to be constructed in
+        # the foreground (serial, no overlap with GPU compute). This isolates the
+        # value of overlap-aware prefetching against an otherwise identical CPU
+        # build path.
+        if bool(getattr(args, "disable_edge_prefetch", False)):
+            return False
         if _prefetch_future is not None:
             return False
         if next_epoch > args.epochs:
