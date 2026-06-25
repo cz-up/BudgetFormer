@@ -44,6 +44,7 @@ from gt_sp.initialize import (
 )
 from gt_sp.reducer import build_gradient_reducer, sync_params_and_buffers
 from gt_sp.utils import (
+    _estimate_rw_working_set_bytes,
     clear_random_walk_graph_cache,
     resolve_edge_build_device,
     rw_realedge_gpu_infeasible_any,
@@ -868,6 +869,20 @@ def main():
                         if args.rank == 0:
                             print(f"[multi_tier] edge_policy={policy} infeasible during probe; skipping.")
                         continue
+                    # First-principles estimate of one rw build's GPU working
+                    # set, so the planner can evaluate a rw-on-GPU variant of
+                    # gpu_persist (the real topology is already resident; only
+                    # this transient is the extra GPU cost). Estimate-only — no
+                    # 18 GiB profiling probe required.
+                    _rw_gpu_extra = 0
+                    if policy == EDGE_POLICY_GPU_PERSIST:
+                        _rw_gpu_extra = _estimate_rw_working_set_bytes(
+                            num_nodes=num_nodes,
+                            num_edges=int(edge_index_global.shape[1]),
+                            walks_per_node=int(getattr(args, "walks_per_node", 2)),
+                            walk_length=int(getattr(args, "walk_length", 4)),
+                            num_heads=int(getattr(args, "num_heads", 1)),
+                        )
                     _mt_prof_mgr.set_edge_policy_profile(
                         policy,
                         prep_time_s=metrics["prep_time_s"],
@@ -876,6 +891,7 @@ def main():
                         gpu_peak_bytes=metrics["gpu_peak_bytes"],
                         cpu_delta_bytes=metrics["cpu_delta_bytes"],
                         live_edge_bytes=metrics["live_edge_bytes"],
+                        rw_gpu_extra_bytes=_rw_gpu_extra,
                         enabled=True,
                     )
                     if policy == EDGE_POLICY_CPU_BROADCAST_PREFETCH:

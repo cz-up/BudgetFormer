@@ -267,6 +267,29 @@ def set_rw_gpu_memory_cap(cap_bytes: int) -> None:
     _GPU_PROCESS_MEMORY_CAP_BYTES = max(0, int(cap_bytes))
 
 
+# Planner override for the random-walk build device. The auto-decision in
+# _gpu_can_fit_rw is intentionally conservative under a per-process HBM cap
+# (it clamps usable memory to cap - reserved), so on large graphs it forces
+# the rw build to CPU even when the transient build peak would actually fit
+# the budget. When the Multi-Tier planner has selected a rw-on-GPU plan (its
+# transient peak was profiled feasible under the cap), it flips this flag so
+# the rw build stays on GPU. The planner sets it on EVERY (re-)plan — True only
+# when the active plan is rw-on-GPU, False otherwise — so the flag can never
+# leak a stale True across plan changes.
+_FORCE_RW_ON_GPU: bool = False
+
+
+def set_force_rw_on_gpu(value: bool) -> None:
+    """Force (or release) keeping the random-walk build on GPU.
+
+    Set by _MultiTierResourceManager whenever it (re-)selects an active plan.
+    A reactive OOM in the rw builder still falls back to CPU, so an over-
+    optimistic True degrades gracefully rather than crashing.
+    """
+    global _FORCE_RW_ON_GPU
+    _FORCE_RW_ON_GPU = bool(value)
+
+
 # Run-level registry of (device_str, E) for which a real-edge GPU sampling build
 # was observed to OOM at runtime and fall back to CPU. Unlike
 # _RW_DEVICE_DECISION_CACHE (a per-probe log-suppression cache cleared by
@@ -410,6 +433,15 @@ def _gpu_can_fit_rw(device, need_bytes: int) -> bool:
     Returns True for non-CUDA / unavailable devices, letting the reactive
     try/except in callers catch any residual fragmentation OOM.
     """
+    # Planner override: a rw-on-GPU plan was selected (its transient peak was
+    # profiled feasible under the HBM cap), so keep rw on GPU regardless of the
+    # conservative cap-clamped headroom. A real OOM is still caught reactively.
+    if _FORCE_RW_ON_GPU:
+        try:
+            if torch.device(device).type == "cuda" and torch.cuda.is_available():
+                return True
+        except (TypeError, RuntimeError):
+            pass
     usable = _rw_gpu_usable_bytes(device)
     if usable < 0:
         return True

@@ -21,6 +21,7 @@ from gt_sp.initialize import (
     get_sequence_parallel_group,
     sequence_parallel_is_initialized,
 )
+from gt_sp.utils import set_force_rw_on_gpu
 
 
 # ---------------------------------------------------------------------------
@@ -192,6 +193,10 @@ class _MultiTierResourceManager:
 
         # --- Final plan ---
         self._cache_edge:          bool = False
+        # Whether the active plan keeps the random-walk build on GPU (vs the
+        # default auto-offload to CPU on large graphs). Single source of truth,
+        # mirrored to the global force flag via _set_rw_on_gpu().
+        self._rw_on_gpu:           bool = False
         self._edge_policy:         str  = self.EDGE_GPU_EPHEMERAL
         self._best_nonpersistent_edge_policy: str = self.EDGE_GPU_EPHEMERAL
         self._best_nonpersistent_tiers: list = [self.T0_RECOMPUTE] * self.n_layers
@@ -267,6 +272,14 @@ class _MultiTierResourceManager:
             cls.EDGE_CPU_BROADCAST,
         )
 
+    def _set_rw_on_gpu(self, value: bool) -> None:
+        """Record the active plan's rw-device choice and mirror it to the
+        global force flag. Called on every (re-)plan and on any path that
+        changes the active edge policy, so the flag never leaks a stale True.
+        """
+        self._rw_on_gpu = bool(value)
+        set_force_rw_on_gpu(self._rw_on_gpu)
+
     def set_edge_policy_profile(
         self,
         policy: str,
@@ -276,6 +289,7 @@ class _MultiTierResourceManager:
         live_edge_bytes: int = 0,
         serial_time_s = None,
         overlap_time_s: float = 0.0,
+        rw_gpu_extra_bytes: int = 0,
         enabled: bool = True,
     ) -> None:
         policy = str(policy)
@@ -295,6 +309,9 @@ class _MultiTierResourceManager:
             "gpu_peak_bytes": max(0, int(gpu_peak_bytes)),
             "cpu_delta_bytes": max(0, int(cpu_delta_bytes)),
             "live_edge_bytes": max(0, int(live_edge_bytes)),
+            # Estimated GPU working set for one rw build (transient peak), used
+            # by the planner to consider a rw-on-GPU variant of this policy.
+            "rw_gpu_extra_bytes": max(0, int(rw_gpu_extra_bytes)),
         }
 
     def _edge_policy_profiles(self):
@@ -786,6 +803,7 @@ class _MultiTierResourceManager:
         best_nonpersistent_policy = self.EDGE_GPU_EPHEMERAL
         best_nonpersistent_tiers = [self.T0_RECOMPUTE] * self.n_layers
         best_tiers = [self.T0_RECOMPUTE] * self.n_layers
+        best_rw_on_gpu = False
         # Per-policy decision log: policy → (status_str, best_t_ms or None)
         policy_log: dict = {}  # policy -> (status_str, best_t_ms_or_none)
 
@@ -820,37 +838,75 @@ class _MultiTierResourceManager:
                 )
                 continue
 
-            policy_best_t = float("inf")
-            for tiers, tie_break, cpu_est, peak_est, t_fwd_est, t_bwd_est, t_model_est in self._enumerate_structured_plans(
-                peak_limit=peak_limit,
-                cpu_budget=cpu_budget,
-                edge_peak=edge_peak,
-                build_peak=prep_gpu_peak,
-            ):
-                edge_time = edge_serial_time + max(0.0, edge_overlap_time - t_model_est)
-                t_est = t_model_est + edge_time
-                policy_best_t = min(policy_best_t, t_est)
-                key = (
-                    t_est,
-                    tie_break,
-                    cpu_est,
-                    int(edge_peak > 0),
-                    prep_cpu_delta,
-                    prep_gpu_peak,
+            # Random-walk device variants to evaluate for this policy. Default:
+            # the profiled path (rw auto-offloaded to CPU on large graphs, as
+            # measured). For gpu_persist we additionally try keeping rw on GPU:
+            # the topology is already resident, so the only added GPU cost is
+            # the rw build's transient working set, whose peak lands at step
+            # start and is off-peak with the backward retain peak. If that
+            # transient fits the budget, argmin weighs "rw-GPU (no CPU build /
+            # H2D)" against spending the same headroom on more retain/keep_mha
+            # layers — exactly the ROI comparison the planner should make.
+            #   variant = (build_peak, serial_t, overlap_t, rw_on_gpu, cpu_delta)
+            rw_extra = int(edge_profile.get("rw_gpu_extra_bytes", 0))
+            variants = [
+                (prep_gpu_peak, edge_serial_time, edge_overlap_time, False, prep_cpu_delta),
+            ]
+            if edge_policy == self.EDGE_GPU_PERSIST and rw_extra > 0:
+                # Memory: the rw-on-GPU transient lands at step START, before
+                # any activation is materialised, so it must NOT be stacked on
+                # peak_warmup (which already carries the fwd/bwd activation
+                # peak) — that double-counts two off-peak transients and grossly
+                # over-estimates (observed: a 22.2 GiB estimate vs a real 18.8
+                # GiB peak, which wrongly failed the 21.6 GiB budget). The
+                # build-time footprint is the resident edge_index plus the rw
+                # working set; _enumerate_structured_plans separately maxes this
+                # against the backward activation peak (peak_warmup+tier_delta).
+                rwgpu_build_peak = max(prep_gpu_peak, edge_peak + rw_extra)
+                # Time: there is no direct GPU rw-build timing. Charge the
+                # measured rw-CPU edge time (serial = CPU build + H2D) as a
+                # conservative UPPER bound — rw-GPU drops the H2D and a GPU build
+                # is usually faster, so the real step is no slower. With
+                # cpu_delta=0 the argmin tie-break then prefers rw-GPU over the
+                # otherwise-equal rw-CPU plan (no CPU build, frees host RAM), and
+                # the true latency win surfaces at runtime.
+                variants.append(
+                    (rwgpu_build_peak, edge_serial_time, 0.0, True, 0)
                 )
-                if best_key is None or key < best_key:
-                    best_key = key
-                    best_step_time = t_est
-                    best_model_time = t_model_est
-                    best_fwd_time = t_fwd_est
-                    best_bwd_time = t_bwd_est
-                    best_edge_prep_time = edge_time
-                    best_policy = edge_policy
-                    best_tiers = tiers
-                if edge_peak == 0 and (best_nonpersistent_key is None or key < best_nonpersistent_key):
-                    best_nonpersistent_key = key
-                    best_nonpersistent_policy = edge_policy
-                    best_nonpersistent_tiers = tiers
+
+            policy_best_t = float("inf")
+            for v_build_peak, v_serial, v_overlap, v_on_gpu, v_cpu_delta in variants:
+                for tiers, tie_break, cpu_est, peak_est, t_fwd_est, t_bwd_est, t_model_est in self._enumerate_structured_plans(
+                    peak_limit=peak_limit,
+                    cpu_budget=cpu_budget,
+                    edge_peak=edge_peak,
+                    build_peak=v_build_peak,
+                ):
+                    edge_time = v_serial + max(0.0, v_overlap - t_model_est)
+                    t_est = t_model_est + edge_time
+                    policy_best_t = min(policy_best_t, t_est)
+                    key = (
+                        t_est,
+                        tie_break,
+                        cpu_est,
+                        int(edge_peak > 0),
+                        v_cpu_delta,
+                        v_build_peak,
+                    )
+                    if best_key is None or key < best_key:
+                        best_key = key
+                        best_step_time = t_est
+                        best_model_time = t_model_est
+                        best_fwd_time = t_fwd_est
+                        best_bwd_time = t_bwd_est
+                        best_edge_prep_time = edge_time
+                        best_policy = edge_policy
+                        best_tiers = tiers
+                        best_rw_on_gpu = v_on_gpu
+                    if edge_peak == 0 and (best_nonpersistent_key is None or key < best_nonpersistent_key):
+                        best_nonpersistent_key = key
+                        best_nonpersistent_policy = edge_policy
+                        best_nonpersistent_tiers = tiers
 
             if policy_best_t == float("inf"):
                 policy_log[edge_policy] = (
@@ -875,6 +931,9 @@ class _MultiTierResourceManager:
         self._cache_edge = best_policy == self.EDGE_GPU_PERSIST
         self._modes = best_tiers
         self._state = self._ACTIVE
+        # Mirror the rw-device choice to the global force flag. Unconditional on
+        # every (re-)plan, so a stale True can never leak across plan changes.
+        self._set_rw_on_gpu(best_rw_on_gpu)
 
         # Flush the GPU caching allocator whenever a GPU edge policy is
         # selected.  Profiling probes run after empty_cache(); without this
@@ -899,6 +958,7 @@ class _MultiTierResourceManager:
             print(
                 f"[MultiTierManager] ACTIVE plan: "
                 f"edge_policy={best_policy}  "
+                f"rw_device={'GPU' if best_rw_on_gpu else 'auto(CPU on large)'}  "
                 f"tiers={tier_counts}  "
                 f"peak_limit={peak_limit/(1024**2):.0f} MiB  "
                 f"last_delta(mha/retain)={(self._peak_mha_last - self._peak_warmup)/(1024**2):+.1f}"
@@ -1129,6 +1189,14 @@ class _MultiTierResourceManager:
         self._edge_policy = edge_policy
         self._cache_edge = edge_policy == self.EDGE_GPU_PERSIST
         self._modes = modes
+        # Preserve the rw-device choice already made by _run_active_plan: every
+        # rank computes the SAME best_rw_on_gpu from identical profiles, so the
+        # synced plan applied here (this is the NORMAL cross-rank sync entry, not
+        # just the --force ablation) already matches it. Only force rw off when
+        # the synced policy is not gpu_persist, where rw-on-GPU is meaningless.
+        # A manual --force_multi_tier_plan never sets rw_on_gpu, so it stays off.
+        if edge_policy != self.EDGE_GPU_PERSIST:
+            self._set_rw_on_gpu(False)
         if self._is_rank0():
             tier_counts = {}
             for t in modes:
@@ -1141,7 +1209,9 @@ class _MultiTierResourceManager:
             # build").
             _placement = {
                 self.EDGE_GPU_PERSIST:
-                    "real=GPU, topology=GPU, rw=GPU or CPU by working set (see [rw-device])",
+                    ("real=GPU, topology=GPU, rw=GPU (planner-forced)"
+                     if self._rw_on_gpu else
+                     "real=GPU, topology=GPU, rw=GPU or CPU by working set (see [rw-device])"),
                 self.EDGE_GPU_EPHEMERAL:
                     "real=GPU, topology=staged, rw=GPU or CPU by working set (see [rw-device])",
                 self.EDGE_CPU_RANK_LOCAL_PREFETCH:
@@ -1249,6 +1319,9 @@ class _MultiTierResourceManager:
             )
         self._edge_policy = best_gpu_policy
         self._cache_edge = best_gpu_policy == self.EDGE_GPU_PERSIST
+        # Adaptive-timing switch back to a GPU policy does not re-evaluate the
+        # rw-on-GPU variant; keep rw on its auto decision to stay conservative.
+        self._set_rw_on_gpu(False)
         return True
 
     def report_runtime_edge_gpu_infeasible(self, device) -> bool:
@@ -1311,6 +1384,10 @@ class _MultiTierResourceManager:
         self._edge_policy = (
             self.EDGE_GPU_PERSIST if self._cache_edge else self._best_nonpersistent_edge_policy
         )
+        # Dropping the GPU topology cache makes rw-on-GPU meaningless; release
+        # the force flag. Keeping the cache leaves the planner's rw choice intact.
+        if not self._cache_edge:
+            self._set_rw_on_gpu(False)
         if self._is_rank0():
             print(
                 f"[MultiTierManager] Topology cache (post-sync): {cache} "
