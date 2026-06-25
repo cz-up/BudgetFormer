@@ -355,55 +355,31 @@ def _gpu_concurrent_overhead_bytes(device) -> int:
     return 512 * 1024 * 1024
 
 
-def _gpu_can_fit_rw(device, need_bytes: int) -> bool:
-    """Return True iff *device* currently has room for a need_bytes RW build.
+def _rw_gpu_usable_bytes(device) -> int:
+    """Bytes usable for an RW build on *device*, after reserved-slack and
+    per-process-cap corrections. Returns ``-1`` for non-CUDA / unavailable
+    devices (i.e. "no GPU memory limit applies").
 
-    Decision rule, with no magic multiplier:
-      available = free_from_driver + caching_allocator_reserve
-      usable    = available - _gpu_concurrent_overhead_bytes(device)
-      return need_bytes <= usable
-
-    ``free_from_driver`` is reported by ``cudaMemGetInfo`` and excludes
-    everything PyTorch has already cudaMalloc'd. ``caching_allocator_reserve``
-    is the slack PyTorch holds from the driver but has not handed to a
-    tensor (``reserved - allocated`` in ``memory_stats``). New CUDA
-    allocations can be satisfied from EITHER pool, so both are usable.
-
-    Returns True unconditionally for non-CUDA devices or when CUDA's
-    ``mem_get_info`` is unavailable, letting the reactive try/except in
-    callers catch any residual OOM (e.g., when the caching reserve is
-    too fragmented to satisfy a single large contiguous request).
+    This is the SINGLE source of truth for "usable GPU memory for RW": both the
+    fit decision (:func:`_gpu_can_fit_rw`) and the rank-0 device-decision logs
+    read it, so a logged number can never disagree with the decision. Previously
+    the log re-read the *uncapped* physical free, producing nonsensical lines
+    like "estimate 12535 MiB > usable 30215 MiB" while the decision was actually
+    made against the much smaller per-process-cap headroom.
     """
     try:
         torch_device = torch.device(device)
     except (TypeError, RuntimeError):
-        return True
-    if torch_device.type != "cuda":
-        return True
-    if not torch.cuda.is_available():
-        return True
+        return -1
+    if torch_device.type != "cuda" or not torch.cuda.is_available():
+        return -1
     try:
         free, _ = torch.cuda.mem_get_info(torch_device)
     except (RuntimeError, AttributeError):
-        return True
-    # Budget: usable = driver_free [+ reserved_slack] − handle_overhead.
-    #
-    # Without expandable_segments the caching allocator's reserved-but-not-
-    # allocated blocks may be too fragmented to satisfy a single multi-GiB
-    # contiguous request, so we conservatively ignore them.
-    #
-    # With expandable_segments:True the allocator can grow existing segments
-    # in-place — but ONLY when there is physically free GPU memory to grow
-    # into (driver_free > 0).  When driver_free ≈ 0 the GPU is physically
-    # full; there is nothing to extend into, and fragmented reserved_slack
-    # blocks cannot satisfy a large contiguous request any better than the
-    # non-expandable case.  Adding reserved_slack unconditionally caused
-    # false-positive "fits" that later OOM'd on the argsort for E=264M.
-    #
-    # Rule: add reserved_slack only when driver_free is non-trivial
-    # (≥ 256 MiB).  That threshold is chosen to be small enough that a
-    # clean post-empty_cache() state always qualifies (driver_free ≫ 256 MiB
-    # after cache flush) while a fully-reserved GPU (driver_free ≈ 0) does not.
+        return -1
+    # Add the caching allocator's reserved-but-unallocated slack only when the
+    # driver still has non-trivial physical free to grow into (>= 256 MiB);
+    # otherwise fragmented slack cannot satisfy a large contiguous request.
     _MIN_DRIVER_FREE_FOR_SLACK = 256 * 1024 * 1024  # 256 MiB
     if _expandable_segments_enabled() and int(free) >= _MIN_DRIVER_FREE_FOR_SLACK:
         try:
@@ -414,13 +390,9 @@ def _gpu_can_fit_rw(device, need_bytes: int) -> bool:
             free = free + reserved_slack
         except Exception:
             pass
-    # If a per-process memory cap is set via set_per_process_memory_fraction(),
-    # mem_get_info returns the driver-level physical free, which is unaware of
-    # the cap.  The allocator can only extend its reserved pool up to
-    # (cap - reserved); new contiguous allocations beyond the pool's existing
-    # free blocks must come from that headroom.  Clamp free to this headroom so
-    # the check doesn't over-optimistically greenlight GPU builds that will later
-    # OOM when the actual cudaMalloc is gated by the cap.
+    # A per-process memory cap (e.g. the planner's HBM limit) is invisible to
+    # mem_get_info, so clamp free to the cap headroom (cap - reserved); new
+    # allocations beyond the pool's free blocks must come from there.
     if _GPU_PROCESS_MEMORY_CAP_BYTES > 0:
         try:
             reserved = torch.cuda.memory_reserved(torch_device)
@@ -429,7 +401,18 @@ def _gpu_can_fit_rw(device, need_bytes: int) -> bool:
         except Exception:
             pass
     overhead = _gpu_concurrent_overhead_bytes(torch_device)
-    usable = max(0, int(free) - overhead)
+    return max(0, int(free) - overhead)
+
+
+def _gpu_can_fit_rw(device, need_bytes: int) -> bool:
+    """Return True iff *device* has room for a need_bytes RW build.
+
+    Returns True for non-CUDA / unavailable devices, letting the reactive
+    try/except in callers catch any residual fragmentation OOM.
+    """
+    usable = _rw_gpu_usable_bytes(device)
+    if usable < 0:
+        return True
     return int(need_bytes) <= usable
 
 
@@ -455,27 +438,20 @@ def _safe_rw_device(rw_dev, args, num_nodes: int, num_edges: int):
     if _gpu_can_fit_rw(requested, estimate):
         return requested
     rank = int(getattr(args, "rank", 0)) if args is not None else 0
-    free_mib = -1.0
-    try:
-        free, _ = torch.cuda.mem_get_info(requested)
-        free_mib = free / (1024 ** 2)
-    except Exception:
-        pass
+    usable_mib = _rw_gpu_usable_bytes(requested) / (1024 ** 2)
     cache_key = ("_safe_rw_device", str(requested), int(num_edges), "cpu")
     prev = _RW_DEVICE_DECISION_CACHE.get(cache_key)
-    overhead_mib = _gpu_concurrent_overhead_bytes(requested) / (1024 ** 2)
-    usable_mib = max(0.0, free_mib - overhead_mib)
     if prev is None and rank == 0:
         print(
             f"[rw-device] estimated working set {estimate/(1024**2):.0f} MiB "
-            f"exceeds usable GPU {usable_mib:.0f} MiB "
-            f"(driver_free={free_mib:.0f} − overhead {overhead_mib:.0f} MiB, "
+            f"exceeds the usable GPU budget {usable_mib:.0f} MiB "
+            f"(physical free minus reserved and the planner HBM cap, "
             f"num_edges={num_edges:,}); forcing CPU build to avoid OOM. "
             f"To reduce false CPU fallbacks, "
             f"set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True. "
             f"(Further matching calls suppressed.)"
         )
-    _RW_DEVICE_DECISION_CACHE[cache_key] = (estimate, free_mib)
+    _RW_DEVICE_DECISION_CACHE[cache_key] = (estimate, usable_mib)
     return torch.device("cpu")
 
 
@@ -1154,28 +1130,34 @@ def compute_hop_buckets_random_walk(
                     walk_length=walk_length,
                 )
             if not _gpu_can_fit_rw(rw_device, estimate):
-                try:
-                    free, _ = torch.cuda.mem_get_info(rw_device)
-                    free_mib = free / (1024 ** 2)
-                except Exception:
-                    free_mib = -1.0
+                usable_mib = _rw_gpu_usable_bytes(rw_device) / (1024 ** 2)
                 cache_key = ("compute_hop_buckets_random_walk", str(rw_device), E_cur, "cpu")
                 prev = _RW_DEVICE_DECISION_CACHE.get(cache_key)
-                overhead_mib = _gpu_concurrent_overhead_bytes(rw_device) / (1024 ** 2)
-                usable_mib = max(0.0, free_mib - overhead_mib)
                 if prev is None and _rw_log_is_rank0():
                     print(
                         f"[rw-device] compute_hop_buckets_random_walk: estimated "
-                        f"working set {estimate/(1024**2):.0f} MiB > usable GPU "
-                        f"{usable_mib:.0f} MiB (driver_free={free_mib:.0f} − "
-                        f"overhead {overhead_mib:.0f} MiB), "
-                        f"num_edges={E_cur:,}; forcing CPU build. NOTE: this overrides "
-                        f"only the RW build device; topology policies such as gpu_persist "
-                        f"may still cache edge_index_global on GPU. "
+                        f"working set {estimate/(1024**2):.0f} MiB exceeds the usable "
+                        f"GPU budget {usable_mib:.0f} MiB (physical free minus reserved "
+                        f"and the planner HBM cap), num_edges={E_cur:,}; forcing CPU "
+                        f"build. NOTE: this overrides only the RW build device; topology "
+                        f"policies such as gpu_persist may still cache edge_index_global "
+                        f"on GPU. (Further matching calls suppressed.)"
+                    )
+                _RW_DEVICE_DECISION_CACHE[cache_key] = (estimate, usable_mib)
+                rw_device = torch.device("cpu")
+            else:
+                # Symmetric log: the working set fits, so the random-walk build
+                # stays on the GPU. Without this, only the CPU-offload case was
+                # logged, making it look like rw was never confirmed on GPU.
+                cache_key_gpu = ("compute_hop_buckets_random_walk", str(rw_device), E_cur, "gpu")
+                if _RW_DEVICE_DECISION_CACHE.get(cache_key_gpu) is None and _rw_log_is_rank0():
+                    print(
+                        f"[rw-device] compute_hop_buckets_random_walk: estimated "
+                        f"working set {estimate/(1024**2):.0f} MiB fits the GPU; "
+                        f"building random-walk edges on {rw_device}. "
                         f"(Further matching calls suppressed.)"
                     )
-                _RW_DEVICE_DECISION_CACHE[cache_key] = (estimate, free_mib)
-                rw_device = torch.device("cpu")
+                _RW_DEVICE_DECISION_CACHE[cache_key_gpu] = (estimate, -1.0)
 
     edge_index_dev, rowptr, col = _get_random_walk_graph(edge_index, num_nodes, rw_device)
 

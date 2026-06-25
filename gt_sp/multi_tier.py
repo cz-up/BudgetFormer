@@ -1141,9 +1141,9 @@ class _MultiTierResourceManager:
             # build").
             _placement = {
                 self.EDGE_GPU_PERSIST:
-                    "real=GPU, rw=GPU(->CPU if oversized), topology=GPU",
+                    "real=GPU, topology=GPU, rw=GPU or CPU by working set (see [rw-device])",
                 self.EDGE_GPU_EPHEMERAL:
-                    "real=GPU, rw=GPU(->CPU if oversized), topology=staged",
+                    "real=GPU, topology=staged, rw=GPU or CPU by working set (see [rw-device])",
                 self.EDGE_CPU_RANK_LOCAL_PREFETCH:
                     "real=CPU, rw=CPU (rank-local prefetch)",
                 self.EDGE_CPU_BROADCAST_PREFETCH:
