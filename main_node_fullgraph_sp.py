@@ -14,6 +14,7 @@ import contextlib
 import copy
 import gc
 import os
+import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -155,6 +156,31 @@ def _parse_force_multi_tier_plan(spec: str, n_layers: int):
         return None
 
 
+def _print_git_version() -> None:
+    repo_dir = os.path.dirname(os.path.abspath(__file__))
+
+    def _git(*args):
+        return subprocess.check_output(
+            ["git", *args],
+            cwd=repo_dir,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+
+    try:
+        commit = _git("rev-parse", "--short=12", "HEAD")
+        branch = _git("branch", "--show-current") or "DETACHED"
+        tracked_status = _git("status", "--short", "--untracked-files=no")
+    except Exception as exc:
+        print(f"[git] unavailable: {exc}")
+        return
+
+    dirty = bool(tracked_status)
+    print(f"[git] commit={commit} branch={branch} dirty_tracked={int(dirty)}")
+    if dirty:
+        print(f"[git] tracked_changes={tracked_status.replace(chr(10), ' | ')}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Full-Graph Node-Level Training with Sequence Parallel."
@@ -201,6 +227,7 @@ def main():
     enable_comm_profiler(profile_sp_comm)
 
     if args.rank == 0:
+        _print_git_version()
         os.makedirs(args.model_dir, exist_ok=True)
 
     feature, y, edge_index_global, num_nodes, split_idx = _load_data(args)

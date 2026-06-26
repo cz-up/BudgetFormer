@@ -2178,6 +2178,28 @@ class _AdaptiveEdgeBudgetController:
             if self.bad_rounds >= self.patience:
                 self.frozen = True
 
+    def commit_expansion_step(self, next_state) -> None:
+        """Advance one growth step toward the total budget ceiling.
+
+        This is used only below the ceiling when the probe signal is too weak or
+        slightly negative. It avoids freezing the search at a small budget because
+        of a near-zero early marginal-loss estimate.
+        """
+        if next_state is None:
+            return
+        self.real_budget = int(next_state.get("real_edges_per_query", self.real_budget))
+        self.rw_budget = int(next_state.get("rw_edges_per_query", self.rw_budget))
+        if "walk_length" in next_state:
+            self.walk_length = int(next_state["walk_length"])
+        self._n_budget_updates += 1
+        self._pending_kind = None
+        self._pending_state = None
+        self._pending_wins = 0
+        self.bad_rounds = 0
+        self.seen_positive_gain = True
+        self.auto_hold_released = True
+        self.auto_hold_neg_inf_streak = 0
+
 
 def _round_budget_to_block(value: int, block_size: int) -> int:
     if value <= 0:
@@ -2780,16 +2802,15 @@ def _maybe_update_edge_budget(
 
     winner_by_loss = min(probe_rows, key=lambda row: row["loss"])
 
-    # Loss-tie → accuracy arbitration. Probe loss is the primary signal, but
-    # when EVERY candidate's loss stays within ±LOSS_BAND of base (|gain| <
+    # Loss-tie -> accuracy arbitration. Probe loss is the primary signal, but
+    # when EVERY candidate's loss stays within +/-LOSS_BAND of base (|gain| <
     # LOSS_BAND for all), the loss differences are within noise and cannot rank
-    # the directions. In that regime switch to accuracy — the quantity we
-    # actually optimise — to pick the direction; otherwise keep the loss winner.
-    # Note the band is on |gain| (relative loss change vs base), so any round
-    # with a strong signal — including large NEGATIVE gains like real edges in a
-    # rw-saturated state — stays loss-driven; only genuine near-ties (all
-    # directions barely moving loss, e.g. snap-patents seed7 epoch 6) flip to
-    # accuracy.
+    # the directions. In that regime use accuracy -- the quantity we actually
+    # optimise -- otherwise keep the loss winner. Note the band is on |gain|
+    # (relative loss change vs base), so any round with a strong signal —
+    # including large NEGATIVE gains like real edges in a rw-saturated state —
+    # stays loss-driven; only genuine near-ties (all directions barely moving
+    # loss) flip to accuracy.
     LOSS_BAND = 0.01
     _arb_cands = [r for r in probe_rows if r["kind"] != "current"]
     if _arb_cands and all(abs(r["gain"]) < LOSS_BAND for r in _arb_cands):
@@ -2803,8 +2824,8 @@ def _maybe_update_edge_budget(
                 print(
                     f"  ↳ BudgetCtrl acc-driven epoch={epoch}: all |gain|<"
                     f"{LOSS_BAND:.0%} (loss-tie); acc picks {_acc_win['kind']}"
-                    f"({_lr},{_lw}) acc={_acc_win['acc']:.6f} over loss-winner "
-                    f"{best_kind} acc={_loss_win_acc:.6f}"
+                    f"({_lr},{_lw}) acc={_acc_win['acc']:.6f} over "
+                    f"loss-winner {best_kind} acc={_loss_win_acc:.6f}"
                 )
             best_kind = _acc_win["kind"]
             best_gain = _acc_win["gain"]
@@ -2833,30 +2854,27 @@ def _maybe_update_edge_budget(
                 f"gain={gain_text} probe_edges={row['edges']}"
             )
 
-    # Noise guard: when no candidate improves on current probe loss (all gains
-    # <= 0, excluding the all-OOM -inf case), treat this probe round as
-    # uninformative — the edges resampled this round simply did not carry enough
-    # signal to justify a move. Keep the current budget and skip the round
-    # entirely: do NOT commit a move, and do NOT touch any freeze / confirmation
-    # counter (bad_rounds, pending wins, auto-hold streak). The round is ignored
-    # as if it never happened.
-    #
-    # EXCEPTION — budget at ceiling (real + rw >= B): once the total budget is
-    # maxed out there is nothing left to grow, so "all gains <= 0" is no longer a
-    # noisy under-sampled round but the genuine convergence signal that we have
-    # reached the best feasible budget. In that case we must NOT skip: fall
-    # through to the normal path so bad_rounds accrues and the patience-based
-    # freeze can eventually fire. Otherwise, late in training where all gains are
-    # routinely negative, the controller would never freeze.
+    # Below the ceiling, do not let a near-zero negative marginal-loss estimate
+    # freeze the search at a small budget. Keep growing one block along the best
+    # probed direction; once the ceiling is reached, the normal positive-gain /
+    # patience logic decides whether to shift or freeze.
     _at_ceiling = (controller.real_budget + controller.rw_budget) >= controller.max_total
-    if float("-inf") < best_gain <= 0.0 and not _at_ceiling:
+    _growth_kinds = {"real_up", "rw_up"}
+    if (
+        float("-inf") < best_gain <= 0.0
+        and not _at_ceiling
+        and best_kind in _growth_kinds
+        and best_state is not None
+    ):
+        controller.commit_expansion_step(best_state)
         if args.rank == 0:
+            cur_budget = controller.current_state()
             print(
-                f"  ↳ BudgetCtrl ignore epoch={epoch}: no candidate beats current "
-                f"on probe loss (best_gain={best_gain:.3e} <= 0) and budget below "
-                f"ceiling ({controller.real_budget}+{controller.rw_budget}"
-                f"<{controller.max_total}); treating round as noise — keeping "
-                f"current budget, counters untouched."
+                f"  ↳ BudgetCtrl expand-below-ceiling epoch={epoch}: "
+                f"move={best_kind} despite non-positive rel_gain={best_gain:.8e}; "
+                f"new_budget=({cur_budget['real_edges_per_query']},"
+                f"{cur_budget['rw_edges_per_query']}) "
+                f"probe_loss={best_loss:.4f} probe_edges={best_count}"
             )
         return
 
