@@ -1264,31 +1264,75 @@ class _MultiTierResourceManager:
         stage_time = float(current_profile.get("serial_time_s", 0.0))
         actual_cpu_t_step = float(actual_t_model_s) + float(actual_prefetch_wait_s) + stage_time
 
-        # Best GPU alternative: t_step = t_model + gpu_build_time (serial, no overlap)
-        # Skip any GPU policy that has been runtime-marked infeasible (OOM fallback);
-        # the adaptive-timing switch must respect the same feasibility gate as the
-        # regular planner — otherwise it will repeatedly re-try a policy that OOM'd.
+        # Best GPU alternative.  Unlike the original timing-only check, this
+        # must re-run the same tier feasibility search as the ACTIVE planner:
+        # switching from CPU-prefetch to gpu_persist can add several GiB of
+        # resident topology, so keeping the old retain/keep_mha tiers can turn
+        # a latency win into a CUDA OOM.
+        peak_limit = int(self._active_peak_limit)
+        if peak_limit <= 0:
+            return False
+        # Skip any GPU policy that has been runtime-marked infeasible (OOM
+        # fallback); the adaptive-timing switch must respect the same gate as
+        # the regular planner — otherwise it will repeatedly re-try a policy
+        # that OOM'd.
         best_gpu_policy = None
         best_gpu_t_step = float("inf")
+        best_gpu_tiers = None
+        best_gpu_model_time = 0.0
+        best_gpu_edge_time = 0.0
+        best_gpu_peak_est = 0
+        best_gpu_build_peak = 0
+        best_gpu_live_edge = 0
+        best_gpu_key = None
         for gpu_pol in (self.EDGE_GPU_EPHEMERAL, self.EDGE_GPU_PERSIST):
             if gpu_pol in self._gpu_infeasible_policies:
                 continue
             prof = self._edge_profiles.get(gpu_pol)
             if prof is None:
                 continue
-            # Respect the same joint-peak gate used at plan-selection time:
-            # build_peak must fit within peak_limit (the threshold that excluded
-            # gpu_persist when its build_peak was 22,985 MiB > 20,400 MiB).
+            live_edge = int(prof.get("live_edge_bytes", 0))
             build_peak = int(prof.get("gpu_peak_bytes", 0))
-            if self._active_peak_limit > 0 and build_peak > self._active_peak_limit:
-                continue
-            gpu_serial = float(prof.get("serial_time_s", prof.get("prep_time_s", 0.0)))
-            gpu_t_step = float(actual_t_model_s) + gpu_serial
-            if gpu_t_step < best_gpu_t_step:
-                best_gpu_t_step = gpu_t_step
-                best_gpu_policy = gpu_pol
+            gpu_serial = float(
+                prof.get("serial_time_s", prof.get("prep_time_s", 0.0))
+            )
+            gpu_overlap = float(prof.get("overlap_time_s", 0.0))
+            for (
+                tiers,
+                tie_break,
+                cpu_est,
+                peak_est,
+                t_fwd_est,
+                t_bwd_est,
+                t_model_est,
+            ) in self._enumerate_structured_plans(
+                peak_limit=peak_limit,
+                cpu_budget=0,
+                edge_peak=live_edge,
+                build_peak=build_peak,
+            ):
+                del t_fwd_est, t_bwd_est
+                edge_time = gpu_serial + max(0.0, gpu_overlap - t_model_est)
+                gpu_t_step = t_model_est + edge_time
+                key = (
+                    gpu_t_step,
+                    tie_break,
+                    cpu_est,
+                    int(live_edge > 0),
+                    build_peak,
+                )
+                if best_gpu_key is None or key < best_gpu_key:
+                    best_gpu_key = key
+                    best_gpu_t_step = gpu_t_step
+                    best_gpu_policy = gpu_pol
+                    best_gpu_tiers = tiers
+                    best_gpu_model_time = t_model_est
+                    best_gpu_edge_time = edge_time
+                    best_gpu_peak_est = int(peak_est)
+                    best_gpu_build_peak = build_peak
+                    best_gpu_live_edge = live_edge
 
-        if best_gpu_policy is None:
+        if best_gpu_policy is None or best_gpu_tiers is None:
             return False
 
         gain_s = actual_cpu_t_step - best_gpu_t_step
@@ -1304,21 +1348,31 @@ class _MultiTierResourceManager:
                 )
             return False
 
-        # GPU is significantly better → switch, keeping same tier configuration.
+        # GPU is significantly better → switch to the re-enumerated feasible
+        # tier configuration for that GPU edge policy.
         if is_r0:
-            tier_counts = {}
+            old_tier_counts = {}
             for t in self._modes:
-                tier_counts[t] = tier_counts.get(t, 0) + 1
+                old_tier_counts[t] = old_tier_counts.get(t, 0) + 1
+            new_tier_counts = {}
+            for t in best_gpu_tiers:
+                new_tier_counts[t] = new_tier_counts.get(t, 0) + 1
             print(
                 f"[MultiTierManager] adaptive-timing switch: "
                 f"{current_policy} actual_t={actual_cpu_t_step*1000:.0f} ms "
                 f"(model={actual_t_model_s*1000:.0f} ms + wait={actual_prefetch_wait_s*1000:.0f} ms + stage={stage_time*1000:.0f} ms) "
                 f"→ {best_gpu_policy} est_t={best_gpu_t_step*1000:.0f} ms "
-                f"(saving ~{gain_s*1000:.0f} ms/epoch). "
-                f"Tiers unchanged: {tier_counts}."
+                f"(model={best_gpu_model_time*1000:.0f} ms + edge={best_gpu_edge_time*1000:.0f} ms; "
+                f"saving ~{gain_s*1000:.0f} ms/epoch). "
+                f"Tiers {old_tier_counts} → {new_tier_counts}; "
+                f"peak_est={best_gpu_peak_est/(1024**2):.0f}/"
+                f"{peak_limit/(1024**2):.0f} MiB "
+                f"(build={best_gpu_build_peak/(1024**2):.0f}, "
+                f"live_edge={best_gpu_live_edge/(1024**2):.0f})."
             )
         self._edge_policy = best_gpu_policy
         self._cache_edge = best_gpu_policy == self.EDGE_GPU_PERSIST
+        self._modes = list(best_gpu_tiers)
         # Adaptive-timing switch back to a GPU policy does not re-evaluate the
         # rw-on-GPU variant; keep rw on its auto decision to stay conservative.
         self._set_rw_on_gpu(False)
