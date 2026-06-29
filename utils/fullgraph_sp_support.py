@@ -2802,28 +2802,24 @@ def _maybe_update_edge_budget(
 
     winner_by_loss = min(probe_rows, key=lambda row: row["loss"])
 
-    # Loss-tie -> accuracy arbitration. Probe loss is the primary signal, but
-    # when EVERY candidate's loss stays within +/-LOSS_BAND of base (|gain| <
-    # LOSS_BAND for all), the loss differences are within noise and cannot rank
-    # the directions. In that regime use accuracy -- the quantity we actually
-    # optimise -- otherwise keep the loss winner. Note the band is on |gain|
-    # (relative loss change vs base), so any round with a strong signal —
-    # including large NEGATIVE gains like real edges in a rw-saturated state —
-    # stays loss-driven; only genuine near-ties (all directions barely moving
-    # loss) flip to accuracy.
-    LOSS_BAND = 0.01
+    # Exact-loss-tie -> accuracy arbitration. Probe loss is the sole ranking
+    # signal: the candidate with the lowest loss wins, however small the margin.
+    # Accuracy is consulted ONLY when multiple candidates share the EXACT same
+    # loss, which loss alone cannot separate; in that case break the tie with
+    # accuracy -- the quantity we actually optimise.
     _arb_cands = [r for r in probe_rows if r["kind"] != "current"]
-    if _arb_cands and all(abs(r["gain"]) < LOSS_BAND for r in _arb_cands):
-        _acc_win = max(_arb_cands, key=lambda r: r["acc"])
+    _tied = [r for r in _arb_cands if r["loss"] == best_loss]
+    if len(_tied) > 1:
+        _acc_win = max(_tied, key=lambda r: r["acc"])
         if _acc_win["kind"] != best_kind:
             if args.rank == 0:
                 _lr, _lw = _budget_pair(_acc_win["state"])
                 _loss_win_acc = next(
-                    (r["acc"] for r in _arb_cands if r["kind"] == best_kind), -1.0
+                    (r["acc"] for r in _tied if r["kind"] == best_kind), -1.0
                 )
                 print(
-                    f"  ↳ BudgetCtrl acc-driven epoch={epoch}: all |gain|<"
-                    f"{LOSS_BAND:.0%} (loss-tie); acc picks {_acc_win['kind']}"
+                    f"  ↳ BudgetCtrl acc-driven epoch={epoch}: exact loss tie "
+                    f"(loss={best_loss:.6f}); acc picks {_acc_win['kind']}"
                     f"({_lr},{_lw}) acc={_acc_win['acc']:.6f} over "
                     f"loss-winner {best_kind} acc={_loss_win_acc:.6f}"
                 )
