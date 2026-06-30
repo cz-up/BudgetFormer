@@ -508,6 +508,23 @@ def main():
     )
 
     use_epoch_seed = dynamic_edges
+    locked_edge_seed = (
+        int(getattr(args, "seed", 0))
+        if use_epoch_seed and (not edge_budget_controller.enabled or edge_budget_controller.frozen)
+        else None
+    )
+    if locked_edge_seed is not None and args.rank == 0:
+        print(f"[edge-seed] locked edge seed={locked_edge_seed} (fixed budget/no adaptive search).")
+
+    def _runtime_edge_seed_for_epoch(epoch_idx: int):
+        if locked_edge_seed is not None:
+            return locked_edge_seed
+        return _edge_seed_for_epoch(
+            epoch_idx,
+            args=args,
+            use_epoch_seed=use_epoch_seed,
+            adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
+        )
 
     # Async edge prefetch: while the GPU runs epoch N, a background thread builds
     # and caches the merged edge_index for epoch N+1.  The main thread's
@@ -594,12 +611,7 @@ def main():
         if is_cpu_broadcast_prefetch and sp_rank != sp_src_rank:
             return False
 
-        next_seed = _edge_seed_for_epoch(
-            next_epoch,
-            args=args,
-            use_epoch_seed=use_epoch_seed,
-            adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
-        )
+        next_seed = _runtime_edge_seed_for_epoch(next_epoch)
         if next_seed is None:
             return False
 
@@ -653,12 +665,7 @@ def main():
         _set_runtime_edge_policy_for_phase(
             budget_phase_active=_adaptive_edge_budget_enabled(args) and not _budget_frozen_notified
         )
-        epoch_edge_seed = _edge_seed_for_epoch(
-            epoch,
-            args=args,
-            use_epoch_seed=use_epoch_seed,
-            adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
-        )
+        epoch_edge_seed = _runtime_edge_seed_for_epoch(epoch)
         epoch_budget_state = dict(edge_budget_controller.current_state())
         sync_step_timing = precise_step_timing or _should_force_ckpt_sync_timers(model)
 
@@ -1594,6 +1601,12 @@ def main():
                 )
             )
             if _budget_is_stable:
+                if use_epoch_seed and locked_edge_seed is None:
+                    locked_edge_seed = int(
+                        epoch_edge_seed
+                        if epoch_edge_seed is not None
+                        else getattr(args, "seed", 0)
+                    )
                 _budget_frozen_notified = True
                 _set_runtime_edge_policy_for_phase(budget_phase_active=False)
                 # Drop probe-only caches the moment we leave budget-search.  This
@@ -1610,6 +1623,11 @@ def main():
                         )
                     )
                 if args.rank == 0:
+                    seed_msg = (
+                        f" Locked edge seed={locked_edge_seed}."
+                        if locked_edge_seed is not None
+                        else ""
+                    )
                     ckpt_msg = (
                         "Checkpoint calibration will start next epoch."
                         if _ckpt_mgr is not None
@@ -1618,7 +1636,7 @@ def main():
                     print(
                         f"[edge-cache] Edge budget stable at epoch {epoch} "
                         f"(real={edge_budget_controller.real_budget}, "
-                        f"rw={edge_budget_controller.rw_budget}). {ckpt_msg}"
+                        f"rw={edge_budget_controller.rw_budget}). {ckpt_msg}{seed_msg}"
                     )
 
         # Fallback for adaptive-budget epochs whose next-step budget is only
@@ -1833,8 +1851,9 @@ def main():
                 local_num_nodes,
                 amp_dtype=amp_dtype,
                 cached_edge_index=_eval_cached_ei,
-                edge_budget_state=edge_budget_controller.current_state(),
+                edge_budget_state=epoch_budget_state,
                 adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
+                edge_seed=epoch_edge_seed,
             )
             if torch.cuda.is_available():
                 torch.cuda.synchronize(device)

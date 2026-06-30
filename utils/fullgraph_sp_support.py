@@ -2171,34 +2171,10 @@ class _AdaptiveEdgeBudgetController:
         self._pending_kind = None
         self._pending_state = None
         self._pending_wins = 0
-        if not self.seen_positive_gain:
-            return
         if best_gain <= 0.0:
             self.bad_rounds += 1
             if self.bad_rounds >= self.patience:
                 self.frozen = True
-
-    def commit_expansion_step(self, next_state) -> None:
-        """Advance one growth step toward the total budget ceiling.
-
-        This is used only below the ceiling when the probe signal is too weak or
-        slightly negative. It avoids freezing the search at a small budget because
-        of a near-zero early marginal-loss estimate.
-        """
-        if next_state is None:
-            return
-        self.real_budget = int(next_state.get("real_edges_per_query", self.real_budget))
-        self.rw_budget = int(next_state.get("rw_edges_per_query", self.rw_budget))
-        if "walk_length" in next_state:
-            self.walk_length = int(next_state["walk_length"])
-        self._n_budget_updates += 1
-        self._pending_kind = None
-        self._pending_state = None
-        self._pending_wins = 0
-        self.bad_rounds = 0
-        self.seen_positive_gain = True
-        self.auto_hold_released = True
-        self.auto_hold_neg_inf_streak = 0
 
 
 def _round_budget_to_block(value: int, block_size: int) -> int:
@@ -2801,25 +2777,30 @@ def _maybe_update_edge_budget(
         )
 
     winner_by_loss = min(probe_rows, key=lambda row: row["loss"])
+    budget_at_ceiling = (controller.real_budget + controller.rw_budget) >= controller.max_total
 
-    # Exact-loss-tie -> accuracy arbitration. Probe loss is the sole ranking
-    # signal: the candidate with the lowest loss wins, however small the margin.
-    # Accuracy is consulted ONLY when multiple candidates share the EXACT same
-    # loss, which loss alone cannot separate; in that case break the tie with
-    # accuracy -- the quantity we actually optimise.
+    # Loss-tie -> accuracy arbitration. Probe loss is the primary signal, but
+    # when EVERY candidate's loss stays within +/-LOSS_BAND of base (|gain| <
+    # LOSS_BAND for all), the loss differences are within noise and cannot rank
+    # the directions. In that regime use accuracy -- the quantity we actually
+    # optimise -- otherwise keep the loss winner. Note the band is on |gain|
+    # (relative loss change vs base), so any round with a strong signal —
+    # including large NEGATIVE gains like real edges in a rw-saturated state —
+    # stays loss-driven; only genuine near-ties (all directions barely moving
+    # loss) flip to accuracy.
+    LOSS_BAND = 0.01
     _arb_cands = [r for r in probe_rows if r["kind"] != "current"]
-    _tied = [r for r in _arb_cands if r["loss"] == best_loss]
-    if len(_tied) > 1:
-        _acc_win = max(_tied, key=lambda r: r["acc"])
+    if budget_at_ceiling and _arb_cands and all(abs(r["gain"]) < LOSS_BAND for r in _arb_cands):
+        _acc_win = max(_arb_cands, key=lambda r: r["acc"])
         if _acc_win["kind"] != best_kind:
             if args.rank == 0:
                 _lr, _lw = _budget_pair(_acc_win["state"])
                 _loss_win_acc = next(
-                    (r["acc"] for r in _tied if r["kind"] == best_kind), -1.0
+                    (r["acc"] for r in _arb_cands if r["kind"] == best_kind), -1.0
                 )
                 print(
-                    f"  ↳ BudgetCtrl acc-driven epoch={epoch}: exact loss tie "
-                    f"(loss={best_loss:.6f}); acc picks {_acc_win['kind']}"
+                    f"  ↳ BudgetCtrl acc-driven epoch={epoch}: all |gain|<"
+                    f"{LOSS_BAND:.0%} (loss-tie); acc picks {_acc_win['kind']}"
                     f"({_lr},{_lw}) acc={_acc_win['acc']:.6f} over "
                     f"loss-winner {best_kind} acc={_loss_win_acc:.6f}"
                 )
@@ -2829,9 +2810,6 @@ def _maybe_update_edge_budget(
             best_loss = _acc_win["loss"]
             best_count = _acc_win["edges"]
 
-    # Loss-only decision: commit iff the chosen candidate strictly beats base
-    # on probe loss. No threshold (the progressive-confirmation gate in
-    # controller.update absorbs noise filtering).
     commit_ok = best_gain > 0.0
 
     if args.rank == 0:
@@ -2850,29 +2828,36 @@ def _maybe_update_edge_budget(
                 f"gain={gain_text} probe_edges={row['edges']}"
             )
 
-    # Below the ceiling, do not let a near-zero negative marginal-loss estimate
-    # freeze the search at a small budget. Keep growing one block along the best
-    # probed direction; once the ceiling is reached, the normal positive-gain /
-    # patience logic decides whether to shift or freeze.
-    _at_ceiling = (controller.real_budget + controller.rw_budget) >= controller.max_total
-    _growth_kinds = {"real_up", "rw_up"}
-    if (
-        float("-inf") < best_gain <= 0.0
-        and not _at_ceiling
-        and best_kind in _growth_kinds
-        and best_state is not None
-    ):
-        controller.commit_expansion_step(best_state)
-        if args.rank == 0:
-            cur_budget = controller.current_state()
-            print(
-                f"  ↳ BudgetCtrl expand-below-ceiling epoch={epoch}: "
-                f"move={best_kind} despite non-positive rel_gain={best_gain:.8e}; "
-                f"new_budget=({cur_budget['real_edges_per_query']},"
-                f"{cur_budget['rw_edges_per_query']}) "
-                f"probe_loss={best_loss:.4f} probe_edges={best_count}"
-            )
-        return
+    if not budget_at_ceiling:
+        base_total = sum(_budget_pair(base_state))
+        growth_rows = [
+            row for row in probe_rows
+            if row["kind"] != "current" and sum(_budget_pair(row["state"])) > base_total
+        ]
+        if growth_rows:
+            growth_win = max(growth_rows, key=lambda row: row["gain"])
+            if growth_win["gain"] > 0.0:
+                controller.auto_hold_released = True
+                controller.auto_hold_neg_inf_streak = 0
+            controller.update(growth_win["kind"], growth_win["gain"], growth_win["state"])
+            if args.rank == 0:
+                cur_budget = controller.current_state()
+                pending_tag = ""
+                if controller._pending_wins > 0:
+                    pending_tag = (
+                        f" [confirm {controller._pending_wins}/"
+                        f"{controller.required_confirm_rounds()}]"
+                    )
+                print(
+                    f"  ↳ BudgetCtrl grow-below-ceiling epoch={epoch}: "
+                    f"move={growth_win['kind']}{pending_tag} "
+                    f"rel_gain={growth_win['gain']:.8e} "
+                    f"new_budget=({cur_budget['real_edges_per_query']},"
+                    f"{cur_budget['rw_edges_per_query']}) "
+                    f"probe_loss={growth_win['loss']:.4f} "
+                    f"probe_edges={growth_win['edges']}"
+                )
+            return
 
     # Check Condition for Release or Continued Update
     if not controller.auto_hold_released:
@@ -2900,13 +2885,19 @@ def _maybe_update_edge_budget(
                     f"{best_gain:.8e}"
                 )
         else:
+            controller.update(None, best_gain, None)
             if args.rank == 0:
+                cur_budget = controller.current_state()
+                freeze_tag = " freezing budget." if controller.frozen else ""
                 print(
-                    f"  ↳ BudgetCtrl [AutoHold] epoch={epoch} searching... "
+                    f"  ↳ BudgetCtrl [AutoHold] epoch={epoch} STAY "
                     f"best_rel_gain_found={best_gain:.8e} "
-                    f"neg_inf_streak={controller.auto_hold_neg_inf_streak}/"
-                    f"{controller.auto_hold_neg_inf_freeze_after}"
+                    f"bad_rounds={controller.bad_rounds}/{controller.patience} "
+                    f"budget=({cur_budget['real_edges_per_query']},"
+                    f"{cur_budget['rw_edges_per_query']}).{freeze_tag}"
                 )
+            if controller.frozen:
+                _release_probe_caches_on_freeze(controller, args)
             return
 
     controller.update(best_kind if commit_ok else None,
@@ -3386,14 +3377,16 @@ def _restore_dropout(states):
 def _eval_sp(args, model, x_local, y, split_idx, edge_index_global, num_nodes,
              device, rw_device, sp_group, sp_src_rank, sp_rank, sp_world_size,
              rank_start, rank_end, local_nodes, amp_dtype=None, cached_edge_index=None,
-             edge_budget_state=None, adaptive_edge_budget_cfg=None):
+             edge_budget_state=None, adaptive_edge_budget_cfg=None, edge_seed=None):
     use_rocauc = str(getattr(args, "dataset", "")).lower() == "genius"
 
     if cached_edge_index is None:
-        with fixed_random_seed(args.seed):
+        eval_seed = int(edge_seed) if edge_seed is not None else int(getattr(args, "seed", 0))
+        with fixed_random_seed(eval_seed):
             edge_index_eval = _build_attention_edges(
                 args, edge_index_global, num_nodes, device, rw_device,
                 sp_group, sp_src_rank, sp_rank, local_nodes,
+                edge_seed=edge_seed,
                 edge_budget_state=edge_budget_state,
                 adaptive_edge_budget_cfg=adaptive_edge_budget_cfg,
             )
