@@ -526,7 +526,9 @@ def fixed_random_seed_cpu(seed: int):
     torch_state = torch.random.get_rng_state()
     random.seed(seed)
     np.random.seed(seed)
-    torch.manual_seed(seed)
+    # torch.manual_seed would also reseed every CUDA generator (and only the
+    # CPU state is restored below); seed the CPU default generator directly.
+    torch.default_generator.manual_seed(seed)
     try:
         yield
     finally:
@@ -1308,7 +1310,12 @@ def compute_khop_pool_dgl_neighbor(
     # graph + same OMP thread count per rank => identical edges, no broadcast.
     if seed is not None:
         dgl.seed(int(seed))
-        torch.manual_seed(int(seed))
+        if torch.device(device).type == "cpu":
+            # CPU build: seed only the CPU default generator so callers'
+            # CPU-only seed contexts stay free of CUDA RNG side effects.
+            torch.default_generator.manual_seed(int(seed))
+        else:
+            torch.manual_seed(int(seed))
 
     rw_device = torch.device(device)
     k = len(fanout)

@@ -6,6 +6,7 @@ from torch.utils.data import DataLoader
 from functools import partial
 import scipy.sparse as sp
 import scipy
+import scipy.io
 from numpy.linalg import inv
 from torch_geometric.datasets import Planetoid, Amazon, Actor, CitationFull, Coauthor, HeterophilousGraphDataset
 from torch.nn.functional import normalize
@@ -13,6 +14,8 @@ import torch_geometric.transforms as T
 from torch_geometric.utils import coalesce
 from tqdm import tqdm
 import os
+import json
+import shutil
 import random
 import math
 import pickle as pkl
@@ -45,6 +48,106 @@ def column_normalize(mx):
     r_mat_inv = sp.diags(r_inv)
     mx = mx.dot(r_mat_inv)
     return mx
+
+
+def _load_linkx_mat(mat_path: str, label_key: str):
+    """Load a LINKX-format .mat file (edge_index, node_feat, <label_key>, num_nodes)."""
+    fulldata = scipy.io.loadmat(mat_path)
+
+    edge_index = torch.as_tensor(fulldata['edge_index'], dtype=torch.long)
+
+    node_feat = fulldata['node_feat']
+    if sp.issparse(node_feat):
+        node_feat = node_feat.toarray()
+    data_x = torch.as_tensor(np.asarray(node_feat), dtype=torch.float32)
+
+    label = np.asarray(fulldata[label_key]).reshape(-1)
+    data_y = torch.as_tensor(label, dtype=torch.long)
+
+    return data_x, edge_index, data_y
+
+
+def _load_snap_patents_mat(mat_path: str):
+    """Load the official LINKX snap-patents .mat file.
+
+    Expects the keys used by the LINKX release: edge_index, node_feat
+    (sparse), years, num_nodes. Returns raw (unquantized) year labels;
+    prepare_snap-patents.py handles the quantile->class conversion.
+    """
+    return _load_linkx_mat(mat_path, label_key='years')
+
+
+def rand_train_test_idx(label: torch.Tensor, train_prop: float, valid_prop: float, rng: np.random.RandomState,
+                         ignore_negative: bool = True) -> dict:
+    """Official LINKX random label split, used for datasets with no fixed official split (e.g. genius)."""
+    if ignore_negative:
+        labeled_nodes = torch.where(label != -1)[0]
+    else:
+        labeled_nodes = torch.arange(label.shape[0])
+
+    n = labeled_nodes.shape[0]
+    train_num = int(n * train_prop)
+    valid_num = int(n * valid_prop)
+
+    perm = torch.as_tensor(rng.permutation(n))
+
+    train_idx = labeled_nodes[perm[:train_num]]
+    valid_idx = labeled_nodes[perm[train_num:train_num + valid_num]]
+    test_idx = labeled_nodes[perm[train_num + valid_num:]]
+
+    return {
+        "train": train_idx.to(torch.long),
+        "valid": valid_idx.to(torch.long),
+        "test": test_idx.to(torch.long),
+    }
+
+
+def _resolve_mat_path(dataset_dir: str, dataset_name: str, mat_filename: str) -> str:
+    mat_path = os.path.join(dataset_dir, dataset_name, mat_filename)
+    if os.path.exists(mat_path):
+        return mat_path
+
+    legacy_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dataset', mat_filename)
+    if os.path.exists(legacy_path):
+        return legacy_path
+
+    raise FileNotFoundError(
+        f"{mat_filename} not found at {mat_path} or {legacy_path}. "
+        "Download it from the LINKX release and place it in one of these locations."
+    )
+
+
+def _download_gdrive_file(file_id: str, out_path: str, force: bool = False) -> None:
+    if os.path.exists(out_path) and not force:
+        return
+
+    try:
+        import gdown
+    except ImportError as exc:
+        raise RuntimeError("gdown is required to download this file (pip install gdown).") from exc
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    downloaded = gdown.download(id=file_id, output=out_path, quiet=False)
+    if downloaded is None or not os.path.exists(out_path):
+        raise RuntimeError(f"Failed to download {out_path} from Google Drive (id={file_id}).")
+
+
+def _resolve_raw_dataset_dir(dataset_dir: str, dataset_name: str, required_files) -> str:
+    """Find a directory containing all `required_files`, checking the output
+    location first (`{dataset_dir}/{dataset_name}`) and falling back to the
+    legacy raw-data location (`utils/dataset/{dataset_name}`, resolved
+    relative to this file so it works regardless of the caller's cwd)."""
+    candidate = os.path.join(dataset_dir, dataset_name)
+    if all(os.path.exists(os.path.join(candidate, fname)) for fname in required_files):
+        return candidate
+
+    legacy_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dataset', dataset_name)
+    if all(os.path.exists(os.path.join(legacy_dir, fname)) for fname in required_files):
+        return legacy_dir
+
+    raise FileNotFoundError(
+        f"Raw files {list(required_files)} not found under {candidate} or {legacy_dir}."
+    )
 
 
 def _mask_to_index(mask: torch.Tensor, split_id: int = 0) -> torch.Tensor:
@@ -166,10 +269,10 @@ def get_dataset(dataset_name, split_id: int = 0):
             edge_index = coalesce(edge_index, num_nodes=data_x.size(0))
             
         elif dataset_name in ['amazon']:
-            # dataset_dir = '/home/zhaochu/torchgt/utils/dataset/'
-            adj = sp.load_npz(os.path.join(dataset_dir, dataset_name, 'adj_full.npz'))
-            data_x = np.load(os.path.join(dataset_dir, dataset_name, 'feats.npy'))
-            data_y = np.load(os.path.join(dataset_dir, dataset_name, 'labels.npy'))
+            raw_dir = _resolve_raw_dataset_dir(dataset_dir, dataset_name, ('adj_full.npz', 'feats.npy', 'labels.npy'))
+            adj = sp.load_npz(os.path.join(raw_dir, 'adj_full.npz'))
+            data_x = np.load(os.path.join(raw_dir, 'feats.npy'))
+            data_y = np.load(os.path.join(raw_dir, 'labels.npy'))
             data_x = torch.tensor(data_x, dtype=torch.float32)
             data_y = torch.tensor(data_y)
             data_y = torch.argmax(data_y, -1)
@@ -181,7 +284,26 @@ def get_dataset(dataset_name, split_id: int = 0):
             col = torch.from_numpy(col).to(torch.long)
             edge_index = torch.stack([row, col], dim=0)
             edge_index = coalesce(edge_index, num_nodes=data_x.size(0))
-            
+
+            # role.json is the official GraphSAINT/PyG AmazonProducts split (fixed
+            # 80/5/15 train/valid/test), downloaded once and cached alongside the
+            # other raw files so later runs reuse it instead of re-downloading.
+            role_path = os.path.join(raw_dir, 'role.json')
+            _download_gdrive_file('1npK9xlmbnjNkV80hK2Q68wTEVOFjnt4K', role_path)
+            with open(role_path, 'r', encoding='utf-8') as f:
+                role = json.load(f)
+            split_idx = {
+                "train": torch.as_tensor(role['tr'], dtype=torch.long),
+                "valid": torch.as_tensor(role['va'], dtype=torch.long),
+                "test": torch.as_tensor(role['te'], dtype=torch.long),
+            }
+
+            # Also mirror role.json into the output dir so it matches the
+            # historical file layout (split_utils.py accepts either format).
+            output_role_path = os.path.join(dataset_dir, dataset_name, 'role.json')
+            if os.path.abspath(output_role_path) != os.path.abspath(role_path):
+                shutil.copyfile(role_path, output_role_path)
+
         elif dataset_name in ['pokec']:
             fulldata = scipy.io.loadmat(f'/path/to/dataset/pokec.mat')
             edge_index = torch.tensor(fulldata['edge_index'], dtype=torch.long)
@@ -197,6 +319,33 @@ def get_dataset(dataset_name, split_id: int = 0):
             
             normalized_adj = adj_normalize(adj)
             column_normalized_adj = column_normalize(adj)
+
+        elif dataset_name in ['snap-patents']:
+            mat_path = _resolve_mat_path(dataset_dir, dataset_name, 'snap_patents.mat')
+            data_x, edge_index, data_y = _load_snap_patents_mat(mat_path)
+            # data_y holds raw publication years here; utils/prepare_snap-patents.py
+            # converts them to LINKX-style quantile classes afterwards.
+
+        elif dataset_name in ['genius']:
+            mat_path = _resolve_mat_path(dataset_dir, dataset_name, 'genius.mat')
+            data_x, edge_index, data_y = _load_linkx_mat(mat_path, label_key='label')
+            # genius ships final binary labels directly, unlike snap-patents' raw years.
+
+            # genius has no official fixed split; LINKX draws a random 50/25/25 split at
+            # runtime. Generate GENIUS_NUM_SPLITS reproducible splits (seeded off
+            # GENIUS_SPLIT_SEED + split index) and keep `split_id` as the default split_idx.pt.
+            genius_num_splits = 5
+            genius_split_seed = 0
+            if split_id < 0 or split_id >= genius_num_splits:
+                raise ValueError(f"split_id={split_id} out of range for {genius_num_splits} genius splits")
+            split_list = [
+                rand_train_test_idx(data_y, train_prop=0.5, valid_prop=0.25,
+                                     rng=np.random.RandomState(genius_split_seed + i))
+                for i in range(genius_num_splits)
+            ]
+            os.makedirs(os.path.join(dataset_dir, dataset_name), exist_ok=True)
+            torch.save(split_list, os.path.join(dataset_dir, dataset_name, 'split_idx_all.pt'))
+            split_idx = split_list[split_id]
 
         elif dataset_name in {"ogbn-papers100M"}:
             file_dir = '/home/zhaochu/torchgt/utils/dataset/'

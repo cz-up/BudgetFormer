@@ -32,8 +32,76 @@ conda activate budgetformer
 pip install -r requirements.txt
 ```
 
-Datasets (ogbn-arxiv, ogbn-products, Amazon, genius, snap-patents) are loaded
-from `./dataset/`; OGB datasets download automatically on first use.
+Datasets are loaded from `./dataset/<name>/` (or wherever `--dataset_dir`
+points); see [Data Preparation](#data-preparation) below for how each
+dataset's raw files are obtained and converted.
+
+---
+
+## Data Preparation
+
+All dataset preprocessing goes through `utils/preprocess_data.py`:
+
+```bash
+python utils/preprocess_data.py --dataset <name> [--split_id 0]
+```
+
+This writes `x.pt` / `edge_index.pt` / `y.pt` (and a split file, when
+available) to `<dataset_dir>/<name>/` (`./dataset/<name>/` by default). It can
+be run from any working directory — output always lands under
+`<dataset_dir>/<name>/` relative to wherever you invoke it from, and raw
+files are resolved with a fallback to `utils/dataset/<name>/` regardless of
+cwd, so a fresh checkout only needs the raw files staged once.
+
+### Auto-downloading datasets
+
+`ogbn-arxiv`, `ogbn-products`, `ogbn-papers100M`, `cora`, `citeseer`,
+`pubmed`, `dblp`, `CS`, `Physics`, `Photo`, `roman-empire`,
+`amazon-ratings`, `minesweeper`, `tolokers`, `questions` fetch themselves via
+OGB / PyTorch Geometric on first use — just run the command above.
+
+### Datasets requiring raw files: snap-patents, genius, amazon
+
+These ship as raw `.mat`/`.npz` files that must be staged locally before
+running `preprocess_data.py`. Place them under `utils/dataset/` as shown
+below (this is also where they already live in this checkout); the
+processed output is regenerated from these on demand and is safe to delete.
+
+| Dataset | Raw files | Source | Local path |
+|---|---|---|---|
+| snap-patents | `snap_patents.mat` | [LINKX / `CUAI/Non-Homophily-Large-Scale`, Google Drive](https://drive.google.com/file/d/1ldh23TSY1PwXia6dU0MYcpyEgX-w3Hia/view) (same file ID as `dataset_drive_url['snap-patents']` in that repo's `data_utils.py`) | `utils/dataset/snap_patents.mat` |
+| genius | `genius.mat` | [LINKX / `CUAI/Non-Homophily-Large-Scale`](https://github.com/CUAI/Non-Homophily-Large-Scale/blob/master/data/genius.mat) — checked directly into that repo's `data/` dir (no Drive download step, unlike snap-patents) | `utils/dataset/genius.mat` |
+| amazon | `adj_full.npz`, `feats.npy`, `labels.npy` | GraphSAINT / PyG `AmazonProducts` release (Google Drive file IDs `17qhNA8H1IpbkkR-T2BmPQm8QNW5do-aa`, `10SW8lCvAj-kb6ckkfTOC5y0l8XXdtMxj`, and — see note below — `class_map.json` id `1LIl4kimLfftj4-7NmValuWyCQE8AaE7P`) | `utils/dataset/amazon/` |
+
+> **amazon label format note:** `preprocess_data.py` expects a dense
+> `labels.npy` (one-hot, `[num_nodes, num_classes]`), not the official
+> `class_map.json` (a `{node_id: class_id}` dict). The `labels.npy` already
+> in `utils/dataset/amazon/` was pre-converted from `class_map.json`; if you
+> download the raw release fresh, convert `class_map.json` to that dense
+> format yourself before running `preprocess_data.py`, or ask for that
+> conversion to be added to the script.
+
+Commands per dataset:
+
+```bash
+# snap-patents: raw tensors, then official label quantization (5-class,
+# by publication year) + official train/valid/test split download
+python utils/preprocess_data.py --dataset snap-patents
+python utils/prepare_snap-patents.py --split_id 0   # needs `pip install gdown`
+
+# genius: single command — generates x/edge_index/y plus 5 reproducible
+# random 50/25/25 splits (LINKX convention, no official fixed split exists)
+python utils/preprocess_data.py --dataset genius --split_id 0
+
+# amazon: single command — generates x/edge_index/y and downloads the
+# official GraphSAINT 80/5/15 split (role.json) automatically
+python utils/preprocess_data.py --dataset amazon   # needs `pip install gdown`
+```
+
+`snap-patents` and `amazon` download their split files from Google Drive via
+`gdown` on first run and cache them locally, so later runs (including in a
+different `--dataset_dir`) don't re-download. `genius`'s splits are generated
+locally with a fixed seed, so they're reproducible without network access.
 
 ---
 

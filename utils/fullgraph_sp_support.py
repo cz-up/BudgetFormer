@@ -2931,7 +2931,9 @@ def _maybe_update_edge_budget(
 @contextlib.contextmanager
 def _fixed_torch_cpu_seed(seed: int):
     torch_state = torch.random.get_rng_state()
-    torch.manual_seed(seed)
+    # torch.manual_seed would also reseed every CUDA generator (and only the
+    # CPU state is restored below); seed the CPU default generator directly.
+    torch.default_generator.manual_seed(seed)
     try:
         yield
     finally:

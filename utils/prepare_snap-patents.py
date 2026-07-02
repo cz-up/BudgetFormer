@@ -104,20 +104,7 @@ def download_official_splits(out_path: Path, force: bool) -> None:
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     print(f"[splits] Downloading official snap-patents splits to {out_path}")
-    drive_url = f"https://drive.google.com/uc?id={_LINKX_SNAP_PATENTS_SPLITS_DRIVE_ID}"
-    try:
-        downloaded = gdown.download(
-            url=drive_url,
-            output=str(out_path),
-            quiet=False,
-            fuzzy=True,
-        )
-    except TypeError:
-        downloaded = gdown.download(
-            url=drive_url,
-            output=str(out_path),
-            quiet=False,
-        )
+    downloaded = gdown.download(id=_LINKX_SNAP_PATENTS_SPLITS_DRIVE_ID, output=str(out_path), quiet=False)
     if downloaded is None or not out_path.exists():
         raise RuntimeError("Failed to download official snap-patents splits.")
 
